@@ -84,6 +84,8 @@ Quick resume file for any AI session. Update at end of every work session.
   - Latest verification for supervisor implementation: `33 passed`; compileall passed; direct `auto_trader.__main__.main` import check passed.
   - Final visible Reviewer verdict for Day 2 supervisor loop: `APPROVE`.
   - Final visible Optimizer verdict for Day 2 supervisor loop: `APPROVE`.
+  - GitHub sync complete:
+    - Commit `9fe40e1` (`Add Day 2 trading supervisor loop`) pushed to `origin/main`.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -107,12 +109,11 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Immediate Next Actions
 
-1. Commit and push Day 2 supervisor implementation.
-2. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
-3. Decide when to opt in to `AUTO_EXIT_ENABLED` and `AUTO_ENTRY_ENABLED` during paper burn-in.
-4. Before long unattended `AUTO_EXIT_ENABLED=true` runs, consider broker open close-order checks and persisted pending exits.
-5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+1. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
+2. Decide when to opt in to `AUTO_EXIT_ENABLED` and `AUTO_ENTRY_ENABLED` during paper burn-in.
+3. Before long unattended `AUTO_EXIT_ENABLED=true` runs, consider broker open close-order checks and persisted pending exits.
+4. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+5. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 

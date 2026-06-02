@@ -72,8 +72,10 @@ Append-only by day. Do not remove past entries.
 - FINAL REVIEW:
   - Reviewer final confirmation: `APPROVE`.
   - Optimizer final confirmation: `APPROVE`.
+- GITHUB SYNC:
+  - Commit `9fe40e1` (`Add Day 2 trading supervisor loop`) pushed to `origin/main`.
 - IN_PROGRESS:
-  - Commit and push Day 2 supervisor implementation.
+  - None.
 - NEXT:
   - Run paper burn-in with alert-only supervisor defaults.
   - Consider broker open close-order checks and persisted pending exits before long unattended `AUTO_EXIT_ENABLED=true` runs.
