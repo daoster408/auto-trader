@@ -1,7 +1,7 @@
 """Alpaca Broker Adapter (async).
 
 Production-hardened: real alpaca-py SDK for critical paths (health, cancel, flatten, submit).
-All external calls wrapped in tenacity retries.
+Idempotent external calls are wrapped in tenacity retries; single-order submits are single-shot.
 Order submission is now available (must only be called after RiskEngine approval).
 Fast startup on ARM via lazy client.
 """
@@ -177,6 +177,37 @@ class AlpacaAdapter:
             raise
 
     @retry_external
+    async def get_open_orders(self) -> list[dict[str, Any]]:
+        """Return currently open broker orders for duplicate close-order guards."""
+        try:
+            client = self._get_client()
+            orders = await asyncio.to_thread(
+                client.get_orders,
+                GetOrdersRequest(status=QueryOrderStatus.OPEN),
+            )
+            results: list[dict[str, Any]] = []
+            for order in orders:
+                broker_id = str(getattr(order, "id", ""))
+                results.append(
+                    {
+                        "client_order_id": str(getattr(order, "client_order_id", None) or broker_id),
+                        "broker_order_id": broker_id,
+                        "symbol": str(getattr(order, "symbol", "")).upper(),
+                        "side": _enum_value(getattr(order, "side", "")),
+                        "qty": _safe_float(getattr(order, "qty", 0)),
+                        "order_type": _enum_value(getattr(order, "order_type", "")),
+                        "status": _enum_value(getattr(order, "status", "")),
+                        "submitted_at": _iso_value(getattr(order, "submitted_at", None)),
+                        "rationale": "broker_open_order_check",
+                    }
+                )
+            log.info("open_orders_loaded", count=len(results))
+            return results
+        except Exception as e:
+            log.error("open_orders_failed", error=str(e))
+            raise
+
+    @retry_external
     async def get_clock(self) -> dict[str, Any]:
         """Real market clock from Alpaca (retried)."""
         try:
@@ -325,9 +356,13 @@ class AlpacaAdapter:
             log.error("flatten_all_failed", error=str(e))
             return 0
 
-    @retry_external
     async def close_position(self, symbol: str, qty: float | None = None, reason: str = "exit_rule") -> dict[str, Any]:
-        """Close an existing broker position with a market order. Risk-reducing only."""
+        """Close an existing broker position with a market order. Risk-reducing only.
+
+        This submit is intentionally not retry-wrapped: if Alpaca accepts the
+        order but the response path fails, retrying here could duplicate a close.
+        The supervisor rechecks broker open orders before a later retry.
+        """
         if not _ALPACA_AVAILABLE:
             raise RuntimeError("alpaca-py not installed")
 

@@ -12,9 +12,13 @@ from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
 from auto_trader.persistence.db import (
+    clear_pending_exit,
     count_entry_orders_since,
     get_latest_entry_order_for_symbol,
+    get_pending_exit_for_symbol,
+    get_pending_exit_symbols,
     reconcile_broker_orders,
+    upsert_pending_exit,
     upsert_order_record,
 )
 from auto_trader.utils.logging import get_logger
@@ -78,6 +82,40 @@ def _format_position_line(position: dict[str, Any]) -> str:
     return f"{symbol}: qty {qty:.6f}, value ${market_value:,.2f}, P/L ${unrealized:,.2f} ({pnl_pct:.2f}%)"
 
 
+def _is_terminal_order_status(status: Any) -> bool:
+    return str(status or "").lower() in {"canceled", "cancelled", "filled", "rejected", "expired"}
+
+
+def _is_failed_terminal_order_status(status: Any) -> bool:
+    return str(status or "").lower() in {"canceled", "cancelled", "rejected", "expired"}
+
+
+def _is_close_order_for_position(order: dict[str, Any], *, symbol: str, position_qty: float) -> bool:
+    if str(order.get("symbol", "")).upper() != symbol.upper():
+        return False
+    if _is_terminal_order_status(order.get("status")):
+        return False
+    side = str(order.get("side", "")).lower()
+    if position_qty > 0:
+        return side == "sell"
+    if position_qty < 0:
+        return side in {"buy", "buy_to_cover"}
+    return False
+
+
+def _order_matches_pending_exit(order: dict[str, Any], pending: dict[str, Any]) -> bool:
+    order_ids = {
+        str(order.get("broker_order_id") or ""),
+        str(order.get("client_order_id") or ""),
+        str(order.get("id") or ""),
+    }
+    pending_ids = {
+        str(pending.get("broker_order_id") or ""),
+        str(pending.get("client_order_id") or ""),
+    }
+    return bool((order_ids - {""}) & (pending_ids - {""}))
+
+
 class TradingSupervisor:
     """Small supervised trading loop for paper burn-in.
 
@@ -124,6 +162,7 @@ class TradingSupervisor:
         lookback = int(days if days is not None else self.settings.reconcile_lookback_days)
         recent_orders = await self.adapter.get_recent_orders(days=lookback)
         reconciled = await reconcile_broker_orders(recent_orders)
+        await self._clear_failed_pending_exits_from_orders(recent_orders)
         self._last_reconcile_at = datetime.now(UTC)
         if reconciled != len(recent_orders):
             await self._notify_once(
@@ -153,6 +192,7 @@ class TradingSupervisor:
 
         metrics = {
             "qty": qty,
+            "position_qty": _float(position.get("qty")),
             "market_value": market_value,
             "unrealized_pl": unrealized,
             "cost_basis": cost_basis,
@@ -176,6 +216,47 @@ class TradingSupervisor:
             return ExitDecision(symbol=symbol, should_exit=True, reason="position max hold reached", metrics=metrics)
         return ExitDecision(symbol=symbol, should_exit=False, reason="hold", metrics=metrics)
 
+    async def _sync_persisted_pending_exits(self, open_symbols: set[str]) -> None:
+        """Keep memory pending exits aligned with durable state after trusted position reads."""
+        persisted = await get_pending_exit_symbols()
+        for symbol in persisted - open_symbols:
+            await clear_pending_exit(symbol)
+        self._pending_exit_symbols.intersection_update(open_symbols)
+
+    async def _find_open_close_order(
+        self,
+        decision: ExitDecision,
+        *,
+        pending_exit: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        position_qty = _float(decision.metrics.get("position_qty"))
+        open_orders = await self.adapter.get_open_orders()
+        for order in open_orders:
+            if not _is_close_order_for_position(order, symbol=decision.symbol, position_qty=position_qty):
+                continue
+            if pending_exit is not None and not _order_matches_pending_exit(order, pending_exit):
+                continue
+            return order
+        return None
+
+    async def _clear_failed_pending_exits_from_orders(self, orders: list[dict[str, Any]]) -> None:
+        """Clear pending exits whose broker close order is known failed/canceled."""
+        for order in orders:
+            if not _is_failed_terminal_order_status(order.get("status")):
+                continue
+            symbol = str(order.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            pending = await get_pending_exit_for_symbol(symbol)
+            if not pending or not _order_matches_pending_exit(order, pending):
+                continue
+            if await clear_pending_exit(symbol):
+                self._pending_exit_symbols.discard(symbol)
+                await self._notify_once(
+                    f"exit-pending-cleared-{symbol}-{order.get('status')}",
+                    f"EXIT PENDING CLEARED: prior close for {symbol} is {order.get('status')}; supervisor may retry.",
+                )
+
     async def _execute_exit_if_enabled(self, decision: ExitDecision) -> dict[str, Any] | None:
         if not decision.should_exit:
             return None
@@ -197,11 +278,56 @@ class TradingSupervisor:
                 f"EXIT SUPPRESSED: close order already submitted for {decision.symbol}.",
             )
             return None
+        persisted_pending = await get_pending_exit_for_symbol(decision.symbol)
+        if persisted_pending:
+            open_close_order = await self._find_open_close_order(decision, pending_exit=persisted_pending)
+            if open_close_order:
+                self._pending_exit_symbols.add(decision.symbol)
+                await self._notify_once(
+                    f"exit-pending-persisted-{decision.symbol}",
+                    f"EXIT SUPPRESSED: persisted pending close exists for {decision.symbol}.",
+                )
+            else:
+                await self._notify_once(
+                    f"exit-pending-unresolved-{decision.symbol}",
+                    (
+                        f"EXIT NEEDS REVIEW: persisted pending close exists for {decision.symbol}, "
+                        "but broker has no open close order. Pausing until operator review."
+                    ),
+                )
+                if self.sm.can_trade():
+                    self.sm.pause("persisted pending exit unresolved")
+            return None
         try:
+            open_close_order = await self._find_open_close_order(decision)
+            if open_close_order:
+                self._pending_exit_symbols.add(decision.symbol)
+                persisted = await upsert_pending_exit(
+                    decision.symbol,
+                    open_close_order,
+                    reason=decision.reason,
+                )
+                if not persisted:
+                    await self._notify_once(
+                        f"exit-pending-persistence-failed-{decision.symbol}",
+                        (
+                            f"EXIT WARNING: broker already has an open close order for {decision.symbol}, "
+                            "but local pending-exit persistence failed."
+                        ),
+                    )
+                    if self.sm.can_trade():
+                        self.sm.pause("broker close order pending but local pending-exit persistence failed")
+                await self._notify_once(
+                    f"exit-pending-broker-{decision.symbol}",
+                    f"EXIT SUPPRESSED: broker already has an open close order for {decision.symbol}.",
+                )
+                return None
+
             self._pending_exit_symbols.add(decision.symbol)
             order = await self.adapter.close_position(decision.symbol, reason=decision.reason)
-            persisted = await upsert_order_record(order, rationale=decision.reason)
-            if not persisted:
+            order_persisted = await upsert_order_record(order, rationale=decision.reason)
+            pending_persisted = await upsert_pending_exit(decision.symbol, order, reason=decision.reason)
+            if not order_persisted or not pending_persisted:
                 await self._notify_once(
                     f"exit-persistence-failed-{decision.symbol}",
                     f"EXIT WARNING: broker close submitted for {decision.symbol}, but local persistence failed.",
@@ -324,7 +450,10 @@ class TradingSupervisor:
         open_positions = [p for p in positions if abs(_float(p.get("qty"))) > 0]
         open_symbols = {str(p.get("symbol", "")).upper() for p in open_positions}
         if positions_snapshot_ok:
-            self._pending_exit_symbols.intersection_update(open_symbols)
+            try:
+                await self._sync_persisted_pending_exits(open_symbols)
+            except Exception as e:
+                errors.append(f"pending exit sync failed: {e}")
         if open_positions:
             lines = ["POSITION MONITOR:"]
             lines.extend(_format_position_line(p) for p in open_positions)

@@ -130,6 +130,48 @@ Append-only by day. Do not remove past entries.
 - Confidence:
   - high
 
+## 2026-06-02 (America/Los_Angeles) - Day 2 Close-Path Hardening
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Responded to real AMPX dry-run max-loss exit alerts by hardening the close path before enabling auto-exit.
+  - Added broker open-order inspection so the supervisor suppresses a close if Alpaca already has an open close order for the symbol.
+  - Added durable pending-exit persistence so a close submitted before a process restart remains remembered.
+  - Added pending-exit cleanup only after a trusted broker position snapshot proves the symbol is no longer open.
+  - Added failed close-order recovery: canceled/rejected/expired pending closes clear during broker reconciliation and can be retried.
+  - Added unresolved persisted pending-exit handling: if no matching broker/client close-order ID exists, the supervisor pauses and alerts for operator review.
+  - Added explicit alert + pause if a broker open close exists but local pending-exit persistence fails.
+  - Removed retry wrapping from single-position close submission so a transient response-path failure cannot duplicate a close order inside the adapter.
+  - Added regression tests for:
+    - pending-exit persistence roundtrip;
+    - persisted pending exit suppressing duplicate close after restart;
+    - broker open close order suppressing duplicate close and persisting the pending marker.
+    - failed pending close clearing and retrying.
+    - broker-open-close persistence failure alerting/pausing.
+    - pending-exit cleanup after a trusted empty position snapshot.
+    - unresolved persisted pending exit pausing for review.
+    - single-position close submission not being retry-wrapped.
+    - unrelated open close orders not satisfying a persisted pending-exit marker.
+- IN_PROGRESS:
+  - None.
+- NEXT:
+  - Commit and push approved close-path hardening.
+  - Decide whether to manually test the close path in paper or keep AMPX alert-only for more burn-in.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Local bot remains running in alert-only mode with `AUTO_EXIT_ENABLED=false`.
+  - `.venv/bin/python -m pytest -q` -> `48 passed`.
+  - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+  - `git diff --check` -> clean.
+  - Final Reviewer verdict: `APPROVE`.
+  - Final Optimizer verdict: `APPROVE`.
+- Confidence:
+  - high
+
 ## Week 1 Day-by-Day Plan (Target)
 
 - Day 1:

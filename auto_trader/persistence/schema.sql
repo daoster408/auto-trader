@@ -56,6 +56,17 @@ CREATE TABLE IF NOT EXISTS orders (
     rationale TEXT
 );
 
+CREATE TABLE IF NOT EXISTS pending_exits (
+    symbol TEXT PRIMARY KEY,
+    broker_order_id TEXT,
+    client_order_id TEXT,
+    reason TEXT,
+    qty REAL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS journal_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,  -- YYYY-MM-DD local report date

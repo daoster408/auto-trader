@@ -268,6 +268,113 @@ async def reconcile_broker_orders(orders: list[dict[str, Any]]) -> int:
     return count
 
 
+async def upsert_pending_exit(symbol: str, order: dict[str, Any] | None = None, reason: str | None = None) -> bool:
+    """Persist that an exit close is pending so restart cannot duplicate it."""
+    clean_symbol = symbol.upper()
+    if not clean_symbol:
+        return False
+    order = order or {}
+    now = datetime.now(UTC).isoformat() + "Z"
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO pending_exits (
+                        symbol, broker_order_id, client_order_id, reason, qty, status, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        broker_order_id=COALESCE(excluded.broker_order_id, pending_exits.broker_order_id),
+                        client_order_id=COALESCE(excluded.client_order_id, pending_exits.client_order_id),
+                        reason=COALESCE(excluded.reason, pending_exits.reason),
+                        qty=COALESCE(excluded.qty, pending_exits.qty),
+                        status='pending',
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        clean_symbol,
+                        order.get("broker_order_id") or order.get("id"),
+                        order.get("client_order_id") or order.get("id"),
+                        reason or order.get("rationale"),
+                        order.get("qty"),
+                        now,
+                        now,
+                    ),
+                )
+                await db.commit()
+            finally:
+                await db.close()
+            log.info("pending_exit_upserted", symbol=clean_symbol, broker_order_id=order.get("broker_order_id") or order.get("id"))
+            return True
+        except Exception as e:
+            log.error("pending_exit_upsert_failed", symbol=clean_symbol, error=str(e))
+            return False
+
+
+async def get_pending_exit_for_symbol(symbol: str) -> dict[str, Any] | None:
+    """Return a persisted pending exit, if one exists for the symbol."""
+    clean_symbol = symbol.upper()
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT symbol, broker_order_id, client_order_id, reason, qty, status, created_at, updated_at
+                    FROM pending_exits
+                    WHERE symbol = ? AND status = 'pending'
+                    """,
+                    (clean_symbol,),
+                )
+                row = await cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("pending_exit_lookup_failed", symbol=clean_symbol, error=str(e))
+            raise
+
+
+async def get_pending_exit_symbols() -> set[str]:
+    """Return all symbols with an active persisted pending exit."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute("SELECT symbol FROM pending_exits WHERE status = 'pending'")
+                rows = await cur.fetchall()
+                return {str(row["symbol"]).upper() for row in rows}
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("pending_exit_symbols_failed", error=str(e))
+            raise
+
+
+async def clear_pending_exit(symbol: str) -> bool:
+    """Clear a pending exit after a trusted position snapshot proves the symbol is gone."""
+    clean_symbol = symbol.upper()
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                await db.execute("DELETE FROM pending_exits WHERE symbol = ?", (clean_symbol,))
+                await db.commit()
+            finally:
+                await db.close()
+            log.info("pending_exit_cleared", symbol=clean_symbol)
+            return True
+        except Exception as e:
+            log.error("pending_exit_clear_failed", symbol=clean_symbol, error=str(e))
+            return False
+
+
 async def get_latest_order_records(limit: int = 5) -> list[dict[str, Any]]:
     """Return latest persisted order records for operator reports."""
     async with _DB_LOCK:

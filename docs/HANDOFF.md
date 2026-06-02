@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-02T20:06:52Z
-- Last updated local (`America/Los_Angeles`): 2026-06-02 13:06:56 PDT
+- Last updated UTC: 2026-06-02T20:31:31Z
+- Last updated local (`America/Los_Angeles`): 2026-06-02 13:31:31 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -109,6 +109,18 @@ Quick resume file for any AI session. Update at end of every work session.
   - Repeatable run/service package final Reviewer verdict: `APPROVE`.
   - Repeatable run/service package final Optimizer verdict: `APPROVE`.
   - Latest verification for run/service package: `39 passed`; compileall passed; `bash -n scripts/run_bot.sh` passed; `git diff --check` clean.
+  - Auto-exit close-path hardening implemented; final Reviewer and Optimizer verdicts: **APPROVE**:
+    - broker open close-order check before any supervisor close submission;
+    - durable `pending_exits` table so submitted/pending closes survive process restart;
+    - pending exits clear only after a trusted broker position snapshot proves the symbol is gone;
+    - close submissions persist both the order record and pending-exit marker;
+    - pending markers for canceled/rejected/expired close orders clear during broker reconciliation so the supervisor can retry;
+    - unresolved persisted pending exits with no matching broker/client close-order ID now pause and alert for operator review;
+    - broker-open-close persistence failures now explicitly alert and pause the state machine;
+    - persisted pending exits are covered by a regression proving cleanup after a trusted empty position snapshot;
+    - supervisor pauses if a broker close exists/submits but local pending-exit persistence fails;
+    - single-position close submission is intentionally not retry-wrapped so response-path failures cannot duplicate a broker close inside the adapter.
+  - Latest verification for close-path hardening: `48 passed`; compileall passed; `git diff --check` clean.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -135,8 +147,7 @@ Quick resume file for any AI session. Update at end of every work session.
 1. Keep the current local bot running for supervised paper burn-in.
 2. Decide whether to keep AMPX as alert-only after dry-run max-loss warnings or manually test the close path in paper.
 3. Decide when to opt in to `AUTO_EXIT_ENABLED` and `AUTO_ENTRY_ENABLED` during paper burn-in.
-4. Before long unattended `AUTO_EXIT_ENABLED=true` runs, consider broker open close-order checks and persisted pending exits.
-5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+4. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
 6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch

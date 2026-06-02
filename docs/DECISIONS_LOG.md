@@ -142,3 +142,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: Avoid executing or systemd-parsing `.env` secrets while keeping Oracle/Pi service runs resilient to clean exits after recoverable runtime failures.
 - Impact: `scripts/run_bot.sh` and systemd set `AUTO_TRADER_ENV_FILE`; `get_settings()` reads that env file; the systemd template uses `Restart=always`, `UMask=0077`, and host-visible `/tmp` health checks.
 - Confidence: high
+
+- UTC timestamp: 2026-06-02T20:13:56Z
+- Local timestamp (`America/Los_Angeles`): 2026-06-02 13:14:01 PDT
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- Decision: Require broker open close-order checks and durable pending-exit markers before enabling auto-exit.
+- Rationale: AMPX produced real dry-run max-loss exit alerts, so duplicate close prevention must survive both one-process ticks and process restarts before any autonomous exit execution.
+- Impact: Supervisor close execution now checks open broker orders, persists pending exits, clears filled pending state only after a trusted broker position snapshot proves the symbol is gone, clears failed pending close orders during reconciliation so they can be retried, pauses for review when a persisted pending close cannot be matched by broker/client order ID to an open broker close order, and keeps single-position close submission un-retried to avoid duplicate closes after response-path failures.
+- Confidence: high
