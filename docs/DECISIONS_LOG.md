@@ -160,3 +160,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: The approved close path needs a real market-open lifecycle test, but new entries should not restart until AMPX exit fill, duplicate-close suppression, pending-exit cleanup, and operator reporting are verified.
 - Impact: Local supervised mode uses `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=true`; `/status` and `/report` include pending exits and duplicate-exit suppression; `/report` includes latest journal notes; Wednesday market-open validation is documented in the runbook.
 - Confidence: high
+
+- UTC timestamp: 2026-06-02T22:08:55Z
+- Local timestamp (`America/Los_Angeles`): 2026-06-02 15:08:55 PDT
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- Decision: Enforce a single local bot process per SQLite trading database.
+- Rationale: Duplicate bot instances caused Telegram `getUpdates` conflicts and can confuse supervised trading state. The second process should fail before Telegram polling or supervisor execution.
+- Impact: Startup now acquires a non-blocking `/tmp/auto_trader_*.lock` keyed by the resolved DB path; duplicate startup exits with a clear fatal message naming the existing holder.
+- Confidence: high

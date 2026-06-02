@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-02T21:01:16Z
-- Last updated local (`America/Los_Angeles`): 2026-06-02 14:01:16 PDT
+- Last updated UTC: 2026-06-02T22:08:55Z
+- Last updated local (`America/Los_Angeles`): 2026-06-02 15:08:55 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -130,6 +130,9 @@ Quick resume file for any AI session. Update at end of every work session.
   - Telegram `/status` and `/report` now include pending exits, matched broker/order status, duplicate-exit suppression language, and latest journal entries.
   - Supervisor now appends a lightweight journal entry when an auto-exit is submitted.
   - Latest verification for pending-exit visibility and journaling: `49 passed`; compileall passed; `git diff --check` clean.
+  - Normal pending-close suppression is now log-only so Telegram does not repeat expected AMPX pending-close notices.
+  - Startup now enforces a single local bot process per SQLite DB with a `/tmp/auto_trader_*.lock`.
+  - Duplicate startup was verified to fail before Telegram polling with a clear fatal message naming the existing lock holder.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.

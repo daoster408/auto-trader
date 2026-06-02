@@ -22,6 +22,7 @@ scripts/run_bot.sh
 Expected startup checks:
 
 - Alpaca paper health succeeds.
+- Single-instance lock is acquired before Telegram polling starts.
 - State is restored from SQLite.
 - Telegram polling starts.
 - Supervisor starts with the configured `auto_entry` and `auto_exit` flags.
@@ -32,6 +33,7 @@ Telegram checks after startup:
 - Send `/status` and confirm pending exits show the close order ID, reason, status, and duplicate-exit suppression.
 - Send `/report` and confirm positions, orders, pending exits, and latest journal entries are visible.
 - Expected pending-close suppression is log-only; Telegram alerts are reserved for submitted exits, failures, unresolved pending exits, and operator actions.
+- A duplicate local bot process should fail fast on startup instead of creating Telegram `getUpdates` conflicts.
 - Do not use `/resume <token>` unless the restored state is intentionally ready to trade.
 - Use `/kill` only when you intend to flatten paper positions and persist `HALTED`.
 

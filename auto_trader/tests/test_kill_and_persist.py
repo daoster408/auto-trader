@@ -18,7 +18,7 @@ from auto_trader.comms.telegram_bot import TelegramBot
 from auto_trader.config.settings import Settings
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
-from auto_trader.__main__ import _handle_signal_shutdown, _should_emergency_halt_on_shutdown
+from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_shutdown, _should_emergency_halt_on_shutdown
 from auto_trader.scheduler.trading_supervisor import TradingSupervisor
 from auto_trader.persistence.db import (
     append_journal_entry,
@@ -124,6 +124,18 @@ class FakeTelegramUpdate:
         self.effective_chat = FakeTelegramIdentity(chat_id)
         self.effective_user = FakeTelegramIdentity(user_id)
         self.message = FakeTelegramMessage()
+
+
+def test_single_instance_lock_rejects_duplicate_for_same_db():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = str(Path(tmp) / "auto_trader.db")
+        lock_path, first_handle = _acquire_single_instance_lock(db_path)
+        try:
+            with pytest.raises(RuntimeError, match="already running"):
+                _acquire_single_instance_lock(db_path)
+        finally:
+            first_handle.close()
+            lock_path.unlink(missing_ok=True)
 
 
 def test_close_position_submit_is_not_retry_wrapped():

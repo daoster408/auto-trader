@@ -16,6 +16,8 @@ Hardened:
 """
 import asyncio
 from contextlib import suppress
+import fcntl
+import hashlib
 import os
 import signal
 import sys
@@ -35,6 +37,27 @@ from auto_trader.scheduler.trading_supervisor import TradingSupervisor
 from auto_trader.utils.logging import setup_logging, get_logger
 
 log = get_logger("auto_trader.main")
+
+
+def _acquire_single_instance_lock(db_path: str) -> tuple[Path, object]:
+    """Prevent duplicate bot processes for the same persisted trading state."""
+    resolved_db = Path(db_path).expanduser().resolve()
+    digest = hashlib.sha256(str(resolved_db).encode("utf-8")).hexdigest()[:16]
+    lock_path = Path("/tmp") / f"auto_trader_{digest}.lock"
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as e:
+        handle.seek(0)
+        existing = handle.read().strip()
+        handle.close()
+        detail = f" Existing holder: {existing}" if existing else ""
+        raise RuntimeError(f"another auto-trader instance is already running for {resolved_db}.{detail}") from e
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"pid={os.getpid()}\ndb_path={resolved_db}\nstarted_at={datetime.now(UTC).isoformat()}Z\n")
+    handle.flush()
+    return lock_path, handle
 
 
 async def _persist_hook(state, reason: str | None) -> None:
@@ -133,6 +156,8 @@ async def main() -> None:
         model_tag="optimizer/harden-2026-06-01",
         json_logs=os.getenv("LOG_JSON", "false").lower() == "true",
     )
+    lock_path, instance_lock = _acquire_single_instance_lock(settings.db_path)
+    log.info("single_instance_lock_acquired", path=str(lock_path))
 
     log.critical("=== AUTO-TRADER OPTIMIZER HARDENED START ===")
     log.info(

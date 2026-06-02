@@ -192,6 +192,8 @@ Append-only by day. Do not remove past entries.
   - Added Telegram pending-exit visibility to `/status` and `/report`.
   - Added latest journal entries to `/report`.
   - Added lightweight journal append support and supervisor auto-exit journal writes.
+  - Quieted normal pending-close suppression so Telegram does not repeat expected market-closed AMPX notices.
+  - Added a single-instance startup lock keyed by the resolved SQLite DB path so duplicate local bot processes fail before Telegram polling.
   - Added a Wednesday market-open checklist to `docs/RUNBOOK.md`.
 - NEXT:
   - Restart the supervised bot after this code is committed so `/status` and `/report` use the new pending-exit visibility code.
@@ -202,7 +204,8 @@ Append-only by day. Do not remove past entries.
 - Evidence:
   - `.env` has `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=true`.
   - Local DB has AMPX pending exit for close order `d08fb2a8-7df4-4da5-b3b5-d4c939be1fde`.
-  - `.venv/bin/python -m pytest -q` -> `49 passed`.
+  - Duplicate startup now fails with a clear existing-holder message before Telegram polling.
+  - `.venv/bin/python -m pytest -q` -> `50 passed`.
   - `.venv/bin/python -m compileall -q auto_trader` -> passed.
   - `git diff --check` -> clean.
 - Confidence:
