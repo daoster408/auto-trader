@@ -266,3 +266,40 @@ async def reconcile_broker_orders(orders: list[dict[str, Any]]) -> int:
             count += 1
     log.info("broker_orders_reconciled", count=count, attempted=len(orders))
     return count
+
+
+async def get_latest_order_records(limit: int = 5) -> list[dict[str, Any]]:
+    """Return latest persisted order records for operator reports."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT
+                        client_order_id,
+                        broker_order_id,
+                        symbol,
+                        side,
+                        qty,
+                        order_type,
+                        status,
+                        filled_qty,
+                        avg_fill_price,
+                        submitted_at,
+                        filled_at,
+                        rationale
+                    FROM orders
+                    ORDER BY COALESCE(submitted_at, filled_at, '') DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cur.fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("latest_order_records_failed", error=str(e))
+            raise

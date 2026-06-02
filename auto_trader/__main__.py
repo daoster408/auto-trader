@@ -142,6 +142,7 @@ async def main() -> None:
         risk_engine=risk_engine,
         adapter=adapter,
         resume_token=settings.resume_token,
+        allowed_ids=settings.telegram_allowed_ids,
     )
 
     # Graceful shutdown + dual-path kill (OS signals now also trigger real halt+flatten)

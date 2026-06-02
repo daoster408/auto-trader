@@ -9,6 +9,8 @@ Commands exactly as specified in SOURCE_OF_TRUTH:
 """
 import asyncio
 from datetime import UTC, datetime
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.ext import (
@@ -21,10 +23,77 @@ from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.models import KillResult
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.state_machine import StateMachine
+from auto_trader.persistence.db import count_entry_orders_since, get_latest_order_records, reconcile_broker_orders
 from auto_trader.utils.logging import get_logger
 from auto_trader.utils.retry import retry_kill_critical
 
 log = get_logger("auto_trader.comms.telegram_bot")
+
+
+def _money(value: Any) -> str:
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _number(value: Any, digits: int = 6) -> str:
+    try:
+        return f"{float(value):,.{digits}f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _format_positions(positions: list[dict[str, Any]]) -> str:
+    if not positions:
+        return "Open positions: none"
+    lines = ["Open positions:"]
+    for pos in positions:
+        symbol = str(pos.get("symbol", "?")).upper()
+        qty = _number(pos.get("qty"))
+        market_value = _money(pos.get("market_value"))
+        unrealized = _money(pos.get("unrealized_pl"))
+        lines.append(f"- {symbol}: qty {qty}, value {market_value}, unrealized P/L {unrealized}")
+    return "\n".join(lines)
+
+
+def _format_orders(orders: list[dict[str, Any]], *, title: str = "Latest orders") -> str:
+    if not orders:
+        return f"{title}: none"
+    lines = [f"{title}:"]
+    for order in orders:
+        symbol = str(order.get("symbol", "?")).upper()
+        status = str(order.get("status", "unknown"))
+        qty = _number(order.get("filled_qty") or order.get("qty"))
+        avg = _money(order.get("avg_fill_price"))
+        broker_id = str(order.get("broker_order_id") or order.get("client_order_id") or "n/a")
+        short_id = broker_id[:8] if broker_id != "n/a" else broker_id
+        lines.append(f"- {symbol}: {status}, qty {qty}, avg {avg}, id {short_id}")
+    return "\n".join(lines)
+
+
+def _entry_status(
+    state_can_trade: bool,
+    positions: list[dict[str, Any]],
+    max_positions: int,
+    today_new_entries: int | None,
+    errors: list[Any],
+    account_tradable: bool,
+) -> str:
+    if not state_can_trade:
+        return "blocked by system state"
+    if errors:
+        return "blocked by unavailable risk data"
+    if not account_tradable:
+        return "blocked by broker account status"
+    open_position_count = sum(1 for p in positions if abs(float(p.get("qty") or 0.0)) > 0)
+    if open_position_count >= max_positions:
+        return "blocked by open-position limit"
+    if today_new_entries is None:
+        return "blocked by unavailable durable entry count"
+    if today_new_entries >= max_positions:
+        return "blocked by daily-entry limit"
+    return "allowed"
 
 
 class TelegramBot:
@@ -37,16 +106,210 @@ class TelegramBot:
         risk_engine: RiskEngine,
         adapter: AlpacaAdapter,
         resume_token: str,
+        allowed_ids: str | list[int] | None = None,
     ) -> None:
         self.token = token
         self.sm = state_machine
         self.risk = risk_engine
         self.adapter = adapter
         self.resume_token = resume_token
+        self.allowed_ids = self._parse_allowed_ids(allowed_ids)
         self.app: Application | None = None
+
+    @staticmethod
+    def _parse_allowed_ids(raw: str | list[int] | None) -> set[int]:
+        if isinstance(raw, list):
+            return {int(value) for value in raw}
+        if not raw:
+            return set()
+        allowed: set[int] = set()
+        for item in str(raw).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            allowed.add(int(item))
+        return allowed
+
+    def _is_authorized(self, update: Update) -> bool:
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_id = update.effective_user.id if update.effective_user else None
+        if chat_id is not None and chat_id in self.allowed_ids:
+            return True
+        return chat_id is not None and user_id is not None and chat_id == user_id and user_id in self.allowed_ids
+
+    async def _reject_unauthorized(self, update: Update, command: str) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_id = update.effective_user.id if update.effective_user else None
+        log.critical("telegram_unauthorized_command", command=command, chat_id=chat_id, user_id=user_id)
+        if update.message:
+            await update.message.reply_text("Unauthorized.")
+
+    async def _require_authorized(self, update: Update, command: str) -> bool:
+        if self._is_authorized(update):
+            return True
+        await self._reject_unauthorized(update, command)
+        return False
+
+    async def _reconcile_and_snapshot(self) -> dict[str, Any]:
+        """Read-only operator snapshot. Never submits orders."""
+        result: dict[str, Any] = {
+            "health": {"paper": self.adapter.paper},
+            "account": None,
+            "positions": [],
+            "orders": [],
+            "reconciled": None,
+            "today_new_entries": None,
+            "errors": [],
+        }
+
+        try:
+            account = await self.adapter.get_account_snapshot()
+            result["account"] = account
+            if account.get("status") == "ERROR":
+                error = account.get("error", "account snapshot returned ERROR")
+                result["errors"].append(f"account unavailable: {error}")
+        except Exception as e:
+            log.warning("telegram_account_failed", error=str(e))
+            result["account"] = {"status": "ERROR"}
+            result["errors"].append(f"account unavailable: {e}")
+
+        try:
+            clock = await self.adapter.get_clock()
+            if clock.get("source") == "error":
+                error = clock.get("error", "market clock returned ERROR")
+                result["errors"].append(f"market clock unavailable: {error}")
+            result["health"].update(
+                {
+                    "status": result["account"].get("status"),
+                    "paper": self.adapter.paper,
+                    "market_open": None if clock.get("source") == "error" else clock.get("is_open"),
+                }
+            )
+        except Exception as e:
+            log.warning("telegram_clock_failed", error=str(e))
+            result["errors"].append(f"market clock unavailable: {e}")
+
+        try:
+            recent_orders = await self.adapter.get_recent_orders(days=7)
+            result["reconciled"] = await reconcile_broker_orders(recent_orders)
+        except Exception as e:
+            log.warning("telegram_reconciliation_failed", error=str(e))
+            result["errors"].append(f"reconciliation failed: {e}")
+
+        try:
+            timezone = ZoneInfo(getattr(self.risk.settings, "report_timezone", "America/Los_Angeles"))
+            local_now = datetime.now(timezone)
+            local_day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            result["today_new_entries"] = await count_entry_orders_since(local_day_start.astimezone(UTC).isoformat())
+        except Exception as e:
+            log.warning("telegram_entry_count_failed", error=str(e))
+            result["errors"].append(f"durable entry count unavailable: {e}")
+
+        try:
+            result["positions"] = await self.adapter.get_positions_snapshot(strict=True)
+        except Exception as e:
+            log.warning("telegram_positions_failed", error=str(e))
+            result["errors"].append(f"positions unavailable: {e}")
+
+        try:
+            result["orders"] = await get_latest_order_records(limit=3)
+        except Exception as e:
+            log.warning("telegram_orders_failed", error=str(e))
+            result["errors"].append(f"orders unavailable: {e}")
+
+        return result
+
+    async def _bounded_snapshot(self) -> dict[str, Any]:
+        try:
+            return await asyncio.wait_for(self._reconcile_and_snapshot(), timeout=8.0)
+        except Exception as e:
+            log.warning("telegram_snapshot_timed_out_or_failed", error=str(e))
+            return {
+                "health": {"paper": self.adapter.paper},
+                "account": {"status": "ERROR"},
+                "positions": [],
+                "orders": [],
+                "reconciled": None,
+                "today_new_entries": None,
+                "errors": [f"snapshot unavailable: {e}"],
+            }
+
+    def _build_status_message(self, snapshot: dict[str, Any]) -> str:
+        account = snapshot.get("account") or {}
+        health = snapshot.get("health") or {}
+        positions = snapshot.get("positions") or []
+        orders = snapshot.get("orders") or []
+        errors = snapshot.get("errors") or []
+        today_new_entries = snapshot.get("today_new_entries")
+        equity = float(account.get("equity") or health.get("equity") or 0.0)
+        snap = self.sm.get_snapshot(
+            equity=equity,
+            cash=float(account.get("cash") or 0.0),
+            open_positions=positions,
+        )
+        max_positions = int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1)
+        account_tradable = (
+            account.get("status") == "CONNECTED"
+            and "active" in str(account.get("account_status", "")).lower()
+            and not account.get("trading_blocked")
+            and not account.get("account_blocked")
+        )
+        lines = [
+            "AUTO-TRADER STATUS",
+            f"State: {snap.state.value}",
+            f"State allows trading: {self.sm.can_trade()}",
+            f"New entries: {_entry_status(self.sm.can_trade(), positions, max_positions, today_new_entries, errors, account_tradable)}",
+            f"Today new entries: {today_new_entries if today_new_entries is not None else 'unknown'} / {max_positions}",
+            f"Alpaca: {account.get('status') or health.get('status')}",
+            f"Paper: {health.get('paper')}",
+            f"Market open: {health.get('market_open')}",
+            f"Account status: {account.get('account_status', 'unknown')}",
+            f"Trading blocked: {account.get('trading_blocked', 'unknown')}",
+            f"Account blocked: {account.get('account_blocked', 'unknown')}",
+            f"Equity: {_money(snap.equity)}",
+            f"Cash: {_money(account.get('cash'))}",
+            f"Buying power: {_money(account.get('buying_power'))}",
+            _format_positions(positions),
+            _format_orders(orders, title="Latest order"),
+        ]
+        if snapshot.get("reconciled") is not None:
+            lines.append(f"Orders reconciled: {snapshot['reconciled']}")
+        if errors:
+            lines.append("Warnings: " + "; ".join(str(e) for e in errors))
+        lines.append(f"Last updated: {snap.updated_at.isoformat()}Z")
+        return "\n".join(lines)
+
+    def _build_report_message(self, snapshot: dict[str, Any]) -> str:
+        account = snapshot.get("account") or {}
+        positions = snapshot.get("positions") or []
+        orders = snapshot.get("orders") or []
+        errors = snapshot.get("errors") or []
+        unrealized = sum(float(p.get("unrealized_pl") or 0.0) for p in positions)
+        exposure = sum(abs(float(p.get("market_value") or 0.0)) for p in positions)
+        lines = [
+            "DAILY REPORT",
+            f"State: {self.sm.state.value}",
+            f"Equity: {_money(account.get('equity'))}",
+            f"Cash: {_money(account.get('cash'))}",
+            f"Account status: {account.get('account_status', 'unknown')}",
+            f"Trading blocked: {account.get('trading_blocked', 'unknown')}",
+            f"Account blocked: {account.get('account_blocked', 'unknown')}",
+            f"Open exposure: {_money(exposure)}",
+            f"Open unrealized P/L: {_money(unrealized)}",
+            _format_positions(positions),
+            _format_orders(orders),
+            f"Orders reconciled: {snapshot.get('reconciled') if snapshot.get('reconciled') is not None else 'unknown'}",
+            f"Generated at: {datetime.now(UTC).isoformat()}Z",
+            "Journal: reconciliation-backed report; trade rationale summaries coming next.",
+        ]
+        if errors:
+            lines.append("Warnings: " + "; ".join(str(e) for e in errors))
+        return "\n".join(lines)
 
     async def _kill_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """HIGHEST PRIORITY. Preempts all other logic. Fully async, retried, no deadlocks."""
+        if not await self._require_authorized(update, "/kill"):
+            return
         log.critical("/kill received - initiating emergency flatten + HALTED")
         await update.message.reply_text("⚠️ /kill received. Executing cancel_all + flatten_all + HALTED...")
 
@@ -93,21 +356,19 @@ class TelegramBot:
         log.critical("kill_completed", cancelled=result.orders_cancelled, flattened=result.positions_flattened)
 
     async def _status_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        health = await self.adapter.health_check()
-        snap = self.sm.get_snapshot(equity=100_000.0)  # TODO: real equity from adapter
-        status = (
-            "🟢 AUTO-TRADER STATUS\n"
-            f"State: {snap.state.value}\n"
-            f"Equity: ${snap.equity:,.2f}\n"
-            f"Can trade: {self.sm.can_trade()}\n"
-            f"Alpaca: {health.get('status')}\n"
-            f"Paper: {health.get('paper')}\n"
-            f"Last updated: {snap.updated_at.isoformat()}Z"
+        if not await self._require_authorized(update, "/status"):
+            return
+        snapshot = await self._bounded_snapshot()
+        await update.message.reply_text(self._build_status_message(snapshot))
+        log.info(
+            "status_reported",
+            state=self.sm.state.value,
+            warnings=len(snapshot.get("errors") or []),
         )
-        await update.message.reply_text(status)
-        log.info("status_reported", state=snap.state.value, alpaca_ok=health.get("ok"))
 
     async def _pause_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_authorized(update, "/pause"):
+            return
         if not self.sm.can_trade():
             await update.message.reply_text(f"Already in {self.sm.state.value}")
             return
@@ -116,6 +377,8 @@ class TelegramBot:
         log.warning("manual_pause", user=update.effective_user.username if update.effective_user else "unknown")
 
     async def _resume_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_authorized(update, "/resume"):
+            return
         token = " ".join(context.args) if context.args else ""
         ok = self.sm.resume(token, self.resume_token)
         if ok:
@@ -126,23 +389,24 @@ class TelegramBot:
             log.warning("manual_resume_failed")
 
     async def _report_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        snap = self.sm.get_snapshot()
-        report = (
-            "📊 DAILY REPORT (stub)\n"
-            f"State: {snap.state.value}\n"
-            f"Equity: ${snap.equity:,.2f}\n"
-            f"Daily PnL: ${snap.daily_pnl:,.2f}\n"
-            "Full journal coming in later iteration."
+        if not await self._require_authorized(update, "/report"):
+            return
+        snapshot = await self._bounded_snapshot()
+        await update.message.reply_text(self._build_report_message(snapshot))
+        log.info(
+            "report_requested",
+            state=self.sm.state.value,
+            warnings=len(snapshot.get("errors") or []),
         )
-        await update.message.reply_text(report)
-        log.info("report_requested", state=snap.state.value)
 
     async def _unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_authorized(update, "unknown"):
+            return
         await update.message.reply_text("Unknown command. Use /status, /pause, /resume <token>, /kill, /report")
 
     def build(self) -> Application:
         """Build the Application with all command handlers."""
-        app = Application.builder().token(self.token).build()
+        app = Application.builder().token(self.token).concurrent_updates(True).build()
 
         app.add_handler(CommandHandler("status", self._status_handler))
         app.add_handler(CommandHandler("pause", self._pause_handler))

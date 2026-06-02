@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-02T15:34:39Z
-- Last updated local (`America/Los_Angeles`): 2026-06-02 08:34:39 PDT
+- Last updated UTC: 2026-06-02T16:07:09Z
+- Last updated local (`America/Los_Angeles`): 2026-06-02 09:07:09 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -17,6 +17,9 @@ Quick resume file for any AI session. Update at end of every work session.
   - Reviewer/Optimizer BLOCK findings addressed; re-review requested
   - Automatic visible Reviewer/Optimizer polling/fix/re-review workflow clarified in docs
   - GitHub sync rule added: approved major milestones and safety fixes should be committed and pushed automatically
+  - Telegram `/status` and `/report` visibility implemented
+  - Telegram visibility Reviewer/Optimizer BLOCK findings addressed; re-review returned `APPROVE WITH CHANGES`
+  - Final pre-commit Telegram visibility changes applied; final Reviewer and Optimizer verdicts: **APPROVE**
   - Automatic Reviewer/Optimizer cycle completed after major Engineer work
   - Final Reviewer verdict for tomorrow readiness: **APPROVE**
 - System status:
@@ -44,6 +47,22 @@ Quick resume file for any AI session. Update at end of every work session.
   - Final visible Optimizer verdict: `APPROVE`.
   - GitHub sync complete:
     - Commit `b30d690` (`Add reconciliation and duplicate trade guards`) pushed to `origin/main`.
+  - Telegram visibility now reports:
+    - live Alpaca equity/cash/buying power,
+    - AMPX open position,
+    - latest filled order,
+    - reconciliation count,
+    - durable same-day entry count,
+    - whether new entries are blocked by open-position or daily-entry limits.
+  - Latest Telegram preview was read-only and submitted no orders.
+  - Telegram is now fail-closed with `TELEGRAM_ALLOWED_IDS`; local `.env` has one allowed private Telegram ID configured and remains ignored.
+  - All Telegram handlers require authorization before data reads or controls.
+  - Telegram app enables concurrent update processing so `/kill` is not queued behind status/report broker reads.
+  - Telegram user-ID allowlist only authorizes private chats; group chats must be explicitly allowlisted by chat ID.
+  - Status/report snapshots are bounded and surface account/clock/reconciliation warnings, including adapter returned error dictionaries.
+  - Latest verification: `25 passed`; compileall passed.
+  - Final visible Reviewer verdict for Telegram visibility: `APPROVE`.
+  - Final visible Optimizer verdict for Telegram visibility: `APPROVE`.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -67,7 +86,7 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Immediate Next Actions
 
-1. Add Telegram notification/report path for submitted/filled orders and current open position.
+1. Commit and push approved Telegram visibility patch.
 2. Add scheduled/periodic reconciliation loop or explicit command path.
 3. Add position monitoring and exit/kill validation around the now-open paper position.
 4. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.

@@ -12,11 +12,13 @@ import pytest
 from auto_trader.core.models import SystemState, KillResult, TradeIntent
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
+from auto_trader.comms.telegram_bot import TelegramBot
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.persistence.db import (
     configure_db_path,
     count_entry_orders_since,
+    get_latest_order_records,
     init_db,
     load_system_state,
     reconcile_broker_orders,
@@ -52,6 +54,27 @@ class DummySnapshotWithTodayEntry:
 class DummySnapshotMissingTodayEntry:
     equity = 100.0
     open_positions = []
+
+
+class FakeTelegramIdentity:
+    def __init__(self, id):
+        self.id = id
+        self.username = "test"
+
+
+class FakeTelegramMessage:
+    def __init__(self):
+        self.replies = []
+
+    async def reply_text(self, text):
+        self.replies.append(text)
+
+
+class FakeTelegramUpdate:
+    def __init__(self, chat_id=123, user_id=456):
+        self.effective_chat = FakeTelegramIdentity(chat_id)
+        self.effective_user = FakeTelegramIdentity(user_id)
+        self.message = FakeTelegramMessage()
 
 
 @pytest.mark.asyncio
@@ -250,6 +273,10 @@ async def test_entry_order_count_uses_persisted_orders():
         assert await count_entry_orders_since("2026-06-02T07:00:00+00:00") == 1
         assert await count_entry_orders_since("2026-06-03T07:00:00+00:00") == 0
 
+        latest = await get_latest_order_records(limit=1)
+        assert latest[0]["symbol"] == "AMPX"
+        assert latest[0]["status"] == "filled"
+
 
 @pytest.mark.asyncio
 async def test_entry_order_count_failure_raises():
@@ -319,3 +346,420 @@ async def test_order_manager_pauses_on_post_submit_persistence_failure(monkeypat
     assert result["persistence"]["order_record_saved"] is False
     assert result["risk_decision"]["approved"] is False
     assert sm.state == SystemState.PAUSED
+
+
+def test_telegram_status_and_report_include_account_position_and_order():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+    snapshot = {
+        "health": {"status": "CONNECTED", "paper": True, "market_open": True},
+        "account": {
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 100.0,
+            "cash": 80.0,
+            "buying_power": 80.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        "positions": [{"symbol": "AMPX", "qty": 0.832986, "market_value": 20.07, "unrealized_pl": -0.04}],
+        "orders": [
+            {
+                "broker_order_id": "eaf99d3e-c577-4b2d-8f4f-74cd74be4178",
+                "symbol": "AMPX",
+                "status": "filled",
+                "filled_qty": 0.832986,
+                "avg_fill_price": 24.134,
+            }
+        ],
+        "reconciled": 1,
+        "today_new_entries": 0,
+        "errors": [],
+    }
+
+    status = bot._build_status_message(snapshot)
+    report = bot._build_report_message(snapshot)
+
+    assert "AUTO-TRADER STATUS" in status
+    assert "Equity: $100.00" in status
+    assert "State allows trading: True" in status
+    assert "New entries: blocked by open-position limit" in status
+    assert "AMPX: qty 0.832986" in status
+    assert "filled" in status
+    assert "Orders reconciled: 1" in status
+    assert "DAILY REPORT" in report
+    assert "Open unrealized P/L: $-0.04" in report
+
+
+def test_telegram_status_surfaces_warnings():
+    sm = StateMachine(initial_state=SystemState.PAUSED)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+    status = bot._build_status_message(
+        {
+            "health": {"status": "ERROR", "paper": True, "market_open": False},
+            "account": {"status": "ERROR"},
+            "positions": [],
+            "orders": [],
+            "reconciled": None,
+            "today_new_entries": None,
+            "errors": ["positions unavailable"],
+        }
+    )
+
+    assert "State: PAUSED" in status
+    assert "New entries: blocked by system state" in status
+    assert "Warnings: positions unavailable" in status
+
+
+def test_telegram_status_blocks_entries_when_risk_data_unavailable():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+
+    status = bot._build_status_message(
+        {
+            "health": {"status": "CONNECTED", "paper": True, "market_open": True},
+            "account": {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "buying_power": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            },
+            "positions": [],
+            "orders": [],
+            "reconciled": None,
+            "today_new_entries": 0,
+            "errors": ["positions unavailable"],
+        }
+    )
+
+    assert "New entries: blocked by unavailable risk data" in status
+
+
+def test_telegram_status_blocks_entries_at_durable_daily_limit():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+
+    status = bot._build_status_message(
+        {
+            "health": {"status": "CONNECTED", "paper": True, "market_open": True},
+            "account": {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "buying_power": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            },
+            "positions": [],
+            "orders": [],
+            "reconciled": 0,
+            "today_new_entries": 1,
+            "errors": [],
+        }
+    )
+
+    assert "New entries: blocked by daily-entry limit" in status
+    assert "Today new entries: 1 / 1" in status
+
+
+@pytest.mark.asyncio
+async def test_telegram_unauthorized_status_does_not_read_broker():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {"snapshot": 0}
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[999],
+    )
+
+    async def fake_snapshot():
+        called["snapshot"] += 1
+        return {}
+
+    bot._bounded_snapshot = fake_snapshot
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._status_handler(update, object())
+
+    assert called["snapshot"] == 0
+    assert update.message.replies == ["Unauthorized."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_allowlisted_user_id_does_not_authorize_group_chat():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {"snapshot": 0}
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[456],
+    )
+
+    async def fake_snapshot():
+        called["snapshot"] += 1
+        return {}
+
+    bot._bounded_snapshot = fake_snapshot
+    update = FakeTelegramUpdate(chat_id=-100123, user_id=456)
+
+    await bot._status_handler(update, object())
+
+    assert called["snapshot"] == 0
+    assert update.message.replies == ["Unauthorized."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_authorized_status_reads_snapshot(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+
+    async def fake_snapshot():
+        return {
+            "health": {"status": "CONNECTED", "paper": True, "market_open": True},
+            "account": {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "buying_power": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            },
+            "positions": [],
+            "orders": [],
+            "reconciled": 0,
+            "today_new_entries": 0,
+            "errors": [],
+        }
+
+    bot._bounded_snapshot = fake_snapshot
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._status_handler(update, object())
+
+    assert "AUTO-TRADER STATUS" in update.message.replies[0]
+    assert "New entries: allowed" in update.message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_telegram_unauthorized_kill_does_not_halt():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[999],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._kill_handler(update, object())
+
+    assert sm.state == SystemState.ACTIVE
+    assert update.message.replies == ["Unauthorized."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_snapshot_gather_reconciles_and_reads_once(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def get_account_snapshot(self):
+            self.calls.append("account")
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "buying_power": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            self.calls.append("clock")
+            return {"is_open": True}
+
+        async def get_recent_orders(self, days=7):
+            self.calls.append(f"orders:{days}")
+            return [{"id": "order-1", "symbol": "AMPX"}]
+
+        async def get_positions_snapshot(self, *, strict=False):
+            self.calls.append(f"positions:{strict}")
+            return [{"symbol": "AMPX", "qty": 0.832986, "market_value": 20.0, "unrealized_pl": -0.1}]
+
+    async def fake_reconcile(orders):
+        assert orders == [{"id": "order-1", "symbol": "AMPX"}]
+        return 1
+
+    async def fake_latest(limit=3):
+        return [{"symbol": "AMPX", "status": "filled", "filled_qty": 0.832986, "avg_fill_price": 24.134}]
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_order_records", fake_latest)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.count_entry_orders_since", fake_count)
+
+    adapter = FakeAdapter()
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=adapter,
+        resume_token="resume",
+    )
+
+    snapshot = await bot._reconcile_and_snapshot()
+
+    assert snapshot["reconciled"] == 1
+    assert snapshot["positions"][0]["symbol"] == "AMPX"
+    assert snapshot["orders"][0]["status"] == "filled"
+    assert snapshot["today_new_entries"] == 0
+    assert snapshot["errors"] == []
+    assert adapter.calls == ["account", "clock", "orders:7", "positions:True"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_snapshot_gather_surfaces_account_and_clock_failures(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            raise RuntimeError("account down")
+
+        async def get_clock(self):
+            raise RuntimeError("clock down")
+
+        async def get_recent_orders(self, days=7):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_latest(limit=3):
+        return []
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_order_records", fake_latest)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.count_entry_orders_since", fake_count)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=FakeAdapter(),
+        resume_token="resume",
+    )
+
+    snapshot = await bot._reconcile_and_snapshot()
+
+    assert snapshot["account"]["status"] == "ERROR"
+    assert "account unavailable" in snapshot["errors"][0]
+    assert "market clock unavailable" in snapshot["errors"][1]
+
+
+@pytest.mark.asyncio
+async def test_telegram_snapshot_gather_surfaces_returned_error_dicts(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {"equity": 0.0, "cash": 0.0, "status": "ERROR", "error": "account returned error"}
+
+        async def get_clock(self):
+            return {"is_open": False, "source": "error", "error": "clock returned error"}
+
+        async def get_recent_orders(self, days=7):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_latest(limit=3):
+        return []
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_order_records", fake_latest)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.count_entry_orders_since", fake_count)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=FakeAdapter(),
+        resume_token="resume",
+    )
+
+    snapshot = await bot._reconcile_and_snapshot()
+    status = bot._build_status_message(snapshot)
+
+    assert "account unavailable: account returned error" in snapshot["errors"]
+    assert "market clock unavailable: clock returned error" in snapshot["errors"]
+    assert snapshot["health"]["market_open"] is None
+    assert "Market open: None" in status
+    assert "Warnings: account unavailable: account returned error; market clock unavailable: clock returned error" in status

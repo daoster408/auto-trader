@@ -592,3 +592,137 @@ Append-only by day. Do not remove past entries.
   - Optimizer thread: `019e88de-4a47-7971-8f09-80dbe63c444a`.
 - Confidence:
   - high
+
+## 2026-06-02 (America/Los_Angeles) - Telegram Visibility Implementation
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Architect -> Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Ran Architect pass in main thread:
+    - Telegram remains operator/reporting surface only.
+    - Broker reads stay in `AlpacaAdapter`.
+    - Durable order facts stay in SQLite.
+    - `/status` and `/report` reconcile/read/report; they do not submit orders.
+  - Ran Engineer implementation pass:
+    - Added `get_latest_order_records()` DB helper for operator reports.
+    - Replaced Telegram `/status` stub with live account, position, reconciliation, and latest-order status.
+    - Replaced Telegram `/report` stub with reconciliation-backed daily report.
+    - Added warning surfacing for degraded reconciliation, positions, or order reads.
+    - Added explicit distinction between:
+      - `State allows trading: True`
+      - `New entries: blocked by open-position limit`
+    - Added focused tests for latest order retrieval and Telegram status/report formatting.
+  - Verification:
+    - `.venv/bin/python -m pytest -q` -> `16 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+    - Read-only live Alpaca preview confirmed:
+      - State `ACTIVE`.
+      - New entries blocked by open-position limit.
+      - Equity about `$399.73`.
+      - AMPX open position quantity `0.832986`.
+      - Latest AMPX order is `filled`, avg `$24.13`.
+      - Orders reconciled: `1`.
+- IN_PROGRESS:
+  - Launching visible Reviewer and Optimizer background threads for this major pass.
+- NEXT:
+  - Engineer must proactively read Reviewer/Optimizer verdicts.
+  - Fix any BLOCK / APPROVE WITH CHANGES findings.
+  - Re-run tests, update docs, re-review, then commit/push when approved.
+- BLOCKED:
+  - Pending Reviewer/Optimizer review.
+- Evidence:
+  - Live preview was read-only: account/order/position/reconciliation only; no orders submitted.
+- Confidence:
+  - high
+
+## 2026-06-02 (America/Los_Angeles) - Telegram Visibility Blocker Fixes
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Read visible Reviewer and Optimizer reports for Telegram visibility.
+  - Reviewer verdict: `BLOCK`.
+    - Missing Telegram command authorization before exposing account/order/position data or controls.
+    - New-entry status could be misleading if durable/risk data is degraded.
+    - Tests did not cover authorization or no-capital-action behavior.
+  - Optimizer verdict: `BLOCK`.
+    - `/status` and `/report` could delay `/kill` under single-update processing and slow broker reads.
+    - Operator reads did avoidable broker work.
+    - Snapshot gather path was not directly tested.
+  - Fixed blockers:
+    - Added `TELEGRAM_ALLOWED_IDS` setting and `.env.example` docs.
+    - Telegram handlers now require allowlisted chat/user authorization before any data read or control action.
+    - Unauthorized `/status` does not read broker data.
+    - Unauthorized `/kill` does not halt.
+    - Local `.env` configured with one allowed private Telegram ID; `.env` remains ignored.
+    - Telegram app now enables concurrent update processing so `/kill` is not queued behind slow `/status`/`/report`.
+    - Status/report snapshot is bounded with an 8s timeout.
+    - Snapshot path now avoids duplicate account reads (`get_account_snapshot` + `get_clock`, not `health_check` + account snapshot).
+    - Account/clock failures surface warnings instead of hiding the operator view.
+    - New-entry status now blocks on unavailable risk data or broker account status.
+    - Status/report now surface `account_status`, `trading_blocked`, `account_blocked`, reconciliation count, and generated timestamp.
+  - Added tests:
+    - unauthorized `/status` does not read broker,
+    - authorized `/status` reads snapshot,
+    - unauthorized `/kill` does not halt,
+    - `_reconcile_and_snapshot()` happy path,
+    - `_reconcile_and_snapshot()` account/clock failure warnings,
+    - status blocks entries when risk data is unavailable.
+  - Verification:
+    - `.venv/bin/python -m pytest -q` -> `22 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+    - `.env` confirmed ignored by git.
+- IN_PROGRESS:
+  - Sent updated working tree back to visible Reviewer and Optimizer for re-review.
+- NEXT:
+  - Engineer must automatically read re-review verdicts and continue fixing if needed.
+  - Commit and push only after Reviewer/Optimizer approval.
+- BLOCKED:
+  - Pending re-review verdicts.
+- Evidence:
+  - Reviewer thread: `019e8901-97e5-7340-96a8-62d8b0523777`.
+  - Optimizer thread: `019e8901-b0ce-7522-8f74-063ba926f165`.
+- Confidence:
+  - high
+
+## 2026-06-02 (America/Los_Angeles) - Telegram Visibility Final Re-review Fixes
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Recovered after Codex auto-compact failure in prior thread.
+  - Read visible Reviewer/Optimizer re-review verdicts:
+    - Reviewer: `APPROVE WITH CHANGES`, no remaining `BLOCK`.
+    - Optimizer: `APPROVE WITH CHANGES`, no remaining `BLOCK`.
+  - Addressed required pre-commit changes:
+    - Telegram user-ID allowlist now only authorizes private chats; group chats must be explicitly allowlisted by chat ID before account/order/position data is posted.
+    - `_reconcile_and_snapshot()` now surfaces real adapter returned error dictionaries from `get_account_snapshot()` and `get_clock()`, not just raised exceptions.
+    - Clock error dictionaries now report `Market open: None` plus an explicit warning instead of looking like a valid closed-market reading.
+    - `/status` now includes durable same-day entry count and blocks `New entries` on daily-entry limit or missing durable entry count.
+  - Added tests:
+    - allowlisted private user ID does not authorize a non-allowlisted group chat,
+    - returned account/clock error dictionaries surface as warnings,
+    - status blocks on durable daily-entry limit.
+  - Verification:
+    - `.venv/bin/python -m pytest -q` -> `25 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+- FINAL REVIEW:
+  - Reviewer final confirmation: `APPROVE`.
+  - Optimizer final confirmation: `APPROVE`.
+- IN_PROGRESS:
+  - Committing and pushing approved Telegram visibility patch.
+- NEXT:
+  - After GitHub sync, continue with scheduled/periodic reconciliation or position monitoring.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Reviewer thread: `019e8901-97e5-7340-96a8-62d8b0523777`.
+  - Optimizer thread: `019e8901-b0ce-7522-8f74-063ba926f165`.
+- Confidence:
+  - high

@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     # Telegram
     telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
+    telegram_allowed_ids: str = Field("", alias="TELEGRAM_ALLOWED_IDS")
 
     # Safety
     resume_token: str = Field(..., alias="RESUME_TOKEN")
