@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-02T17:20:02Z
-- Last updated local (`America/Los_Angeles`): 2026-06-02 10:20:07 PDT
+- Last updated UTC: 2026-06-02T19:53:04Z
+- Last updated local (`America/Los_Angeles`): 2026-06-02 12:53:04 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -21,6 +21,7 @@ Quick resume file for any AI session. Update at end of every work session.
   - Telegram visibility Reviewer/Optimizer BLOCK findings addressed; re-review returned `APPROVE WITH CHANGES`
   - Final pre-commit Telegram visibility changes applied; final Reviewer and Optimizer verdicts: **APPROVE**
   - Day 2 supervised trading loop implemented; final Reviewer and Optimizer verdicts: **APPROVE**
+  - Supervised local shutdown mode implemented; final Reviewer and Optimizer verdicts: **APPROVE**
   - Automatic Reviewer/Optimizer cycle completed after major Engineer work
   - Final Reviewer verdict for tomorrow readiness: **APPROVE**
 - System status:
@@ -86,6 +87,15 @@ Quick resume file for any AI session. Update at end of every work session.
   - Final visible Optimizer verdict for Day 2 supervisor loop: `APPROVE`.
   - GitHub sync complete:
     - Commit `9fe40e1` (`Add Day 2 trading supervisor loop`) pushed to `origin/main`.
+  - Local supervised shutdown mode now exists:
+    - `SHUTDOWN_FLATTEN_ON_EXIT=true` remains production/live safety default.
+    - `SHUTDOWN_FLATTEN_ON_EXIT=false` is allowed only in paper mode and prevents Ctrl+C/SIGTERM process exit from flattening during supervised local tests.
+    - Settings fail fast if `ALPACA_PAPER=false` and shutdown flattening is disabled.
+    - `/kill` remains independent and still halts/flattens.
+  - Local ignored `.env` is currently set to `SHUTDOWN_FLATTEN_ON_EXIT=false` for the next supervised laptop run; do not commit `.env`.
+  - Latest verification for shutdown mode: `39 passed`; compileall passed; `git diff --check` clean.
+  - Final visible Reviewer verdict for shutdown mode: `APPROVE`.
+  - Final visible Optimizer verdict for shutdown mode: `APPROVE`.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -109,11 +119,13 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Immediate Next Actions
 
-1. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
-2. Decide when to opt in to `AUTO_EXIT_ENABLED` and `AUTO_ENTRY_ENABLED` during paper burn-in.
-3. Before long unattended `AUTO_EXIT_ENABLED=true` runs, consider broker open close-order checks and persisted pending exits.
-4. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-5. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+1. Commit and push supervised local shutdown mode.
+2. Start the bot locally in alert-only mode and verify Telegram startup, `/status`, `/report`, and supervisor position alerts.
+3. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
+4. Decide when to opt in to `AUTO_EXIT_ENABLED` and `AUTO_ENTRY_ENABLED` during paper burn-in.
+5. Before long unattended `AUTO_EXIT_ENABLED=true` runs, consider broker open close-order checks and persisted pending exits.
+6. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+7. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 

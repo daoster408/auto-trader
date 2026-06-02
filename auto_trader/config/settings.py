@@ -1,6 +1,6 @@
 """Configuration and settings (Pydantic v2)."""
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, model_validator
 from typing import Literal
 
 
@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     # Safety
     resume_token: str = Field(..., alias="RESUME_TOKEN")
+    shutdown_flatten_on_exit: bool = Field(True, alias="SHUTDOWN_FLATTEN_ON_EXIT")
 
     # Risk (v1 defaults - changes require DECISIONS_LOG entry + restart)
     risk_per_trade_pct: float = Field(0.5, alias="RISK_PER_TRADE_PCT")
@@ -57,6 +58,12 @@ class Settings(BaseSettings):
         "populate_by_name": True,
         "extra": "forbid",
     }
+
+    @model_validator(mode="after")
+    def validate_shutdown_flatten_safety(self) -> "Settings":
+        if not self.alpaca_paper and not self.shutdown_flatten_on_exit:
+            raise ValueError("SHUTDOWN_FLATTEN_ON_EXIT=false is only allowed in Alpaca paper mode")
+        return self
 
 
 def get_settings() -> Settings:

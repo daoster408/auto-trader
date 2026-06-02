@@ -731,6 +731,45 @@ Append-only by day. Do not remove past entries.
 - Confidence:
   - high
 
+## 2026-06-02 (America/Los_Angeles) - Supervised Local Shutdown Mode
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Added `SHUTDOWN_FLATTEN_ON_EXIT` for supervised local paper runs.
+  - Production/live default remains `true`: process exit HALTs/flattens `ACTIVE` or `PAUSED`.
+  - Paper-only local opt-out can set `false` so Ctrl+C/SIGTERM stops the bot without flattening an open paper position.
+  - Added a settings-level fail-fast guard: `SHUTDOWN_FLATTEN_ON_EXIT=false` is rejected when `ALPACA_PAPER=false`.
+  - Extracted process signal shutdown into `_handle_signal_shutdown()` so SIGINT/SIGTERM behavior is directly testable.
+  - Updated local ignored `.env` to `SHUTDOWN_FLATTEN_ON_EXIT=false` for the supervised laptop test; this is not committed.
+  - Added tests for:
+    - production default shutdown flatten decision,
+    - local opt-out shutdown decision,
+    - SIGINT/SIGTERM local opt-out skipping broker cancel/flatten,
+    - SIGINT/SIGTERM production default HALTING and flattening,
+    - paper-mode opt-out allowed,
+    - live-mode opt-out rejected.
+  - Verification:
+    - `.venv/bin/python -m pytest -q` -> `39 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+    - `git diff --check` -> clean.
+- FINAL REVIEW:
+  - Reviewer final confirmation: `APPROVE`.
+  - Optimizer final confirmation: `APPROVE`.
+- IN_PROGRESS:
+  - Commit and push shutdown-mode change.
+- NEXT:
+  - Start the bot locally in alert-only mode and verify Telegram startup, `/status`, `/report`, and supervisor position alerts.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Reviewer thread: `019e89e1-674b-7232-bef6-4ccbf749fa73`.
+  - Optimizer thread: `019e89e1-6803-71e1-aa6a-973f076c983b`.
+- Confidence:
+  - high
+
 ## 2026-06-02 (America/Los_Angeles) - Day 2 Supervisor Loop Implementation
 
 - Date (local): 2026-06-02

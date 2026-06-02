@@ -94,6 +94,38 @@ async def _emergency_halt(
         log.exception("emergency_halt_outer_failed", error=str(e))
 
 
+def _should_emergency_halt_on_shutdown(settings, state_machine: StateMachine) -> bool:
+    """Return whether process shutdown should force HALTED + flatten."""
+    if not settings.shutdown_flatten_on_exit:
+        log.warning(
+            "shutdown_emergency_halt_skipped_by_config",
+            state=state_machine.state.value,
+        )
+        return False
+    return state_machine.state in {SystemState.ACTIVE, SystemState.PAUSED}
+
+
+async def _handle_signal_shutdown(
+    *,
+    sig: int,
+    settings,
+    state_machine: StateMachine,
+    adapter: AlpacaAdapter,
+    stop_event: asyncio.Event,
+) -> None:
+    """Handle OS process-exit signals without affecting Telegram /kill semantics."""
+    log.critical("signal_kill_initiated", sig=sig)
+    if _should_emergency_halt_on_shutdown(settings, state_machine):
+        await _emergency_halt(state_machine, adapter, f"signal_{sig}")
+    else:
+        log.warning(
+            "signal_emergency_halt_skipped_by_config",
+            sig=sig,
+            state=state_machine.state.value,
+        )
+    stop_event.set()
+
+
 async def main() -> None:
     settings = get_settings()
     setup_logging(
@@ -161,15 +193,18 @@ async def main() -> None:
     # Graceful shutdown + dual-path kill (OS signals now also trigger real halt+flatten)
     stop_event = asyncio.Event()
 
-    async def _handle_signal_kill(sig: int) -> None:
-        log.critical("signal_kill_initiated", sig=sig)
-        await _emergency_halt(state_machine, adapter, f"signal_{sig}")
-        stop_event.set()
-
     def _signal_handler(sig: int) -> None:
-        log.warning("signal_received", sig=sig, action="emergency_halt")
+        log.warning("signal_received", sig=sig, action="process_shutdown_requested")
         # Schedule the real kill path without blocking the signal handler
-        asyncio.create_task(_handle_signal_kill(sig))
+        asyncio.create_task(
+            _handle_signal_shutdown(
+                sig=sig,
+                settings=settings,
+                state_machine=state_machine,
+                adapter=adapter,
+                stop_event=stop_event,
+            )
+        )
 
     # Modern signal handling (works on ARM, avoids deprecated loop methods in some Pythons)
     loop = asyncio.get_running_loop()
@@ -209,8 +244,8 @@ async def main() -> None:
             supervisor_task.cancel()
             with suppress(asyncio.CancelledError):
                 await supervisor_task
-        # Belt + suspenders: if we are still ACTIVE/PAUSED on shutdown, force HALTED best-effort
-        if state_machine.state in {SystemState.ACTIVE, SystemState.PAUSED}:
+        # Belt + suspenders: production exits force HALTED best-effort unless explicitly disabled for supervised local runs.
+        if _should_emergency_halt_on_shutdown(settings, state_machine):
             await _emergency_halt(state_machine, adapter, "shutdown_without_explicit_kill")
         await bot.shutdown()
         await _touch_health_file(False)

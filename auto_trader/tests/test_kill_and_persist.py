@@ -4,6 +4,7 @@ Minimal critical safety tests for kill + HALTED persistence (Reviewer requiremen
 These tests must actually exercise real DB save → load roundtrips
 and verify the safety default to HALTED on failure.
 """
+import asyncio
 import tempfile
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from auto_trader.comms.telegram_bot import TelegramBot
 from auto_trader.config.settings import Settings
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
+from auto_trader.__main__ import _handle_signal_shutdown, _should_emergency_halt_on_shutdown
 from auto_trader.scheduler.trading_supervisor import TradingSupervisor
 from auto_trader.persistence.db import (
     configure_db_path,
@@ -171,6 +173,91 @@ async def test_emergency_halt_path_persists_and_calls_flatten():
         # Restart simulation
         restored, _ = await load_system_state()
         assert restored == SystemState.HALTED
+
+
+def test_shutdown_emergency_halt_decision_defaults_to_production_safety():
+    settings = type("Settings", (), {"shutdown_flatten_on_exit": True})()
+
+    assert _should_emergency_halt_on_shutdown(settings, StateMachine(initial_state=SystemState.ACTIVE)) is True
+    assert _should_emergency_halt_on_shutdown(settings, StateMachine(initial_state=SystemState.PAUSED)) is True
+    assert _should_emergency_halt_on_shutdown(settings, StateMachine(initial_state=SystemState.HALTED)) is False
+
+
+def test_shutdown_emergency_halt_can_be_disabled_for_supervised_local_runs():
+    settings = type("Settings", (), {"shutdown_flatten_on_exit": False})()
+
+    assert _should_emergency_halt_on_shutdown(settings, StateMachine(initial_state=SystemState.ACTIVE)) is False
+    assert _should_emergency_halt_on_shutdown(settings, StateMachine(initial_state=SystemState.PAUSED)) is False
+
+
+@pytest.mark.asyncio
+async def test_signal_shutdown_skips_flatten_when_local_opt_out_enabled():
+    settings = type("Settings", (), {"shutdown_flatten_on_exit": False})()
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stop_event = asyncio.Event()
+
+    class FakeAdapter:
+        def __init__(self):
+            self.cancel_calls = 0
+            self.flatten_calls = 0
+
+        async def cancel_all_orders(self):
+            self.cancel_calls += 1
+            return 0
+
+        async def flatten_all_positions(self):
+            self.flatten_calls += 1
+            return 0
+
+    adapter = FakeAdapter()
+
+    await _handle_signal_shutdown(
+        sig=2,
+        settings=settings,
+        state_machine=sm,
+        adapter=adapter,
+        stop_event=stop_event,
+    )
+
+    assert sm.state == SystemState.ACTIVE
+    assert adapter.cancel_calls == 0
+    assert adapter.flatten_calls == 0
+    assert stop_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_signal_shutdown_defaults_to_emergency_flatten():
+    settings = type("Settings", (), {"shutdown_flatten_on_exit": True})()
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stop_event = asyncio.Event()
+
+    class FakeAdapter:
+        def __init__(self):
+            self.cancel_calls = 0
+            self.flatten_calls = 0
+
+        async def cancel_all_orders(self):
+            self.cancel_calls += 1
+            return 2
+
+        async def flatten_all_positions(self):
+            self.flatten_calls += 1
+            return 1
+
+    adapter = FakeAdapter()
+
+    await _handle_signal_shutdown(
+        sig=15,
+        settings=settings,
+        state_machine=sm,
+        adapter=adapter,
+        stop_event=stop_event,
+    )
+
+    assert sm.state == SystemState.HALTED
+    assert adapter.cancel_calls == 1
+    assert adapter.flatten_calls == 1
+    assert stop_event.is_set()
 
 
 @pytest.mark.asyncio
@@ -1163,6 +1250,31 @@ def test_supervisor_config_rejects_hot_loop_intervals():
             RECONCILE_INTERVAL_SECONDS=0,
             POSITION_MONITOR_INTERVAL_SECONDS=0,
             SUPERVISOR_TICK_TIMEOUT_SECONDS=0,
+        )
+
+
+def test_shutdown_flatten_opt_out_is_allowed_in_paper_mode_only():
+    settings = Settings(
+        ALPACA_API_KEY="key",
+        ALPACA_API_SECRET="secret",
+        ALPACA_PAPER=True,
+        TELEGRAM_BOT_TOKEN="token",
+        RESUME_TOKEN="resume",
+        SHUTDOWN_FLATTEN_ON_EXIT=False,
+    )
+
+    assert settings.shutdown_flatten_on_exit is False
+
+
+def test_shutdown_flatten_opt_out_rejected_in_live_mode():
+    with pytest.raises(ValidationError):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            ALPACA_PAPER=False,
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            SHUTDOWN_FLATTEN_ON_EXIT=False,
         )
 
 
