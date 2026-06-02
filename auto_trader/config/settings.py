@@ -1,4 +1,6 @@
 """Configuration and settings (Pydantic v2)."""
+import os
+
 from pydantic_settings import BaseSettings
 from pydantic import Field, model_validator
 from typing import Literal
@@ -68,4 +70,4 @@ class Settings(BaseSettings):
 
 def get_settings() -> Settings:
     """Singleton-style loader (call once at startup)."""
-    return Settings()  # type: ignore[call-arg]
+    return Settings(_env_file=os.getenv("AUTO_TRADER_ENV_FILE", ".env"))  # type: ignore[call-arg]

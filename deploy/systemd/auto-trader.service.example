@@ -1,0 +1,22 @@
+[Unit]
+Description=AUTO-TRADER supervised paper trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=auto-trader
+Group=auto-trader
+WorkingDirectory=/opt/auto-trader
+Environment=AUTO_TRADER_ENV_FILE=/opt/auto-trader/.env
+ExecStart=/opt/auto-trader/.venv/bin/python -m auto_trader
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

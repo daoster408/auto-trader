@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-02T19:53:04Z
-- Last updated local (`America/Los_Angeles`): 2026-06-02 12:53:04 PDT
+- Last updated UTC: 2026-06-02T20:06:52Z
+- Last updated local (`America/Los_Angeles`): 2026-06-02 13:06:56 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -96,6 +96,19 @@ Quick resume file for any AI session. Update at end of every work session.
   - Latest verification for shutdown mode: `39 passed`; compileall passed; `git diff --check` clean.
   - Final visible Reviewer verdict for shutdown mode: `APPROVE`.
   - Final visible Optimizer verdict for shutdown mode: `APPROVE`.
+  - Local alert-only bot run started successfully on 2026-06-02:
+    - Alpaca paper health OK.
+    - Telegram polling active.
+    - Supervisor running with `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=false`.
+    - Telegram `/status` and `/report` were verified by the user.
+    - AMPX paper position is being monitored; no new orders are being placed by the supervisor.
+  - Repeatable run/service package added:
+    - `scripts/run_bot.sh` points `AUTO_TRADER_ENV_FILE` at `.env` and execs `python -m auto_trader` without sourcing secrets as shell.
+    - `deploy/systemd/auto-trader.service.example` documents Oracle/Pi service shape with `Restart=always`, restrictive `UMask=0077`, host-visible `/tmp` health checks, and Pydantic-only `.env` parsing via `AUTO_TRADER_ENV_FILE`.
+    - `docs/RUNBOOK.md` documents laptop burn-in, server operation, Telegram checks, and promotion gates.
+  - Repeatable run/service package final Reviewer verdict: `APPROVE`.
+  - Repeatable run/service package final Optimizer verdict: `APPROVE`.
+  - Latest verification for run/service package: `39 passed`; compileall passed; `bash -n scripts/run_bot.sh` passed; `git diff --check` clean.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -119,13 +132,12 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Immediate Next Actions
 
-1. Commit and push supervised local shutdown mode.
-2. Start the bot locally in alert-only mode and verify Telegram startup, `/status`, `/report`, and supervisor position alerts.
-3. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
-4. Decide when to opt in to `AUTO_EXIT_ENABLED` and `AUTO_ENTRY_ENABLED` during paper burn-in.
-5. Before long unattended `AUTO_EXIT_ENABLED=true` runs, consider broker open close-order checks and persisted pending exits.
-6. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-7. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+1. Keep the current local bot running for supervised paper burn-in.
+2. Decide whether to keep AMPX as alert-only after dry-run max-loss warnings or manually test the close path in paper.
+3. Decide when to opt in to `AUTO_EXIT_ENABLED` and `AUTO_ENTRY_ENABLED` during paper burn-in.
+4. Before long unattended `AUTO_EXIT_ENABLED=true` runs, consider broker open close-order checks and persisted pending exits.
+5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 

@@ -19,7 +19,13 @@ See `docs/SOURCE_OF_TRUTH.md`, `docs/ARCHITECTURE.md`, and `docs/OPERATING_RULES
 1. Python 3.12+
 2. Use the local virtualenv: `.venv/bin/python`
 3. Fill `.env` from `.env.example` with Alpaca paper keys, Telegram token, and `RESUME_TOKEN`
-4. During market hours, run the one-shot paper trade helper:
+4. For the supervised Telegram + supervisor loop, run:
+
+```bash
+scripts/run_bot.sh
+```
+
+5. During market hours, run the one-shot paper trade helper only when intentionally testing a first paper entry:
 
 ```bash
 .venv/bin/python -c "import asyncio; from auto_trader.__main__ import run_first_paper_trade_test; asyncio.run(run_first_paper_trade_test())"
@@ -47,6 +53,7 @@ See `docs/SOURCE_OF_TRUTH.md`, `docs/ARCHITECTURE.md`, and `docs/OPERATING_RULES
 ## Hosting Target
 
 Oracle Always Free ARM tier (Docker/systemd), after local paper loop is validated.
+See `docs/RUNBOOK.md` and `deploy/systemd/auto-trader.service.example` for repeatable local/server runs.
 
 ## Important
 

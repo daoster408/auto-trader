@@ -133,3 +133,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: User wants multiple AI viewpoints (e.g., ChatGPT, Claude, Grok/Gemini) while avoiding hallucinated market facts and unsafe autonomous execution. Separating AI judgment from deterministic risk authorization preserves automation without weakening capital safety.
 - Impact: Architecture now defines Bull Analyst, Bear/Risk Analyst, and Judge/Portfolio Manager roles; AI starts in journal-only mode, can later influence ranking/veto, and can never override RiskEngine, `/kill`, `HALTED`, stale-data blocks, or exposure/loss limits.
 - Confidence: high
+
+- UTC timestamp: 2026-06-02T20:06:52Z
+- Local timestamp (`America/Los_Angeles`): 2026-06-02 13:06:56 PDT
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- Decision: Use Pydantic-only secret parsing and systemd watchdog restarts for server runs.
+- Rationale: Avoid executing or systemd-parsing `.env` secrets while keeping Oracle/Pi service runs resilient to clean exits after recoverable runtime failures.
+- Impact: `scripts/run_bot.sh` and systemd set `AUTO_TRADER_ENV_FILE`; `get_settings()` reads that env file; the systemd template uses `Restart=always`, `UMask=0077`, and host-visible `/tmp` health checks.
+- Confidence: high

@@ -88,6 +88,48 @@ Append-only by day. Do not remove past entries.
 - Confidence:
   - high
 
+## 2026-06-02 (America/Los_Angeles) - Day 2 Local Burn-In + Service Prep
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Started the local bot in alert-only supervised mode.
+  - Verified Telegram polling and user-visible `/status` plus `/report`.
+  - Confirmed the supervisor is monitoring the AMPX paper position without placing new orders.
+  - Added repeatable operation artifacts:
+    - `scripts/run_bot.sh` for local supervised runs;
+    - `deploy/systemd/auto-trader.service.example` for Oracle VM or Raspberry Pi systemd deployment;
+    - `docs/RUNBOOK.md` for local/server run steps, shutdown behavior, Telegram checks, and promotion gates.
+  - Set the systemd template to `Restart=always` so recoverable clean exits still relaunch under the server watchdog.
+  - Avoided sourcing `.env` as shell in `scripts/run_bot.sh`; Python now reads the configured env file directly.
+  - Avoided systemd `EnvironmentFile` secret parsing; the service now sets only `AUTO_TRADER_ENV_FILE`.
+  - Added server `.env` ownership/mode guidance and `UMask=0077`.
+  - Kept systemd `PrivateTmp=false` so `/tmp/auto_trader_healthy` remains visible to host checks.
+- IN_PROGRESS:
+  - Local paper burn-in is running in alert-only mode.
+- FINAL REVIEW:
+  - Reviewer final confirmation: `APPROVE`.
+  - Optimizer final confirmation: `APPROVE`.
+- NEXT:
+  - Commit and push the repeatable run/service package.
+  - Decide whether to keep AMPX as alert-only after dry-run max-loss warnings or manually test the close path in paper.
+  - Continue paper burn-in before enabling `AUTO_EXIT_ENABLED` or `AUTO_ENTRY_ENABLED`.
+  - Decide next Day 2 feature: broker open close-order checks/persisted pending exits or journal-only AI committee scaffolding.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Local bot process is running.
+  - Telegram `/status` and `/report` were confirmed by the user.
+  - Supervisor sent dry-run max-loss exit warnings for AMPX while `AUTO_EXIT_ENABLED=false`; no close order was placed.
+  - `.venv/bin/python -m pytest -q` -> `39 passed`.
+  - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+  - `bash -n scripts/run_bot.sh` -> passed.
+  - `git diff --check` -> clean.
+- Confidence:
+  - high
+
 ## Week 1 Day-by-Day Plan (Target)
 
 - Day 1:
