@@ -4,24 +4,48 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-02T04:55:00Z
-- Last updated local (`America/Los_Angeles`): 2026-06-01 21:55:00 PDT
-- Updated by: openai/gpt-5.5
-- Active role: Engineer + automatic Reviewer/Optimizer coordination
+- Last updated UTC: 2026-06-02T15:33:42Z
+- Last updated local (`America/Los_Angeles`): 2026-06-02 08:33:42 PDT
+- Updated by: openai/gpt-5-codex
+- Active role: Engineer
 - Project phase: 
   - Kill + persistence foundation: **Clean APPROVED**
   - First paper order path implemented (real submit_order, OrderManager)
-  - Dynamic stock discovery implemented (no hardcoded watchlist)
+  - Dynamic stock discovery implemented and market-data parser fixed for Alpaca top-level snapshot payloads
+  - First paper order submitted and filled into an open paper position
+  - Reconciliation foundation and duplicate-entry protection implemented
+  - Reviewer/Optimizer BLOCK findings addressed; re-review requested
+  - Automatic visible Reviewer/Optimizer polling/fix/re-review workflow clarified in docs
+  - GitHub sync rule added: approved major milestones and safety fixes should be committed and pushed automatically
   - Automatic Reviewer/Optimizer cycle completed after major Engineer work
   - Final Reviewer verdict for tomorrow readiness: **APPROVE**
 - System status:
   - RiskEngine remains the **only** path to any real order.
   - Real order submission code is written and gated.
   - First paper trade is now possible in code (via `run_first_paper_trade_test()` helper) and guarded by system state, market clock, account status, live equity, dynamic discovery, RiskEngine, and OrderManager.
+  - First market-hours attempt on 2026-06-02 initially submitted no orders because Alpaca paper account reported zero buying power. After user reset/funded the paper account, first order was submitted.
+  - First paper order: `AMPX`, quantity `0.832986`, order id `eaf99d3e-c577-4b2d-8f4f-74cd74be4178`, RiskEngine trace `ed4e33f9`.
+  - Broker verification after submission returned no open orders and an open `AMPX` position with quantity `0.832986`.
+  - SQLite reconciliation now has the filled AMPX order persisted: status `filled`, avg fill price `24.134`.
+  - Duplicate-protection verification reran the helper and submitted no second order; RiskEngine rejected with `Symbol already has an open position`, trace `7b41038c`.
+  - RiskEngine now sizes first paper trades fractionally under the existing 5% early notional cap; cap was not weakened.
+  - Fail-closed blocker fixes applied after Reviewer/Optimizer:
+    - fresh DB defaults `HALTED`;
+    - missing durable entry count rejects;
+    - DB count failures raise;
+    - reconciliation reports successful persisted rows only;
+    - strict broker position read is required before pre-trade checks;
+    - one-shot helper refuses before discovery when open-position or same-day entry limits are reached.
+  - Latest verification: `13 passed`; live helper reconciled AMPX and refused early with `Open position limit already reached`, no second order submitted.
+  - Reviewer re-review returned `APPROVE`.
+  - Optimizer re-review returned `APPROVE WITH CHANGES`; Engineer addressed the non-blocking recommendation by pausing the running state machine if broker submit succeeds but local order persistence fails.
+  - Latest verification after Optimizer recommendation fix: `14 passed`.
+  - Final visible Reviewer verdict: `APPROVE`.
+  - Final visible Optimizer verdict: `APPROVE`.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
-  - Market was closed during preflight; no order was submitted.
+  - Market-data discovery now successfully scans snapshots and found candidates during market hours.
   - AI committee design is documented but not active for the first paper trade. It will start later in journal-only mode.
   - GitHub is connected and pushed: `origin` -> `https://github.com/daoster408/auto-trader` (private repo). Local `main` tracks `origin/main`. `.env` is ignored and was not committed.
   - Workflow automation policy active: Major Engineer work triggers automatic Reviewer/Optimizer launches.
@@ -41,12 +65,13 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Immediate Next Actions
 
-1. Tomorrow during regular market hours: run one-shot paper order helper and verify in Alpaca paper dashboard.
-2. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
-3. If no candidate is found, do not force a trade; inspect scanner logs / candidate filters.
-4. After first paper order: add order reconciliation + journaling/Telegram notification improvements.
-5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-6. Maintain automatic Reviewer/Optimizer launches for future major milestones.
+1. Commit and push the approved reconciliation + duplicate-protection milestone to GitHub.
+2. Add Telegram notification/report path for submitted/filled orders and current open position.
+3. Add scheduled/periodic reconciliation loop or explicit command path.
+4. Add position monitoring and exit/kill validation around the now-open paper position.
+5. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
+6. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+7. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 

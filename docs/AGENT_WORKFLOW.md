@@ -27,7 +27,10 @@ Defines responsibilities and handoff rules for the 4-agent build team.
 
 ## Automatic Subagent Rule
 
-- After every major Engineer implementation pass, launch Reviewer and Optimizer subagents automatically without asking the user for permission again.
+- After every major Engineer implementation pass, launch visible Reviewer and Optimizer background threads automatically without asking the user for permission again.
+- Engineer must proactively poll/read Reviewer and Optimizer verdicts; the user should not need to ask whether agents are done or whether blockers exist.
+- If Reviewer or Optimizer returns BLOCK or APPROVE WITH CHANGES, Engineer must apply required fixes or explicitly log why a recommendation is deferred, then automatically send the updated working tree back for re-review.
+- Continue the Engineer -> Reviewer/Optimizer -> Engineer fix loop until Reviewer is APPROVE and Optimizer is APPROVE or only has documented non-blocking follow-ups.
 - Reviewer must prioritize capital safety, risk bypass checks, kill-switch reliability, and correctness.
 - Optimizer must not remove, weaken, bypass, or defer any risk control in pursuit of performance.
 - If Reviewer returns BLOCK, Engineer fixes required changes and then automatically re-runs Reviewer/Optimizer as appropriate.
@@ -50,6 +53,7 @@ Each role handoff must include:
 - Risks identified
 - Verification evidence (tests, logs, sample outputs)
 - Next owner role and concrete next actions
+- GitHub sync status for approved milestones (commit hash and push status when available)
 
 ## Quality Gates
 
@@ -57,6 +61,7 @@ Each role handoff must include:
 - `/kill` flow tested and operational before live cutover.
 - Journaling and audit logs must be end-to-end functional.
 - Any threshold changes must be recorded in `docs/DECISIONS_LOG.md`.
+- Approved major milestones must be committed and pushed to GitHub before moving to the next feature.
 
 ## Session Metadata Standard
 

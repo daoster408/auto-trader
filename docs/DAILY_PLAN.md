@@ -386,3 +386,209 @@ Append-only by day. Do not remove past entries.
   - Market is currently closed; paper order test must wait for regular market hours.
 - Confidence:
   - high
+
+## 2026-06-02 (America/Los_Angeles) - First Market-Hours Paper Attempt
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Started the planned market-hours one-shot paper trade attempt at user request.
+  - Confirmed persisted system state is `ACTIVE` and `ALPACA_PAPER=True`.
+  - Found and fixed SQLite persistence connection lifecycle bug:
+    - `load_system_state()` was double-entering an already-awaited aiosqlite connection and defaulting safe to `HALTED`.
+    - Moved `init_db()` in `load_system_state()` under the safety error handler so corrupt DB files default to `HALTED` instead of raising.
+  - Ran focused safety tests: `4 passed`.
+  - Ran first one-shot helper attempt:
+    - No order submitted.
+    - Dynamic discovery returned zero snapshots because Alpaca's snapshots endpoint returned top-level symbol keys, not a nested `snapshots` object.
+  - Fixed `AlpacaAdapter.get_stock_snapshots()` to support both nested and top-level Alpaca response shapes.
+  - Added regression test for top-level Alpaca snapshot payloads.
+  - Re-ran one-shot helper after fix:
+    - Dynamic discovery scanned 750 symbols.
+    - Snapshot retrieval worked.
+    - 11 candidates were found and 5 ranked candidates were returned.
+    - No order submitted because Alpaca paper account reported `equity=0`, `cash=0`, and `buying_power=0`.
+- IN_PROGRESS:
+  - First paper order remains blocked by paper account funding/buying power, not by code path or market-data discovery.
+- NEXT:
+  - User should reset/fund the Alpaca paper account or provide API keys for a funded paper account.
+  - After account equity/buying power is nonzero, rerun:
+    - `.venv/bin/python -c "import asyncio; from auto_trader.__main__ import run_first_paper_trade_test; asyncio.run(run_first_paper_trade_test())"`
+  - Verify the resulting order in Alpaca paper dashboard.
+  - After first order, implement order reconciliation, journaling, and Telegram notification improvements.
+- BLOCKED:
+  - Alpaca paper account currently reports zero equity, cash, and buying power.
+- Evidence:
+  - No orders submitted.
+  - `pytest auto_trader/tests/test_kill_and_persist.py -q` -> `4 passed`.
+  - Helper after parser fix found dynamic candidates but refused at missing-equity gate.
+- Confidence:
+  - high
+
+## 2026-06-02 (America/Los_Angeles) - First Paper Order Submitted
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - User reset/funded Alpaca paper account and requested retry.
+  - Re-ran one-shot paper order helper.
+  - Dynamic discovery found candidates and selected `AMPX`.
+  - Initial retry was blocked by RiskEngine because one full share exceeded the early 5% notional cap.
+  - Fixed RiskEngine sizing to use fractional share quantity under the existing 5% early notional cap instead of weakening the cap.
+  - Added regression test confirming small-account fractional sizing stays under the early cap.
+  - Re-ran tests: `5 passed`.
+  - Re-ran one-shot helper:
+    - RiskEngine approved `AMPX`.
+    - Alpaca paper order submitted: `eaf99d3e-c577-4b2d-8f4f-74cd74be4178`.
+    - Quantity: `0.832986`.
+    - Status at submission: `pending_new`.
+  - Verified broker state after submission:
+    - No open orders returned.
+    - Position exists: `AMPX`, quantity `0.832986`, market value about `$20.07`.
+- IN_PROGRESS:
+  - First paper position is open and should now be monitored/reconciled.
+- NEXT:
+  - Implement order reconciliation/journaling so fills are persisted in `orders`/journal tables.
+  - Add Telegram notification/report path for submitted/filled orders and current open position.
+  - Add position monitoring and exit/kill validation around the now-open paper position.
+  - Continue automatic Reviewer/Optimizer cycle for the next major implementation pass.
+- BLOCKED:
+  - None for first paper order. Follow-up work is reconciliation/monitoring/reporting.
+- Evidence:
+  - Order passed RiskEngine with trace `ed4e33f9`.
+  - Alpaca paper position verification returned `AMPX` position quantity `0.832986`.
+  - `pytest auto_trader/tests/test_kill_and_persist.py -q` -> `5 passed`.
+- Confidence:
+  - high
+
+## 2026-06-02 (America/Los_Angeles) - Reconciliation + Duplicate Protection
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Implemented first reconciliation layer:
+    - Added normalized `AlpacaAdapter.get_recent_orders()`.
+    - Added SQLite helpers to log risk decisions, upsert order records, count same-day entry orders, and reconcile broker orders.
+    - Wired `OrderManager` to persist risk decisions and accepted broker orders immediately.
+    - Wired one-shot helper to reconcile recent broker orders before evaluating a new signal.
+  - Implemented duplicate-entry protection:
+    - RiskEngine rejects a trade if the symbol already has an open position.
+    - RiskEngine rejects when v1 open-position limit is reached.
+    - RiskEngine rejects when persisted same-day entries reach `MAX_NEW_POSITIONS_PER_DAY`.
+  - Added regression tests for:
+    - top-level Alpaca snapshot payloads,
+    - fractional sizing under early cap,
+    - duplicate open-position rejection,
+    - durable daily-entry rejection,
+    - persisted order counting.
+  - Ran focused tests: `8 passed`.
+  - Ran one-shot helper as live duplicate-protection verification:
+    - Reconciled existing Alpaca order into SQLite.
+    - RiskEngine rejected new AMPX attempt: `Symbol already has an open position`.
+    - No second order submitted.
+  - Verified SQLite state:
+    - Persisted order `eaf99d3e-c577-4b2d-8f4f-74cd74be4178`.
+    - Symbol `AMPX`, side `buy`, qty `0.832986`, status `filled`, avg fill price `24.134`.
+    - Rejected duplicate risk decision trace `7b41038c` persisted.
+- IN_PROGRESS:
+  - Reconciliation foundation exists, but continuous scheduled reconciliation is not yet running.
+- NEXT:
+  - Add Telegram `/status` and `/report` output for current open position and last order.
+  - Add scheduled/periodic reconciliation loop or explicit command path.
+  - Add position monitoring and exit/kill validation around the open AMPX position.
+  - Run automatic Reviewer/Optimizer cycle for this major implementation pass.
+- BLOCKED:
+  - None.
+- Evidence:
+  - `pytest auto_trader/tests/test_kill_and_persist.py -q` -> `8 passed`.
+  - One-shot helper duplicate verification produced no new order and persisted the rejection.
+- Confidence:
+  - high
+
+## 2026-06-02 (America/Los_Angeles) - Reviewer/Optimizer Blocker Fixes
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Read visible Reviewer and Optimizer background-thread reports.
+  - Reviewer verdict: `BLOCK`.
+  - Optimizer verdict: `BLOCK`.
+  - Blocker theme: duplicate-entry controls depended on broker positions, DB counts, and reconciliation persistence that could fail open.
+  - Fixed fail-open paths:
+    - Fresh DB schema now defaults `system_state` to `HALTED`, not `ACTIVE`.
+    - `RiskEngine` rejects if `today_new_entries` is missing instead of defaulting to zero.
+    - `count_entry_orders_since()` raises on DB/read failure instead of returning zero.
+    - `upsert_order_record()` returns success/failure.
+    - `reconcile_broker_orders()` reports only successfully persisted rows, not attempts.
+    - `OrderManager` records post-submit order persistence status and emits a critical log if broker submission succeeds but persistence fails.
+    - `AlpacaAdapter.get_positions_snapshot(strict=True)` raises on broker failure.
+    - One-shot helper uses strict position fetches before discovery and refuses if reconciliation, count, or position reads fail.
+    - One-shot helper refuses early when open-position or durable same-day entry limits are already reached.
+  - Added regression tests for:
+    - fresh DB defaults to `HALTED`,
+    - strict position snapshot failure,
+    - missing durable entry count rejection,
+    - DB count failure raising,
+    - reconciliation success count vs attempted count.
+  - Verification:
+    - `.venv/bin/python -m pytest -q` -> `13 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+    - Live one-shot duplicate verification reconciled existing AMPX order, counted/persisted one order, fetched positions strictly, and refused early: `Open position limit already reached`.
+    - No second order submitted.
+  - Sent updated working tree back to visible Reviewer and Optimizer threads for re-review.
+- IN_PROGRESS:
+  - Awaiting Reviewer/Optimizer re-review verdicts.
+- NEXT:
+  - If re-review approves, proceed to Telegram `/status` + `/report` for open position and last order.
+  - If re-review returns changes, fix those before adding new features.
+- BLOCKED:
+  - Pending re-review verdict.
+- Evidence:
+  - Reviewer thread: `019e88de-30a2-7992-adbc-9134a0d0bd84`.
+  - Optimizer thread: `019e88de-4a47-7971-8f09-80dbe63c444a`.
+- Confidence:
+  - high
+
+## 2026-06-02 (America/Los_Angeles) - Automatic Review Loop Policy Fix
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer / Workflow Coordinator
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - User clarified the expected workflow:
+    - Engineer should proactively check Reviewer/Optimizer output.
+    - Engineer should fix blockers and send work back for re-review automatically.
+    - User should not need to ask whether agents are done or whether blockers exist.
+  - Updated workflow docs:
+    - `docs/AGENT_WORKFLOW.md`
+    - `docs/OPERATING_RULES.md`
+  - Checked visible Reviewer/Optimizer re-review verdicts:
+    - Reviewer: `APPROVE`.
+    - Optimizer: `APPROVE WITH CHANGES`.
+  - Addressed Optimizer's remaining operational recommendation:
+    - If broker accepts an order but local order persistence fails, `OrderManager` now pauses the running state machine, marks the result as not approved, and requires reconciliation before future trading.
+  - Added regression test proving post-submit persistence failure pauses the system.
+  - Verification:
+    - `.venv/bin/python -m pytest -q` -> `14 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+- IN_PROGRESS:
+  - Sending updated working tree back to visible Reviewer/Optimizer threads for final re-review.
+- NEXT:
+  - Wait for final Reviewer/Optimizer verdicts automatically.
+  - If approved, proceed to Telegram `/status` + `/report`.
+- BLOCKED:
+  - Pending final re-review verdict after the extra Optimizer recommendation fix.
+- Evidence:
+  - Reviewer thread: `019e88de-30a2-7992-adbc-9134a0d0bd84`.
+  - Optimizer thread: `019e88de-4a47-7971-8f09-80dbe63c444a`.
+- Confidence:
+  - high

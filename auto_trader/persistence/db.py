@@ -10,6 +10,7 @@ Hardens:
 Wires directly to existing persistence/schema.sql .
 """
 import asyncio
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,10 +61,11 @@ async def load_system_state() -> tuple[SystemState, dict[str, Any]]:
     On any error, missing row, or corrupt data → default to HALTED.
     This forces manual /resume <token> after any kill or crash.
     """
-    await init_db()
     async with _DB_LOCK:
         try:
-            async with await _get_conn() as db:
+            await init_db()
+            db = await _get_conn()
+            try:
                 cur = await db.execute(
                     "SELECT state, halted_at, halt_reason, resumed_at, last_equity, updated_at FROM system_state WHERE id=1"
                 )
@@ -83,6 +85,8 @@ async def load_system_state() -> tuple[SystemState, dict[str, Any]]:
                     # Clean first run or no prior state — safe default but not a "failure"
                     log.info("no_prior_state_found_defaulting_halted")
                     return SystemState.HALTED, {"reason": "no_prior_state"}
+            finally:
+                await db.close()
         except Exception as e:
             log.critical("state_load_failed_defaulting_halted", error=str(e))
 
@@ -97,7 +101,8 @@ async def save_system_state(state: SystemState, reason: str | None = None, equit
     async with _DB_LOCK:
         try:
             await init_db()  # symmetry with load; safe if already initialized
-            async with await _get_conn() as db:
+            db = await _get_conn()
+            try:
                 # Proper UPSERT for the singleton row (id=1)
                 await db.execute(
                     """
@@ -121,13 +126,143 @@ async def save_system_state(state: SystemState, reason: str | None = None, equit
                     ),
                 )
                 await db.commit()
+            finally:
+                await db.close()
             log.info("state_persisted", state=state.value, reason=reason)
         except Exception as e:
             log.critical("state_persist_failed", state=state.value, error=str(e))
             # Never raise — in-memory HALTED is still effective for this process
 
 
-# Future helpers (stubbed, no new logic)
-async def log_risk_decision(**kwargs: Any) -> None:
-    """Placeholder - will be wired by later Engineer pass without changing risk logic."""
-    pass
+async def log_risk_decision(**kwargs: Any) -> int | None:
+    """Persist a risk decision audit row and return its row id."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    INSERT INTO risk_decisions (
+                        approved, reason, symbol, side, proposed_qty, sized_qty,
+                        equity_snapshot, metrics_json, model_tag, trace_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1 if kwargs.get("approved") else 0,
+                        str(kwargs.get("reason", "")),
+                        str(kwargs.get("symbol", "")).upper(),
+                        str(kwargs.get("side", "")),
+                        kwargs.get("proposed_qty"),
+                        kwargs.get("sized_qty"),
+                        float(kwargs.get("equity_snapshot") or 0.0),
+                        json.dumps(kwargs.get("risk_metrics") or {}, sort_keys=True),
+                        kwargs.get("model_tag"),
+                        kwargs.get("trace_id"),
+                    ),
+                )
+                await db.commit()
+                return int(cur.lastrowid) if cur.lastrowid is not None else None
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("risk_decision_log_failed", error=str(e))
+            return None
+
+
+async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | None = None, rationale: str | None = None) -> bool:
+    """Persist or refresh an order row from broker/manager normalized data."""
+    client_order_id = str(order.get("client_order_id") or order.get("id") or order.get("broker_order_id") or "")
+    broker_order_id = str(order.get("broker_order_id") or order.get("id") or client_order_id)
+    if not client_order_id or not broker_order_id:
+        log.warning("order_record_missing_id_skipped", order=order)
+        return False
+
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO orders (
+                        client_order_id, broker_order_id, symbol, side, qty, order_type,
+                        status, filled_qty, avg_fill_price, submitted_at, filled_at,
+                        risk_decision_id, rationale
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(client_order_id) DO UPDATE SET
+                        broker_order_id=excluded.broker_order_id,
+                        symbol=excluded.symbol,
+                        side=excluded.side,
+                        qty=excluded.qty,
+                        order_type=excluded.order_type,
+                        status=excluded.status,
+                        filled_qty=excluded.filled_qty,
+                        avg_fill_price=COALESCE(excluded.avg_fill_price, orders.avg_fill_price),
+                        submitted_at=COALESCE(excluded.submitted_at, orders.submitted_at),
+                        filled_at=COALESCE(excluded.filled_at, orders.filled_at),
+                        risk_decision_id=COALESCE(excluded.risk_decision_id, orders.risk_decision_id),
+                        rationale=COALESCE(excluded.rationale, orders.rationale)
+                    """,
+                    (
+                        client_order_id,
+                        broker_order_id,
+                        str(order.get("symbol", "")).upper(),
+                        str(order.get("side", "")),
+                        float(order.get("qty") or 0.0),
+                        str(order.get("order_type") or "market"),
+                        str(order.get("status") or "unknown"),
+                        float(order.get("filled_qty") or 0.0),
+                        order.get("avg_fill_price"),
+                        order.get("submitted_at"),
+                        order.get("filled_at"),
+                        risk_decision_id,
+                        rationale or order.get("rationale"),
+                    ),
+                )
+                await db.commit()
+            finally:
+                await db.close()
+            log.info("order_record_upserted", broker_order_id=broker_order_id, symbol=order.get("symbol"))
+            return True
+        except Exception as e:
+            log.error("order_record_upsert_failed", error=str(e), broker_order_id=broker_order_id)
+            return False
+
+
+async def count_entry_orders_since(start_utc_iso: str) -> int:
+    """Count durable buy/long entry orders submitted since a UTC boundary."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM orders
+                    WHERE COALESCE(submitted_at, '') >= ?
+                      AND lower(side) IN ('long', 'buy')
+                      AND lower(status) NOT IN ('canceled', 'cancelled', 'rejected', 'expired')
+                    """,
+                    (start_utc_iso,),
+                )
+                row = await cur.fetchone()
+                return int(row["count"] if row else 0)
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("entry_order_count_failed", error=str(e))
+            raise
+
+
+async def reconcile_broker_orders(orders: list[dict[str, Any]]) -> int:
+    """Upsert broker orders into SQLite. Returns number successfully persisted."""
+    count = 0
+    for order in orders:
+        if await upsert_order_record(order):
+            count += 1
+    log.info("broker_orders_reconciled", count=count, attempted=len(orders))
+    return count

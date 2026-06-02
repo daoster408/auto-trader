@@ -20,6 +20,7 @@ import signal
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.comms.telegram_bot import TelegramBot
@@ -211,7 +212,14 @@ async def run_first_paper_trade_test():
     from auto_trader.core.state_machine import StateMachine
     from auto_trader.execution.order_manager import OrderManager
     from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
-    from auto_trader.persistence.db import configure_db_path, init_db, load_system_state, save_system_state
+    from auto_trader.persistence.db import (
+        configure_db_path,
+        count_entry_orders_since,
+        init_db,
+        load_system_state,
+        reconcile_broker_orders,
+        save_system_state,
+    )
 
     settings = get_settings()
     setup_logging(settings.log_level)
@@ -256,6 +264,46 @@ async def run_first_paper_trade_test():
         print("Alpaca account is not tradable; refusing paper order test.")
         return {"error": "account_not_tradable", "account": account}
 
+    try:
+        recent_orders = await adapter.get_recent_orders(days=2)
+        reconciled_count = await reconcile_broker_orders(recent_orders)
+        if reconciled_count != len(recent_orders):
+            print("Broker reconciliation incomplete; refusing paper order test.")
+            return {
+                "error": "broker_reconciliation_incomplete",
+                "attempted": len(recent_orders),
+                "persisted": reconciled_count,
+            }
+        local_now = datetime.now(ZoneInfo(settings.report_timezone))
+        local_day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_utc = local_day_start.astimezone(UTC).isoformat()
+        today_new_entries = await count_entry_orders_since(today_start_utc)
+    except Exception as e:
+        print(f"Broker reconciliation/count failed; refusing paper order test: {e}")
+        return {"error": "broker_reconciliation_or_count_failed", "detail": str(e)}
+
+    try:
+        positions = await adapter.get_positions_snapshot(strict=True)
+    except Exception as e:
+        print(f"Position snapshot failed; refusing paper order test: {e}")
+        return {"error": "positions_snapshot_failed", "detail": str(e)}
+
+    open_position_count = sum(1 for p in positions if abs(float(p.get("qty", 0) or 0)) > 0)
+    if open_position_count >= settings.max_new_positions_per_day:
+        print("Open position limit already reached; refusing paper order test.")
+        return {
+            "error": "open_position_limit_reached",
+            "open_positions": positions,
+            "today_new_entries": today_new_entries,
+        }
+    if today_new_entries >= settings.max_new_positions_per_day:
+        print("Durable daily entry limit already reached; refusing paper order test.")
+        return {
+            "error": "daily_entry_limit_reached",
+            "open_positions": positions,
+            "today_new_entries": today_new_entries,
+        }
+
     # Get simple rule-based signals
     try:
         signals = await get_simple_rules_signals(adapter, max_signals=1)
@@ -268,10 +316,10 @@ async def run_first_paper_trade_test():
 
     intent = signals[0]
 
-    positions = await adapter.get_positions_snapshot()
     snapshot = type("obj", (object,), {
         "equity": float(account.get("equity", 0.0)),
         "open_positions": positions,
+        "today_new_entries": today_new_entries,
     })()
 
     if snapshot.equity <= 0:

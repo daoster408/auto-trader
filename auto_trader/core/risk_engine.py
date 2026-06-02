@@ -6,6 +6,7 @@ No exceptions. Ever.
 from __future__ import annotations
 
 import uuid
+from math import floor
 
 
 from auto_trader.core.models import RiskDecision, TradeIntent
@@ -50,16 +51,89 @@ class RiskEngine:
                 trace_id=trace_id,
             )
 
-        # 2. Basic per-trade risk budget (v1 first paper trade: one share, no leverage)
-        sized_qty = 1.0
+        open_positions = getattr(snapshot, "open_positions", [])
+        existing_position_symbols = {
+            str(p.get("symbol", "")).upper()
+            for p in open_positions
+            if abs(float(p.get("qty", 0) or 0)) > 0
+        }
+        if intent.symbol.upper() in existing_position_symbols:
+            return RiskDecision(
+                approved=False,
+                reason="Symbol already has an open position",
+                sized_quantity=None,
+                risk_metrics={"symbol": intent.symbol, "open_positions": sorted(existing_position_symbols)},
+                model_tag=model_tag,
+                trace_id=trace_id,
+            )
+        if (
+            self.settings.max_new_positions_per_day <= 1
+            and len(existing_position_symbols) >= self.settings.max_new_positions_per_day
+        ):
+            return RiskDecision(
+                approved=False,
+                reason="Open position limit reached for v1",
+                sized_quantity=None,
+                risk_metrics={
+                    "open_positions": sorted(existing_position_symbols),
+                    "max_new_positions_per_day": self.settings.max_new_positions_per_day,
+                },
+                model_tag=model_tag,
+                trace_id=trace_id,
+            )
+
+        durable_today_entries_raw = getattr(snapshot, "today_new_entries", None)
+        if durable_today_entries_raw is None:
+            return RiskDecision(
+                approved=False,
+                reason="Durable daily entry count unavailable",
+                sized_quantity=None,
+                risk_metrics={"today_new_entries": None},
+                model_tag=model_tag,
+                trace_id=trace_id,
+            )
+        durable_today_entries = int(durable_today_entries_raw)
+        if durable_today_entries >= self.settings.max_new_positions_per_day:
+            return RiskDecision(
+                approved=False,
+                reason="Durable daily new position limit reached",
+                sized_quantity=None,
+                risk_metrics={
+                    "today_new_entries": durable_today_entries,
+                    "max_new_positions_per_day": self.settings.max_new_positions_per_day,
+                },
+                model_tag=model_tag,
+                trace_id=trace_id,
+            )
+
+        # 2. Basic per-trade risk budget (v1 bootstrap: fractional long, no leverage)
+        early_notional_cap = snapshot.equity * 0.05
+        sized_qty = floor((early_notional_cap / intent.entry_price) * 1_000_000) / 1_000_000
         proposed_notional = intent.entry_price * sized_qty
         max_risk_dollars = snapshot.equity * (self.settings.risk_per_trade_pct / 100.0)
-        if proposed_notional > snapshot.equity * 0.05:  # conservative 5% cap early
+        if proposed_notional < 1.0:
+            return RiskDecision(
+                approved=False,
+                reason="Proposed size below minimum bootstrap notional",
+                sized_quantity=None,
+                risk_metrics={
+                    "proposed_notional": proposed_notional,
+                    "early_notional_cap": early_notional_cap,
+                    "max_risk": max_risk_dollars,
+                },
+                model_tag=model_tag,
+                trace_id=trace_id,
+            )
+        if proposed_notional > early_notional_cap:  # conservative 5% cap early
             return RiskDecision(
                 approved=False,
                 reason="Proposed size exceeds early conservative limit",
                 sized_quantity=None,
-                risk_metrics={"proposed_notional": proposed_notional, "max_risk": max_risk_dollars},
+                risk_metrics={
+                    "proposed_notional": proposed_notional,
+                    "early_notional_cap": early_notional_cap,
+                    "max_risk": max_risk_dollars,
+                },
                 model_tag=model_tag,
                 trace_id=trace_id,
             )
@@ -76,7 +150,7 @@ class RiskEngine:
             )
 
         # 4. Gross exposure guard (very loose for bootstrap)
-        current_exposure = sum(p.get("market_value", 0) for p in snapshot.open_positions)
+        current_exposure = sum(p.get("market_value", 0) for p in open_positions)
         projected = current_exposure + proposed_notional
         if projected > snapshot.equity * (self.settings.max_gross_exposure_pct / 100):
             return RiskDecision(

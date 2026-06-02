@@ -7,7 +7,7 @@ Fast startup on ARM via lazy client.
 """
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -35,6 +35,19 @@ except ImportError:
     _ALPACA_AVAILABLE = False
     TradingClient = None  # type: ignore
     MarketOrderRequest = None  # type: ignore
+
+
+def _enum_value(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw) if raw is not None else ""
+
+
+def _iso_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
 
 
 class AlpacaAdapter:
@@ -103,7 +116,7 @@ class AlpacaAdapter:
             return {"equity": 0.0, "cash": 0.0, "status": "ERROR", "error": str(e)}
 
     @retry_external
-    async def get_positions_snapshot(self) -> list[dict[str, Any]]:
+    async def get_positions_snapshot(self, *, strict: bool = False) -> list[dict[str, Any]]:
         """Return open positions as risk-engine-friendly dictionaries."""
         try:
             client = self._get_client()
@@ -121,7 +134,44 @@ class AlpacaAdapter:
             return results
         except Exception as e:
             log.error("positions_snapshot_failed", error=str(e))
+            if strict:
+                raise
             return []
+
+    @retry_external
+    async def get_recent_orders(self, days: int = 2) -> list[dict[str, Any]]:
+        """Return recent broker orders for reconciliation and duplicate-entry guards."""
+        try:
+            client = self._get_client()
+            after = datetime.now(UTC) - timedelta(days=days)
+            orders = await asyncio.to_thread(
+                client.get_orders,
+                GetOrdersRequest(status=QueryOrderStatus.ALL, after=after),
+            )
+            results: list[dict[str, Any]] = []
+            for order in orders:
+                broker_id = str(getattr(order, "id", ""))
+                results.append(
+                    {
+                        "client_order_id": str(getattr(order, "client_order_id", None) or broker_id),
+                        "broker_order_id": broker_id,
+                        "symbol": str(getattr(order, "symbol", "")).upper(),
+                        "side": _enum_value(getattr(order, "side", "")),
+                        "qty": _safe_float(getattr(order, "qty", 0)),
+                        "order_type": _enum_value(getattr(order, "order_type", "")),
+                        "status": _enum_value(getattr(order, "status", "")),
+                        "filled_qty": _safe_float(getattr(order, "filled_qty", 0)),
+                        "avg_fill_price": _safe_float(getattr(order, "filled_avg_price", None), default=None),
+                        "submitted_at": _iso_value(getattr(order, "submitted_at", None)),
+                        "filled_at": _iso_value(getattr(order, "filled_at", None)),
+                        "rationale": "broker_reconciliation",
+                    }
+                )
+            log.info("recent_orders_loaded", count=len(results), days=days)
+            return results
+        except Exception as e:
+            log.error("recent_orders_failed", error=str(e))
+            raise
 
     @retry_external
     async def get_clock(self) -> dict[str, Any]:
@@ -197,7 +247,16 @@ class AlpacaAdapter:
             )
             with urlopen(req, timeout=20) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-            return payload.get("snapshots", {})
+            snapshots = payload.get("snapshots")
+            if isinstance(snapshots, dict):
+                return snapshots
+            # Alpaca's multi-symbol snapshots endpoint may return symbol keys at
+            # the top level, e.g. {"AAPL": {...}, "MSFT": {...}}.
+            return {
+                symbol: snapshot
+                for symbol, snapshot in payload.items()
+                if symbol.upper() in clean_symbols and isinstance(snapshot, dict)
+            }
 
         try:
             snapshots = await asyncio.to_thread(_fetch)
@@ -306,11 +365,16 @@ class AlpacaAdapter:
 
             result = {
                 "id": str(getattr(submitted, "id", "")),
+                "client_order_id": str(getattr(submitted, "client_order_id", None) or getattr(submitted, "id", "")),
                 "symbol": symbol.upper(),
                 "qty": float(getattr(submitted, "qty", qty)),
                 "side": side,
-                "status": getattr(submitted, "status", "submitted"),
-                "submitted_at": getattr(submitted, "submitted_at", None),
+                "order_type": order_type,
+                "status": _enum_value(getattr(submitted, "status", "submitted")),
+                "filled_qty": _safe_float(getattr(submitted, "filled_qty", 0)),
+                "avg_fill_price": _safe_float(getattr(submitted, "filled_avg_price", None), default=None),
+                "submitted_at": _iso_value(getattr(submitted, "submitted_at", None)),
+                "filled_at": _iso_value(getattr(submitted, "filled_at", None)),
                 "paper": self.paper,
             }
 

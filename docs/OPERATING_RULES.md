@@ -14,7 +14,9 @@ Rules all AIs and contributors must follow.
 - Every session must declare active role and model tag.
 - Reviewer can require changes before optimization.
 - Optimizer cannot remove or weaken risk controls to improve speed.
-- After any major Engineer deliverable, Reviewer and Optimizer subagents must be launched automatically without asking the user each cycle. Reviewer focuses on safety/correctness; Optimizer focuses on reliability/performance without weakening risk controls.
+- After any major Engineer deliverable, visible Reviewer and Optimizer background threads must be launched automatically without asking the user each cycle. Reviewer focuses on safety/correctness; Optimizer focuses on reliability/performance without weakening risk controls.
+- Engineer must proactively check Reviewer/Optimizer verdicts, apply required fixes, and send the updated work back for re-review without waiting for the user to ask.
+- BLOCK and APPROVE WITH CHANGES verdicts require Engineer action or an explicit documented deferral before new feature work continues.
 - Milestones are incomplete until all four deliverables are present:
   - complete architecture
   - full implementation
@@ -44,6 +46,14 @@ Per session, update:
 - `docs/HANDOFF.md` (required)
 - `docs/DECISIONS_LOG.md` (required only if a decision changed)
 - `docs/AGENT_WORKFLOW.md` (reference required for role handoffs)
+
+## GitHub Sync Rules
+
+- After every approved major milestone or safety fix, Engineer must commit and push to GitHub without waiting for the user to ask.
+- Do not push while Reviewer or Optimizer has an unresolved `BLOCK`.
+- `APPROVE WITH CHANGES` must be fixed or explicitly documented as deferred before push.
+- Never commit `.env`, secrets, local databases, or generated private runtime artifacts.
+- Commit messages should name the milestone and safety outcome.
 
 ## Model Experimentation Rules
 

@@ -64,6 +64,6 @@ CREATE TABLE IF NOT EXISTS journal_entries (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Initial state
+-- Initial state: safe default. Manual /resume is required after a fresh DB.
 INSERT OR IGNORE INTO system_state (id, state, updated_at)
-VALUES (1, 'ACTIVE', datetime('now'));
+VALUES (1, 'HALTED', datetime('now'));
