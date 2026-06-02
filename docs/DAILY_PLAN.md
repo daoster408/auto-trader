@@ -46,6 +46,46 @@ Append-only by day. Do not remove past entries.
 - Confidence:
   - high
 
+## 2026-06-02 (America/Los_Angeles) - Day 2 Supervisor Loop Final Approval
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Completed the Day 2 supervisor loop review cycle after internet/auto-compact disruption.
+  - Reused the same visible Reviewer and Optimizer threads for all blocker fixes on this milestone.
+  - Addressed Reviewer/Optimizer findings:
+    - optional auto-entry remains gated through `OrderManager -> RiskEngine` and is blocked on supervisor read errors;
+    - optional auto-exit is still disabled by default;
+    - auto-exit now suppresses duplicate close submissions per symbol while a close remains pending;
+    - pending exits now survive transient position-snapshot failures and only clear after a successful snapshot proves the symbol is gone;
+    - `close_position()` caps explicit close quantity to the broker-reported position size;
+    - supervisor suppresses auto-exit execution while `HALTED`;
+    - shutdown emergency halt now covers both `ACTIVE` and `PAUSED`;
+    - supervisor interval/timeout settings now have Pydantic bounds to prevent hot loops.
+  - Added regression coverage for duplicate close suppression, pending-exit preservation across position read failures, HALTED auto-exit suppression, and hot-loop config validation.
+  - Verification:
+    - `.venv/bin/python -m pytest -q` -> `33 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+    - direct import check for `auto_trader.__main__.main` -> passed.
+- FINAL REVIEW:
+  - Reviewer final confirmation: `APPROVE`.
+  - Optimizer final confirmation: `APPROVE`.
+- IN_PROGRESS:
+  - Commit and push Day 2 supervisor implementation.
+- NEXT:
+  - Run paper burn-in with alert-only supervisor defaults.
+  - Consider broker open close-order checks and persisted pending exits before long unattended `AUTO_EXIT_ENABLED=true` runs.
+  - Decide explicit timing for enabling `AUTO_ENTRY_ENABLED` and `AUTO_EXIT_ENABLED` during supervised paper burn-in.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Reviewer thread: `019e8938-8556-78e3-97fa-ed928f7c3c6f`.
+  - Optimizer thread: `019e8938-865c-7850-981e-96f481ded3fd`.
+- Confidence:
+  - high
+
 ## Week 1 Day-by-Day Plan (Target)
 
 - Day 1:
@@ -686,6 +726,54 @@ Append-only by day. Do not remove past entries.
 - Evidence:
   - Reviewer thread: `019e8901-97e5-7340-96a8-62d8b0523777`.
   - Optimizer thread: `019e8901-b0ce-7522-8f74-063ba926f165`.
+- Confidence:
+  - high
+
+## 2026-06-02 (America/Los_Angeles) - Day 2 Supervisor Loop Implementation
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Implemented Day 2 supervised trading loop foundation:
+    - `TradingSupervisor` background loop under `auto_trader/scheduler/`.
+    - Periodic broker order reconciliation via `reconcile_broker_orders()`.
+    - Position monitoring for open broker positions.
+    - Telegram supervisor alerts using allowlisted operator IDs.
+    - HALTED-with-open-position warning for kill/flatten validation.
+    - Optional auto-entry loop that still routes through `RiskEngine -> OrderManager`.
+    - Optional auto-exit execution through broker close-position path.
+  - Added default alert-only supervisor settings:
+    - `AUTO_ENTRY_ENABLED=false`.
+    - `AUTO_EXIT_ENABLED=false`.
+    - Reconciliation and monitor intervals.
+    - Exit thresholds for max loss, take profit, trailing stop, and max hold days.
+  - Added broker support:
+    - enriched position snapshots with `avg_entry_price`, `current_price`, and `cost_basis`;
+    - added `close_position()` for risk-reducing exit orders.
+  - Added persistence helper:
+    - `get_latest_entry_order_for_symbol()` for durable max-hold age checks.
+  - Added tests:
+    - supervisor reconciliation + dry-run exit alert,
+    - max-hold exit rule,
+    - enabled auto-exit close + persistence path,
+    - optional auto-entry uses `OrderManager`.
+  - Verification:
+    - `.venv/bin/python -m pytest -q` -> `29 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+- IN_PROGRESS:
+  - Launching fresh visible Reviewer and Optimizer threads for this new major Day 2 milestone.
+- NEXT:
+  - Read Reviewer/Optimizer verdicts.
+  - Fix any `BLOCK` / `APPROVE WITH CHANGES` findings.
+  - Commit and push only after approval.
+- BLOCKED:
+  - Pending review.
+- Evidence:
+  - Current implementation is safe-by-default: monitor/reconcile/alert runs, but automated entries/exits require explicit env opt-in.
+  - Reviewer thread: `019e8938-8556-78e3-97fa-ed928f7c3c6f`.
+  - Optimizer thread: `019e8938-865c-7850-981e-96f481ded3fd`.
 - Confidence:
   - high
 

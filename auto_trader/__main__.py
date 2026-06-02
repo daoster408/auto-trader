@@ -15,6 +15,7 @@ Hardened:
 - All risk/kill gates untouched and reinforced
 """
 import asyncio
+from contextlib import suppress
 import os
 import signal
 import sys
@@ -25,10 +26,12 @@ from zoneinfo import ZoneInfo
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.comms.telegram_bot import TelegramBot
 from auto_trader.config.settings import get_settings
-from auto_trader.core.models import KillResult
+from auto_trader.core.models import KillResult, SystemState
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.state_machine import StateMachine
+from auto_trader.execution.order_manager import OrderManager
 from auto_trader.persistence.db import init_db, load_system_state, save_system_state
+from auto_trader.scheduler.trading_supervisor import TradingSupervisor
 from auto_trader.utils.logging import setup_logging, get_logger
 
 log = get_logger("auto_trader.main")
@@ -127,6 +130,7 @@ async def main() -> None:
         api_secret=settings.alpaca_api_secret,
         paper=settings.alpaca_paper,
     )
+    order_manager = OrderManager(risk_engine, adapter)
 
     # Health + observability on startup
     health = await adapter.health_check()
@@ -143,6 +147,15 @@ async def main() -> None:
         adapter=adapter,
         resume_token=settings.resume_token,
         allowed_ids=settings.telegram_allowed_ids,
+    )
+    bot.build()
+
+    supervisor = TradingSupervisor(
+        settings=settings,
+        state_machine=state_machine,
+        adapter=adapter,
+        order_manager=order_manager,
+        notifier=bot.send_alert,
     )
 
     # Graceful shutdown + dual-path kill (OS signals now also trigger real halt+flatten)
@@ -170,6 +183,7 @@ async def main() -> None:
             await _touch_health_file(True)
 
     health_task = asyncio.create_task(_health_watcher())
+    supervisor_task = asyncio.create_task(supervisor.run(stop_event))
 
     try:
         log.info(
@@ -186,8 +200,17 @@ async def main() -> None:
         log.exception("fatal_error_main_loop")
     finally:
         health_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await health_task
+        stop_event.set()
+        try:
+            await asyncio.wait_for(supervisor_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            supervisor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await supervisor_task
         # Belt + suspenders: if we are still ACTIVE/PAUSED on shutdown, force HALTED best-effort
-        if state_machine.can_trade():
+        if state_machine.state in {SystemState.ACTIVE, SystemState.PAUSED}:
             await _emergency_halt(state_machine, adapter, "shutdown_without_explicit_kill")
         await bot.shutdown()
         await _touch_health_file(False)

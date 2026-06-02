@@ -129,6 +129,9 @@ class AlpacaAdapter:
                         "qty": _safe_float(getattr(pos, "qty", 0)),
                         "market_value": _safe_float(getattr(pos, "market_value", 0)),
                         "unrealized_pl": _safe_float(getattr(pos, "unrealized_pl", 0)),
+                        "avg_entry_price": _safe_float(getattr(pos, "avg_entry_price", None), default=None),
+                        "current_price": _safe_float(getattr(pos, "current_price", None), default=None),
+                        "cost_basis": _safe_float(getattr(pos, "cost_basis", None), default=None),
                     }
                 )
             return results
@@ -321,6 +324,56 @@ class AlpacaAdapter:
         except Exception as e:
             log.error("flatten_all_failed", error=str(e))
             return 0
+
+    @retry_external
+    async def close_position(self, symbol: str, qty: float | None = None, reason: str = "exit_rule") -> dict[str, Any]:
+        """Close an existing broker position with a market order. Risk-reducing only."""
+        if not _ALPACA_AVAILABLE:
+            raise RuntimeError("alpaca-py not installed")
+
+        client = self._get_client()
+        target_symbol = symbol.upper()
+        positions = await asyncio.to_thread(client.get_all_positions)
+        target = None
+        for pos in positions:
+            if str(getattr(pos, "symbol", "")).upper() == target_symbol:
+                target = pos
+                break
+        if target is None:
+            raise ValueError(f"no open position for {target_symbol}")
+
+        position_qty = float(getattr(target, "qty", 0.0))
+        available_qty = abs(position_qty)
+        requested_qty = abs(float(qty if qty is not None else position_qty))
+        close_qty = min(requested_qty, available_qty)
+        if close_qty <= 0:
+            raise ValueError(f"invalid close quantity for {target_symbol}: {close_qty}")
+        close_side = OrderSide.SELL if position_qty > 0 else OrderSide.BUY
+        close_req = MarketOrderRequest(
+            symbol=target_symbol,
+            qty=close_qty,
+            side=close_side,
+            time_in_force=TimeInForce.DAY,
+        )
+        submitted = await asyncio.to_thread(client.submit_order, close_req)
+        result = {
+            "id": str(getattr(submitted, "id", "")),
+            "client_order_id": str(getattr(submitted, "client_order_id", None) or getattr(submitted, "id", "")),
+            "broker_order_id": str(getattr(submitted, "id", "")),
+            "symbol": target_symbol,
+            "qty": float(getattr(submitted, "qty", close_qty)),
+            "side": "sell" if close_side == OrderSide.SELL else "buy_to_cover",
+            "order_type": "market",
+            "status": _enum_value(getattr(submitted, "status", "submitted")),
+            "filled_qty": _safe_float(getattr(submitted, "filled_qty", 0)),
+            "avg_fill_price": _safe_float(getattr(submitted, "filled_avg_price", None), default=None),
+            "submitted_at": _iso_value(getattr(submitted, "submitted_at", None)),
+            "filled_at": _iso_value(getattr(submitted, "filled_at", None)),
+            "paper": self.paper,
+            "rationale": reason,
+        }
+        log.warning("position_close_order_submitted", **result)
+        return result
 
     @retry_external
     async def submit_order(

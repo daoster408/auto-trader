@@ -8,13 +8,16 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from auto_trader.core.models import SystemState, KillResult, TradeIntent
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.comms.telegram_bot import TelegramBot
+from auto_trader.config.settings import Settings
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
+from auto_trader.scheduler.trading_supervisor import TradingSupervisor
 from auto_trader.persistence.db import (
     configure_db_path,
     count_entry_orders_since,
@@ -31,6 +34,20 @@ class DummySettings:
     risk_per_trade_pct = 0.5
     max_new_positions_per_day = 1
     max_gross_exposure_pct = 25.0
+
+
+class DummySupervisorSettings(DummySettings):
+    reconcile_interval_seconds = 300
+    reconcile_lookback_days = 2
+    position_monitor_interval_seconds = 60
+    supervisor_tick_timeout_seconds = 20
+    auto_entry_enabled = False
+    auto_exit_enabled = False
+    position_max_loss_pct = -5.0
+    position_take_profit_pct = 8.0
+    position_trailing_stop_pct = 6.0
+    position_max_hold_days = 10
+    report_timezone = "America/Los_Angeles"
 
 
 class DummySnapshot:
@@ -763,3 +780,520 @@ async def test_telegram_snapshot_gather_surfaces_returned_error_dicts(monkeypatc
     assert snapshot["health"]["market_open"] is None
     assert "Market open: None" in status
     assert "Warnings: account unavailable: account returned error; market clock unavailable: clock returned error" in status
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reconciles_and_dry_run_exit_signal(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    notifications = []
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.close_calls = 0
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return [{"id": "order-1", "symbol": "AMPX"}]
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return [
+                {
+                    "symbol": "AMPX",
+                    "qty": 1,
+                    "market_value": 94.0,
+                    "unrealized_pl": -6.0,
+                    "cost_basis": 100.0,
+                }
+            ]
+
+        async def close_position(self, *args, **kwargs):
+            self.close_calls += 1
+            return {}
+
+    async def fake_reconcile(orders):
+        return len(orders)
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        return None
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+
+    adapter = FakeAdapter()
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=sm,
+        adapter=adapter,
+        order_manager=object(),
+        notifier=fake_notify,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.reconciled_orders == 1
+    assert result.exit_decisions[0].should_exit is True
+    assert result.exit_decisions[0].reason == "position max loss reached"
+    assert adapter.close_calls == 0
+    assert any("EXIT SIGNAL (dry run): AMPX" in message for message in notifications)
+
+
+def test_supervisor_exit_rule_blocks_max_hold():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=sm,
+        adapter=object(),
+        order_manager=object(),
+    )
+
+    decision = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 100.0,
+            "unrealized_pl": 0.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 10.1,
+        }
+    )
+
+    assert decision.should_exit is True
+    assert decision.reason == "position max hold reached"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_auto_exit_closes_and_persists(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    notifications = []
+
+    class ExitSettings(DummySupervisorSettings):
+        auto_exit_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.close_calls = 0
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return [
+                {
+                    "symbol": "AMPX",
+                    "qty": 1,
+                    "market_value": 110.0,
+                    "unrealized_pl": 10.0,
+                    "cost_basis": 100.0,
+                }
+            ]
+
+        async def close_position(self, symbol, reason):
+            self.close_calls += 1
+            return {
+                "id": "exit-1",
+                "client_order_id": "exit-1",
+                "broker_order_id": "exit-1",
+                "symbol": symbol,
+                "side": "sell",
+                "qty": 1,
+                "status": "submitted",
+                "rationale": reason,
+            }
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        return None
+
+    async def fake_upsert(order, **kwargs):
+        assert order["id"] == "exit-1"
+        return True
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.upsert_order_record", fake_upsert)
+
+    adapter = FakeAdapter()
+    supervisor = TradingSupervisor(
+        settings=ExitSettings(),
+        state_machine=sm,
+        adapter=adapter,
+        order_manager=object(),
+        notifier=fake_notify,
+    )
+
+    result = await supervisor.tick_once()
+    result2 = await supervisor.tick_once()
+
+    assert result.exit_decisions[0].reason == "position take profit reached"
+    assert result2.exit_decisions[0].reason == "position take profit reached"
+    assert adapter.close_calls == 1
+    assert any("EXIT SUBMITTED: AMPX" in message for message in notifications)
+    assert any("EXIT SUPPRESSED: close order already submitted for AMPX" in message for message in notifications)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_pending_exit_survives_position_snapshot_failure(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    notifications = []
+
+    class ExitSettings(DummySupervisorSettings):
+        auto_exit_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.close_calls = 0
+            self.position_calls = 0
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            self.position_calls += 1
+            if self.position_calls == 2:
+                raise RuntimeError("broker positions temporarily unavailable")
+            return [
+                {
+                    "symbol": "AMPX",
+                    "qty": 1,
+                    "market_value": 110.0,
+                    "unrealized_pl": 10.0,
+                    "cost_basis": 100.0,
+                }
+            ]
+
+        async def close_position(self, symbol, reason):
+            self.close_calls += 1
+            return {
+                "id": f"exit-{self.close_calls}",
+                "client_order_id": f"exit-{self.close_calls}",
+                "broker_order_id": f"exit-{self.close_calls}",
+                "symbol": symbol,
+                "side": "sell",
+                "qty": 1,
+                "status": "submitted",
+                "rationale": reason,
+            }
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        return None
+
+    async def fake_upsert(order, **kwargs):
+        return True
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.upsert_order_record", fake_upsert)
+
+    adapter = FakeAdapter()
+    supervisor = TradingSupervisor(
+        settings=ExitSettings(),
+        state_machine=sm,
+        adapter=adapter,
+        order_manager=object(),
+        notifier=fake_notify,
+    )
+
+    first = await supervisor.tick_once()
+    second = await supervisor.tick_once()
+    third = await supervisor.tick_once()
+
+    assert first.exit_decisions[0].reason == "position take profit reached"
+    assert second.exit_decisions == []
+    assert third.exit_decisions[0].reason == "position take profit reached"
+    assert adapter.close_calls == 1
+    assert any("positions unavailable" in error for error in second.errors)
+    assert any("EXIT SUPPRESSED: close order already submitted for AMPX" in message for message in notifications)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_halted_suppresses_auto_exit(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.HALTED)
+    notifications = []
+
+    class ExitSettings(DummySupervisorSettings):
+        auto_exit_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.close_calls = 0
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return [
+                {
+                    "symbol": "AMPX",
+                    "qty": 1,
+                    "market_value": 110.0,
+                    "unrealized_pl": 10.0,
+                    "cost_basis": 100.0,
+                }
+            ]
+
+        async def close_position(self, symbol, reason):
+            self.close_calls += 1
+            return {"id": "exit-1", "symbol": symbol, "rationale": reason}
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        return None
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+
+    adapter = FakeAdapter()
+    supervisor = TradingSupervisor(
+        settings=ExitSettings(),
+        state_machine=sm,
+        adapter=adapter,
+        order_manager=object(),
+        notifier=fake_notify,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.exit_decisions[0].reason == "position take profit reached"
+    assert adapter.close_calls == 0
+    assert any("HALTED POSITION WARNING" in message for message in notifications)
+    assert any("EXIT SUPPRESSED: system is HALTED" in message for message in notifications)
+
+
+def test_supervisor_config_rejects_hot_loop_intervals():
+    with pytest.raises(ValidationError):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            RECONCILE_INTERVAL_SECONDS=0,
+            POSITION_MONITOR_INTERVAL_SECONDS=0,
+            SUPERVISOR_TICK_TIMEOUT_SECONDS=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class EntrySettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    class FakeOrderManager:
+        def __init__(self):
+            self.calls = []
+
+        async def submit_trade_intent(self, intent, snapshot):
+            self.calls.append((intent, snapshot))
+            return {"order": {"id": "entry-1"}, "risk_decision": {"approved": True}}
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        return None
+
+    async def fake_signals(adapter, max_signals=1):
+        return [TradeIntent(symbol="AMPX", side="long", entry_price=20.0)]
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=EntrySettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=manager,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.entry_result["order"]["id"] == "entry-1"
+    assert manager.calls[0][0].symbol == "AMPX"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_blocks_auto_entry_when_positions_unavailable(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class EntrySettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            raise RuntimeError("positions down")
+
+    class FakeOrderManager:
+        def __init__(self):
+            self.calls = 0
+
+        async def submit_trade_intent(self, intent, snapshot):
+            self.calls += 1
+            return {"order": {"id": "entry-1"}}
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_signals(adapter, max_signals=1):
+        return [TradeIntent(symbol="AMPX", side="long", entry_price=20.0)]
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=EntrySettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=manager,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.entry_result is None
+    assert manager.calls == 0
+    assert any("positions unavailable" in error for error in result.errors)

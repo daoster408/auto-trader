@@ -303,3 +303,43 @@ async def get_latest_order_records(limit: int = 5) -> list[dict[str, Any]]:
         except Exception as e:
             log.error("latest_order_records_failed", error=str(e))
             raise
+
+
+async def get_latest_entry_order_for_symbol(symbol: str) -> dict[str, Any] | None:
+    """Return the latest durable buy/long entry order for a symbol."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT
+                        client_order_id,
+                        broker_order_id,
+                        symbol,
+                        side,
+                        qty,
+                        order_type,
+                        status,
+                        filled_qty,
+                        avg_fill_price,
+                        submitted_at,
+                        filled_at,
+                        rationale
+                    FROM orders
+                    WHERE upper(symbol) = ?
+                      AND lower(side) IN ('long', 'buy')
+                      AND lower(status) NOT IN ('canceled', 'cancelled', 'rejected', 'expired')
+                    ORDER BY COALESCE(submitted_at, filled_at, '') DESC, rowid DESC
+                    LIMIT 1
+                    """,
+                    (symbol.upper(),),
+                )
+                row = await cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("latest_entry_order_lookup_failed", symbol=symbol, error=str(e))
+            raise

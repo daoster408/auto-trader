@@ -28,6 +28,18 @@ class Settings(BaseSettings):
     peak_drawdown_halt_pct: float = Field(-6.0, alias="PEAK_DRAWDOWN_HALT_PCT")
     consecutive_sl_halt: int = Field(2, alias="CONSECUTIVE_SL_HALT")
 
+    # Supervisor / automation controls (default alert-only)
+    reconcile_interval_seconds: int = Field(300, ge=60, alias="RECONCILE_INTERVAL_SECONDS")
+    reconcile_lookback_days: int = Field(2, ge=1, alias="RECONCILE_LOOKBACK_DAYS")
+    position_monitor_interval_seconds: int = Field(60, ge=15, alias="POSITION_MONITOR_INTERVAL_SECONDS")
+    supervisor_tick_timeout_seconds: int = Field(20, ge=1, alias="SUPERVISOR_TICK_TIMEOUT_SECONDS")
+    auto_entry_enabled: bool = Field(False, alias="AUTO_ENTRY_ENABLED")
+    auto_exit_enabled: bool = Field(False, alias="AUTO_EXIT_ENABLED")
+    position_max_loss_pct: float = Field(-5.0, alias="POSITION_MAX_LOSS_PCT")
+    position_take_profit_pct: float = Field(8.0, alias="POSITION_TAKE_PROFIT_PCT")
+    position_trailing_stop_pct: float = Field(6.0, ge=0.0, alias="POSITION_TRAILING_STOP_PCT")
+    position_max_hold_days: int = Field(10, ge=1, alias="POSITION_MAX_HOLD_DAYS")
+
     report_timezone: str = Field("America/Los_Angeles", alias="REPORT_TIMEZONE")
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field("INFO", alias="LOG_LEVEL")
 

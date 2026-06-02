@@ -150,6 +150,20 @@ class TelegramBot:
         await self._reject_unauthorized(update, command)
         return False
 
+    async def send_alert(self, message: str) -> None:
+        """Send an operator alert to configured allowlisted IDs."""
+        if not self.allowed_ids:
+            log.warning("telegram_alert_skipped_no_allowed_ids")
+            return
+        if not self.app:
+            self.build()
+        assert self.app is not None
+        for chat_id in sorted(self.allowed_ids):
+            try:
+                await self.app.bot.send_message(chat_id=chat_id, text=message)
+            except Exception as e:
+                log.error("telegram_alert_send_failed", chat_id=chat_id, error=str(e))
+
     async def _reconcile_and_snapshot(self) -> dict[str, Any]:
         """Read-only operator snapshot. Never submits orders."""
         result: dict[str, Any] = {
