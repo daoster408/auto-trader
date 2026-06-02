@@ -31,6 +31,7 @@ Telegram checks after startup:
 - Send `/status` and confirm account, state, and warnings.
 - Send `/status` and confirm pending exits show the close order ID, reason, status, and duplicate-exit suppression.
 - Send `/report` and confirm positions, orders, pending exits, and latest journal entries are visible.
+- Expected pending-close suppression is log-only; Telegram alerts are reserved for submitted exits, failures, unresolved pending exits, and operator actions.
 - Do not use `/resume <token>` unless the restored state is intentionally ready to trade.
 - Use `/kill` only when you intend to flatten paper positions and persist `HALTED`.
 

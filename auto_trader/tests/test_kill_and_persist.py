@@ -1153,7 +1153,7 @@ async def test_supervisor_auto_exit_closes_and_persists(monkeypatch):
     assert result2.exit_decisions[0].reason == "position take profit reached"
     assert adapter.close_calls == 1
     assert any("EXIT SUBMITTED: AMPX" in message for message in notifications)
-    assert any("EXIT SUPPRESSED: close order already submitted for AMPX" in message for message in notifications)
+    assert not any("EXIT SUPPRESSED: close order already submitted for AMPX" in message for message in notifications)
 
 
 @pytest.mark.asyncio
@@ -1256,7 +1256,7 @@ async def test_supervisor_pending_exit_survives_position_snapshot_failure(monkey
     assert third.exit_decisions[0].reason == "position take profit reached"
     assert adapter.close_calls == 1
     assert any("positions unavailable" in error for error in second.errors)
-    assert any("EXIT SUPPRESSED: close order already submitted for AMPX" in message for message in notifications)
+    assert not any("EXIT SUPPRESSED: close order already submitted for AMPX" in message for message in notifications)
 
 
 @pytest.mark.asyncio
@@ -1405,7 +1405,7 @@ async def test_supervisor_persisted_pending_exit_suppresses_close_after_restart(
 
     assert result.exit_decisions[0].reason == "position max loss reached"
     assert adapter.close_calls == 0
-    assert any("EXIT SUPPRESSED: persisted pending close exists for AMPX" in message for message in notifications)
+    assert notifications == []
 
 
 @pytest.mark.asyncio
@@ -1711,7 +1711,7 @@ async def test_supervisor_broker_open_close_order_suppresses_and_persists(monkey
     assert adapter.close_calls == 0
     assert pending_upserts[0][0] == "AMPX"
     assert pending_upserts[0][1]["broker_order_id"] == "broker-open-close"
-    assert any("broker already has an open close order for AMPX" in message for message in notifications)
+    assert notifications == []
 
 
 @pytest.mark.asyncio

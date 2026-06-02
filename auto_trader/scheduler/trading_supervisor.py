@@ -274,9 +274,10 @@ class TradingSupervisor:
             )
             return None
         if decision.symbol in self._pending_exit_symbols:
-            await self._notify_once(
-                f"exit-pending-{decision.symbol}",
-                f"EXIT SUPPRESSED: close order already submitted for {decision.symbol}.",
+            log.info(
+                "exit_suppressed_pending_in_memory",
+                symbol=decision.symbol,
+                reason=decision.reason,
             )
             return None
         persisted_pending = await get_pending_exit_for_symbol(decision.symbol)
@@ -284,9 +285,11 @@ class TradingSupervisor:
             open_close_order = await self._find_open_close_order(decision, pending_exit=persisted_pending)
             if open_close_order:
                 self._pending_exit_symbols.add(decision.symbol)
-                await self._notify_once(
-                    f"exit-pending-persisted-{decision.symbol}",
-                    f"EXIT SUPPRESSED: persisted pending close exists for {decision.symbol}.",
+                log.info(
+                    "exit_suppressed_persisted_pending",
+                    symbol=decision.symbol,
+                    broker_order_id=persisted_pending.get("broker_order_id"),
+                    reason=decision.reason,
                 )
             else:
                 await self._notify_once(
@@ -318,9 +321,11 @@ class TradingSupervisor:
                     )
                     if self.sm.can_trade():
                         self.sm.pause("broker close order pending but local pending-exit persistence failed")
-                await self._notify_once(
-                    f"exit-pending-broker-{decision.symbol}",
-                    f"EXIT SUPPRESSED: broker already has an open close order for {decision.symbol}.",
+                log.info(
+                    "exit_suppressed_broker_open_close_order",
+                    symbol=decision.symbol,
+                    broker_order_id=open_close_order.get("broker_order_id") or open_close_order.get("id"),
+                    reason=decision.reason,
                 )
                 return None
 
