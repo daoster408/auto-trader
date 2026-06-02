@@ -1,0 +1,295 @@
+"""AUTO-TRADER main entrypoint (Optimizer production hardening pass).
+
+Role: Optimizer
+Model: xai/grok-build-0.1
+Date: 2026-06-01
+
+Hardened:
+- /kill is fully async + retried + highest priority (no deadlocks)
+- HALTED state persisted via DB on every transition (survives restart)
+- Real alpaca-py SDK on kill/health paths + tenacity
+- Structured logging (UTC + model_tag)
+- Graceful shutdown + signal handling integrated end-to-end
+- Basic observability (health file + startup metrics)
+- Fast ARM startup (lazy client, minimal top-level work)
+- All risk/kill gates untouched and reinforced
+"""
+import asyncio
+import os
+import signal
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+from auto_trader.broker.alpaca_adapter import AlpacaAdapter
+from auto_trader.comms.telegram_bot import TelegramBot
+from auto_trader.config.settings import get_settings
+from auto_trader.core.models import KillResult
+from auto_trader.core.risk_engine import RiskEngine
+from auto_trader.core.state_machine import StateMachine
+from auto_trader.persistence.db import init_db, load_system_state, save_system_state
+from auto_trader.utils.logging import setup_logging, get_logger
+
+log = get_logger("auto_trader.main")
+
+
+async def _persist_hook(state, reason: str | None) -> None:
+    """Async persist for StateMachine - makes HALTED bulletproof across restarts."""
+    await save_system_state(state, reason)
+
+
+async def _touch_health_file(ok: bool = True) -> None:
+    """Basic observability hook for external watchdog (cheap on ARM)."""
+    path = Path("/tmp/auto_trader_healthy")
+    try:
+        if ok:
+            path.write_text(datetime.now(UTC).isoformat())
+        else:
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass  # never fail main on observability
+
+
+async def _emergency_halt(
+    state_machine: StateMachine,
+    adapter: AlpacaAdapter,
+    reason: str,
+) -> None:
+    """
+    Dual-path kill entry point (called from both /kill command and OS signals).
+    Best-effort: persist HALTED, cancel orders, flatten positions, even on partial failure.
+    Uses shield + timeout so shutdown doesn't hang forever.
+    """
+    log.critical("emergency_halt_triggered", reason=reason)
+
+    async def _do_kill() -> None:
+        try:
+            async def _flatten_both() -> KillResult:
+                cancelled = await adapter.cancel_all_orders()
+                flattened = await adapter.flatten_all_positions()
+                return KillResult(
+                    success=True,
+                    orders_cancelled=cancelled,
+                    positions_flattened=flattened,
+                    reason=reason,
+                    incident_report="EMERGENCY FLATTEN (signal/shutdown path)",
+                    timestamp=datetime.now(UTC),
+                )
+
+            # This will set state=HALTED, persist first, then call flatten
+            await state_machine.halt(reason, flatten_callback=_flatten_both)
+        except Exception as e:
+            log.exception("emergency_halt_inner_failed", error=str(e))
+
+    try:
+        # Protect with shield + 15s timeout so we don't block shutdown indefinitely
+        await asyncio.wait_for(asyncio.shield(_do_kill()), timeout=15.0)
+    except asyncio.TimeoutError:
+        log.error("emergency_halt_timed_out")
+    except Exception as e:
+        log.exception("emergency_halt_outer_failed", error=str(e))
+
+
+async def main() -> None:
+    settings = get_settings()
+    setup_logging(
+        level=settings.log_level,
+        model_tag="optimizer/harden-2026-06-01",
+        json_logs=os.getenv("LOG_JSON", "false").lower() == "true",
+    )
+
+    log.critical("=== AUTO-TRADER OPTIMIZER HARDENED START ===")
+    log.info(
+        "config_loaded",
+        paper=settings.alpaca_paper,
+        risk_per_trade_pct=settings.risk_per_trade_pct,
+        hosting_target="oracle-arm-lowmem",
+    )
+
+    # Init DB + restore HALTED state if present (critical for persistence blocker)
+    from auto_trader.persistence.db import configure_db_path
+    configure_db_path(settings.db_path)
+    await init_db()
+    restored_state, meta = await load_system_state()
+    log.info("state_restored", state=restored_state.value, meta=meta)
+
+    # Core - wire real persist hook
+    state_machine = StateMachine(
+        initial_state=restored_state,
+        persist_hook=_persist_hook,
+    )
+    risk_engine = RiskEngine(state_machine, settings)
+
+    # Broker (real SDK now wired for kill paths)
+    adapter = AlpacaAdapter(
+        api_key=settings.alpaca_api_key,
+        api_secret=settings.alpaca_api_secret,
+        paper=settings.alpaca_paper,
+    )
+
+    # Health + observability on startup
+    health = await adapter.health_check()
+    log.info("alpaca_startup_health", **{k: v for k, v in health.items() if k != "error"})
+    await _touch_health_file(health.get("ok", False))
+    if not health.get("ok"):
+        log.error("alpaca_degraded_mode")
+
+    # Telegram (kill now highest-priority async + retried)
+    bot = TelegramBot(
+        token=settings.telegram_bot_token,
+        state_machine=state_machine,
+        risk_engine=risk_engine,
+        adapter=adapter,
+        resume_token=settings.resume_token,
+    )
+
+    # Graceful shutdown + dual-path kill (OS signals now also trigger real halt+flatten)
+    stop_event = asyncio.Event()
+
+    async def _handle_signal_kill(sig: int) -> None:
+        log.critical("signal_kill_initiated", sig=sig)
+        await _emergency_halt(state_machine, adapter, f"signal_{sig}")
+        stop_event.set()
+
+    def _signal_handler(sig: int) -> None:
+        log.warning("signal_received", sig=sig, action="emergency_halt")
+        # Schedule the real kill path without blocking the signal handler
+        asyncio.create_task(_handle_signal_kill(sig))
+
+    # Modern signal handling (works on ARM, avoids deprecated loop methods in some Pythons)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig: _signal_handler(s))
+
+    # Periodic health touch (lightweight observability)
+    async def _health_watcher():
+        while not stop_event.is_set():
+            await asyncio.sleep(30)
+            await _touch_health_file(True)
+
+    health_task = asyncio.create_task(_health_watcher())
+
+    try:
+        log.info(
+            "starting_telegram_control_surface",
+            commands="status,pause,resume,kill,report",
+            kill_priority="absolute",
+        )
+        print("\n✅ AUTO-TRADER (OPTIMIZED) running on Oracle ARM target.")
+        print("   /status | /pause | /resume <token> | /kill | /report")
+        print("   /kill is bulletproof async + real SDK + retries + HALTED persists.\n")
+
+        await bot.run(stop_event=stop_event)
+    except Exception:
+        log.exception("fatal_error_main_loop")
+    finally:
+        health_task.cancel()
+        # Belt + suspenders: if we are still ACTIVE/PAUSED on shutdown, force HALTED best-effort
+        if state_machine.can_trade():
+            await _emergency_halt(state_machine, adapter, "shutdown_without_explicit_kill")
+        await bot.shutdown()
+        await _touch_health_file(False)
+        log.info("shutdown_complete", uptime_s="n/a")
+        print("\nShutdown complete. State persisted.")
+
+
+# === Convenience helper for first paper trade testing (once .env is set) ===
+async def run_first_paper_trade_test():
+    """
+    One-shot function to test the full paper order path:
+    rules_fallback → RiskEngine → OrderManager → real Alpaca paper order.
+
+    Run manually after you have .env with paper keys:
+        python -c "
+        import asyncio
+        from auto_trader.__main__ import run_first_paper_trade_test
+        asyncio.run(run_first_paper_trade_test())
+        "
+    """
+    from auto_trader.config.settings import get_settings
+    from auto_trader.core.risk_engine import RiskEngine
+    from auto_trader.core.state_machine import StateMachine
+    from auto_trader.execution.order_manager import OrderManager
+    from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
+    from auto_trader.persistence.db import configure_db_path, init_db, load_system_state, save_system_state
+
+    settings = get_settings()
+    setup_logging(settings.log_level)
+
+    configure_db_path(settings.db_path)
+    await init_db()
+    restored_state, _ = await load_system_state()
+
+    async def _test_persist_hook(state, reason=None):
+        await save_system_state(state, reason)
+
+    sm = StateMachine(initial_state=restored_state, persist_hook=_test_persist_hook)
+    risk = RiskEngine(sm, settings)
+    adapter = AlpacaAdapter(
+        api_key=settings.alpaca_api_key,
+        api_secret=settings.alpaca_api_secret,
+        paper=settings.alpaca_paper,
+    )
+
+    order_mgr = OrderManager(risk, adapter)
+
+    if not sm.can_trade():
+        print(
+            f"System state is {sm.state.value}; refusing one-shot order. "
+            "Start the bot and use /resume <token> before testing paper orders."
+        )
+        return {"error": "system_not_active", "state": sm.state.value}
+
+    clock = await adapter.get_clock()
+    if not clock.get("is_open"):
+        print("Market is not open; refusing one-shot paper order test.")
+        return {"error": "market_closed", "clock": clock}
+
+    account = await adapter.get_account_snapshot()
+    account_status = str(account.get("account_status", "")).lower()
+    if (
+        account.get("status") != "CONNECTED"
+        or account.get("trading_blocked")
+        or account.get("account_blocked")
+        or "active" not in account_status
+    ):
+        print("Alpaca account is not tradable; refusing paper order test.")
+        return {"error": "account_not_tradable", "account": account}
+
+    # Get simple rule-based signals
+    try:
+        signals = await get_simple_rules_signals(adapter, max_signals=1)
+    except Exception as e:
+        print(f"Market data discovery failed; refusing paper order test: {e}")
+        return {"error": "market_data_discovery_failed", "detail": str(e)}
+    if not signals:
+        print("No signals generated.")
+        return
+
+    intent = signals[0]
+
+    positions = await adapter.get_positions_snapshot()
+    snapshot = type("obj", (object,), {
+        "equity": float(account.get("equity", 0.0)),
+        "open_positions": positions,
+    })()
+
+    if snapshot.equity <= 0:
+        print("No valid account equity from Alpaca; refusing paper order test.")
+        return {"error": "missing_equity"}
+
+    print(f"Attempting first paper trade on {intent.symbol} via risk gate...")
+    result = await order_mgr.submit_trade_intent(intent, snapshot)
+    print("Result:", result)
+    return result
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nShutdown via KeyboardInterrupt.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"Fatal: {e}")
+        sys.exit(1)
