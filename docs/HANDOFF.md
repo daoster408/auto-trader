@@ -63,6 +63,8 @@ Quick resume file for any AI session. Update at end of every work session.
   - Latest verification: `25 passed`; compileall passed.
   - Final visible Reviewer verdict for Telegram visibility: `APPROVE`.
   - Final visible Optimizer verdict for Telegram visibility: `APPROVE`.
+  - GitHub sync complete:
+    - Commit `89c2af8` (`Add authorized Telegram visibility reports`) pushed to `origin/main`.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -86,12 +88,11 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Immediate Next Actions
 
-1. Commit and push approved Telegram visibility patch.
-2. Add scheduled/periodic reconciliation loop or explicit command path.
-3. Add position monitoring and exit/kill validation around the now-open paper position.
-4. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
-5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+1. Add scheduled/periodic reconciliation loop or explicit command path.
+2. Add position monitoring and exit/kill validation around the now-open paper position.
+3. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
+4. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+5. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 
