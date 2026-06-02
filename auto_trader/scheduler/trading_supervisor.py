@@ -12,6 +12,7 @@ from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
 from auto_trader.persistence.db import (
+    append_journal_entry,
     clear_pending_exit,
     count_entry_orders_since,
     get_latest_entry_order_for_symbol,
@@ -334,6 +335,14 @@ class TradingSupervisor:
                 )
                 if self.sm.can_trade():
                     self.sm.pause("exit order persistence failed")
+            await append_journal_entry(
+                content=(
+                    f"Auto-exit submitted for {decision.symbol}: {decision.reason}. "
+                    f"Order {order.get('broker_order_id') or order.get('id')}; "
+                    f"qty {order.get('qty')}; status {order.get('status')}; "
+                    f"metrics {decision.metrics}."
+                )
+            )
             await self._notify(f"EXIT SUBMITTED: {decision.symbol} - {decision.reason} - order {order.get('id')}")
             return order
         except Exception as e:

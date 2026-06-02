@@ -23,7 +23,13 @@ from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.models import KillResult
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.state_machine import StateMachine
-from auto_trader.persistence.db import count_entry_orders_since, get_latest_order_records, reconcile_broker_orders
+from auto_trader.persistence.db import (
+    count_entry_orders_since,
+    get_latest_journal_entries,
+    get_latest_order_records,
+    get_pending_exits,
+    reconcile_broker_orders,
+)
 from auto_trader.utils.logging import get_logger
 from auto_trader.utils.retry import retry_kill_critical
 
@@ -69,6 +75,46 @@ def _format_orders(orders: list[dict[str, Any]], *, title: str = "Latest orders"
         broker_id = str(order.get("broker_order_id") or order.get("client_order_id") or "n/a")
         short_id = broker_id[:8] if broker_id != "n/a" else broker_id
         lines.append(f"- {symbol}: {status}, qty {qty}, avg {avg}, id {short_id}")
+    return "\n".join(lines)
+
+
+def _order_lookup_by_id(orders: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for order in orders:
+        for key in ("broker_order_id", "client_order_id", "id"):
+            value = str(order.get(key) or "")
+            if value:
+                lookup[value] = order
+    return lookup
+
+
+def _format_pending_exits(pending_exits: list[dict[str, Any]], orders: list[dict[str, Any]]) -> str:
+    if not pending_exits:
+        return "Pending exits: none"
+    order_lookup = _order_lookup_by_id(orders)
+    lines = ["Pending exits:"]
+    for pending in pending_exits:
+        symbol = str(pending.get("symbol", "?")).upper()
+        broker_id = str(pending.get("broker_order_id") or pending.get("client_order_id") or "n/a")
+        matching_order = order_lookup.get(broker_id) if broker_id != "n/a" else None
+        status = str((matching_order or {}).get("status") or pending.get("status") or "pending")
+        qty = _number(pending.get("qty"))
+        reason = str(pending.get("reason") or "unspecified")
+        short_id = broker_id[:8] if broker_id != "n/a" else broker_id
+        lines.append(f"- {symbol}: {status}, qty {qty}, id {short_id}, reason {reason}; duplicate exits suppressed")
+    return "\n".join(lines)
+
+
+def _format_journal_entries(entries: list[dict[str, Any]]) -> str:
+    if not entries:
+        return "Journal: no entries yet"
+    lines = ["Journal:"]
+    for entry in entries:
+        created = str(entry.get("created_at") or entry.get("date") or "unknown")
+        content = " ".join(str(entry.get("content") or "").split())
+        if len(content) > 180:
+            content = content[:177] + "..."
+        lines.append(f"- {created}: {content}")
     return "\n".join(lines)
 
 
@@ -171,6 +217,9 @@ class TelegramBot:
             "account": None,
             "positions": [],
             "orders": [],
+            "broker_orders": [],
+            "pending_exits": [],
+            "journal_entries": [],
             "reconciled": None,
             "today_new_entries": None,
             "errors": [],
@@ -205,6 +254,7 @@ class TelegramBot:
 
         try:
             recent_orders = await self.adapter.get_recent_orders(days=7)
+            result["broker_orders"] = recent_orders
             result["reconciled"] = await reconcile_broker_orders(recent_orders)
         except Exception as e:
             log.warning("telegram_reconciliation_failed", error=str(e))
@@ -231,6 +281,18 @@ class TelegramBot:
             log.warning("telegram_orders_failed", error=str(e))
             result["errors"].append(f"orders unavailable: {e}")
 
+        try:
+            result["pending_exits"] = await get_pending_exits(limit=5)
+        except Exception as e:
+            log.warning("telegram_pending_exits_failed", error=str(e))
+            result["errors"].append(f"pending exits unavailable: {e}")
+
+        try:
+            result["journal_entries"] = await get_latest_journal_entries(limit=3)
+        except Exception as e:
+            log.warning("telegram_journal_failed", error=str(e))
+            result["errors"].append(f"journal unavailable: {e}")
+
         return result
 
     async def _bounded_snapshot(self) -> dict[str, Any]:
@@ -243,6 +305,9 @@ class TelegramBot:
                 "account": {"status": "ERROR"},
                 "positions": [],
                 "orders": [],
+                "broker_orders": [],
+                "pending_exits": [],
+                "journal_entries": [],
                 "reconciled": None,
                 "today_new_entries": None,
                 "errors": [f"snapshot unavailable: {e}"],
@@ -253,6 +318,8 @@ class TelegramBot:
         health = snapshot.get("health") or {}
         positions = snapshot.get("positions") or []
         orders = snapshot.get("orders") or []
+        broker_orders = snapshot.get("broker_orders") or []
+        pending_exits = snapshot.get("pending_exits") or []
         errors = snapshot.get("errors") or []
         today_new_entries = snapshot.get("today_new_entries")
         equity = float(account.get("equity") or health.get("equity") or 0.0)
@@ -285,6 +352,7 @@ class TelegramBot:
             f"Buying power: {_money(account.get('buying_power'))}",
             _format_positions(positions),
             _format_orders(orders, title="Latest order"),
+            _format_pending_exits(pending_exits, broker_orders + orders),
         ]
         if snapshot.get("reconciled") is not None:
             lines.append(f"Orders reconciled: {snapshot['reconciled']}")
@@ -297,6 +365,9 @@ class TelegramBot:
         account = snapshot.get("account") or {}
         positions = snapshot.get("positions") or []
         orders = snapshot.get("orders") or []
+        broker_orders = snapshot.get("broker_orders") or []
+        pending_exits = snapshot.get("pending_exits") or []
+        journal_entries = snapshot.get("journal_entries") or []
         errors = snapshot.get("errors") or []
         unrealized = sum(float(p.get("unrealized_pl") or 0.0) for p in positions)
         exposure = sum(abs(float(p.get("market_value") or 0.0)) for p in positions)
@@ -312,9 +383,10 @@ class TelegramBot:
             f"Open unrealized P/L: {_money(unrealized)}",
             _format_positions(positions),
             _format_orders(orders),
+            _format_pending_exits(pending_exits, broker_orders + orders),
             f"Orders reconciled: {snapshot.get('reconciled') if snapshot.get('reconciled') is not None else 'unknown'}",
             f"Generated at: {datetime.now(UTC).isoformat()}Z",
-            "Journal: reconciliation-backed report; trade rationale summaries coming next.",
+            _format_journal_entries(journal_entries),
         ]
         if errors:
             lines.append("Warnings: " + "; ".join(str(e) for e in errors))

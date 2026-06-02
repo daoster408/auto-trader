@@ -151,3 +151,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: AMPX produced real dry-run max-loss exit alerts, so duplicate close prevention must survive both one-process ticks and process restarts before any autonomous exit execution.
 - Impact: Supervisor close execution now checks open broker orders, persists pending exits, clears filled pending state only after a trusted broker position snapshot proves the symbol is gone, clears failed pending close orders during reconciliation so they can be retried, pauses for review when a persisted pending close cannot be matched by broker/client order ID to an open broker close order, and keeps single-position close submission un-retried to avoid duplicate closes after response-path failures.
 - Confidence: high
+
+- UTC timestamp: 2026-06-02T21:01:16Z
+- Local timestamp (`America/Los_Angeles`): 2026-06-02 14:01:16 PDT
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- Decision: Keep auto-entry disabled while enabling supervised paper auto-exit and surfacing pending exits in Telegram.
+- Rationale: The approved close path needs a real market-open lifecycle test, but new entries should not restart until AMPX exit fill, duplicate-close suppression, pending-exit cleanup, and operator reporting are verified.
+- Impact: Local supervised mode uses `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=true`; `/status` and `/report` include pending exits and duplicate-exit suppression; `/report` includes latest journal notes; Wednesday market-open validation is documented in the runbook.
+- Confidence: high

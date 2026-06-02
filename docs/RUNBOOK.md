@@ -4,9 +4,10 @@ Operational notes for supervised paper-trading runs. Keep live-money changes exp
 
 ## Current Mode
 
-- Day 2 paper burn-in is alert-only by default.
+- Day 2 paper burn-in is supervised paper mode.
 - `AUTO_ENTRY_ENABLED=false` means the supervisor will not open new positions.
-- `AUTO_EXIT_ENABLED=false` means the supervisor will not close positions from exit rules.
+- `AUTO_EXIT_ENABLED=true` is enabled locally after close-path hardening approval so exit rules can close existing paper positions.
+- Current AMPX close order is expected to remain accepted/queued while the market is closed.
 - `/kill` remains the emergency path: cancel all orders, flatten all positions, and persist `HALTED`.
 - RiskEngine remains the only path to any order.
 
@@ -28,7 +29,8 @@ Expected startup checks:
 Telegram checks after startup:
 
 - Send `/status` and confirm account, state, and warnings.
-- Send `/report` and confirm positions/orders are visible.
+- Send `/status` and confirm pending exits show the close order ID, reason, status, and duplicate-exit suppression.
+- Send `/report` and confirm positions, orders, pending exits, and latest journal entries are visible.
 - Do not use `/resume <token>` unless the restored state is intentionally ready to trade.
 - Use `/kill` only when you intend to flatten paper positions and persist `HALTED`.
 
@@ -50,7 +52,8 @@ Copy the repo to `/opt/auto-trader`, create the virtualenv, install dependencies
 
 - `ALPACA_PAPER=true` during burn-in.
 - `SHUTDOWN_FLATTEN_ON_EXIT=true` for unattended operation.
-- `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=false` until explicitly promoted.
+- `AUTO_ENTRY_ENABLED=false` until entry automation is explicitly promoted.
+- `AUTO_EXIT_ENABLED=true` only after the close path has been reviewed, pushed, and validated on the supervised laptop run.
 - `TELEGRAM_ALLOWED_IDS` populated so commands fail closed.
 
 Recommended install commands from `/opt/auto-trader`:
@@ -89,13 +92,25 @@ Manual stop:
 sudo systemctl stop auto-trader
 ```
 
+## Wednesday Market-Open Checklist
+
+Use this on Wednesday, 2026-06-03, before enabling new entries:
+
+- Confirm the accepted AMPX close either fills after market open or remains visible as an open/pending broker order.
+- Confirm `/status` shows pending exits and does not hide duplicate-exit suppression.
+- Confirm `/report` shows the AMPX close order, pending-exit state, and latest journal entry.
+- Confirm no second AMPX close order was submitted.
+- Confirm `pending_exits` clears only after Alpaca position snapshot shows AMPX is gone.
+- Keep `AUTO_ENTRY_ENABLED=false` until the full close lifecycle is verified.
+
 ## Promotion Gates
 
-Before enabling auto-exit:
+Before keeping auto-exit enabled unattended:
 
 - Confirm `/status` and `/report` work during market hours.
 - Confirm reconciliation sees filled orders and open positions.
 - Confirm no duplicate close orders are produced in tests.
+- Confirm pending exits are visible in Telegram and clear after the broker position disappears.
 - Confirm shutdown behavior is understood for the run target.
 
 Before enabling auto-entry:

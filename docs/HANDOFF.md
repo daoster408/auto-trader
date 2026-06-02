@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-02T20:31:31Z
-- Last updated local (`America/Los_Angeles`): 2026-06-02 13:31:31 PDT
+- Last updated UTC: 2026-06-02T21:01:16Z
+- Last updated local (`America/Los_Angeles`): 2026-06-02 14:01:16 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -121,6 +121,15 @@ Quick resume file for any AI session. Update at end of every work session.
     - supervisor pauses if a broker close exists/submits but local pending-exit persistence fails;
     - single-position close submission is intentionally not retry-wrapped so response-path failures cannot duplicate a broker close inside the adapter.
   - Latest verification for close-path hardening: `48 passed`; compileall passed; `git diff --check` clean.
+  - Local supervised paper mode now has `AUTO_EXIT_ENABLED=true` and `AUTO_ENTRY_ENABLED=false`.
+  - AMPX auto-exit was submitted while the market was closed:
+    - close order id `d08fb2a8-7df4-4da5-b3b5-d4c939be1fde`;
+    - side `sell`, quantity `0.832986`;
+    - status `accepted`;
+    - pending-exit marker persisted so duplicate AMPX exits are suppressed.
+  - Telegram `/status` and `/report` now include pending exits, matched broker/order status, duplicate-exit suppression language, and latest journal entries.
+  - Supervisor now appends a lightweight journal entry when an auto-exit is submitted.
+  - Latest verification for pending-exit visibility and journaling: `49 passed`; compileall passed; `git diff --check` clean.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -145,9 +154,10 @@ Quick resume file for any AI session. Update at end of every work session.
 ## Immediate Next Actions
 
 1. Keep the current local bot running for supervised paper burn-in.
-2. Decide whether to keep AMPX as alert-only after dry-run max-loss warnings or manually test the close path in paper.
-3. Decide when to opt in to `AUTO_EXIT_ENABLED` and `AUTO_ENTRY_ENABLED` during paper burn-in.
-4. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+2. On Wednesday, 2026-06-03 market open, confirm the accepted AMPX close fills or remains visibly pending without duplicate close submission.
+3. Confirm `pending_exits` clears only after Alpaca shows AMPX gone.
+4. Keep `AUTO_ENTRY_ENABLED=false` until the AMPX close lifecycle is verified.
+5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
 6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch

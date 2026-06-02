@@ -356,6 +356,32 @@ async def get_pending_exit_symbols() -> set[str]:
             raise
 
 
+async def get_pending_exits(limit: int = 10) -> list[dict[str, Any]]:
+    """Return active pending exits for operator reports."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT symbol, broker_order_id, client_order_id, reason, qty, status, created_at, updated_at
+                    FROM pending_exits
+                    WHERE status = 'pending'
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cur.fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("pending_exits_list_failed", error=str(e))
+            raise
+
+
 async def clear_pending_exit(symbol: str) -> bool:
     """Clear a pending exit after a trusted position snapshot proves the symbol is gone."""
     clean_symbol = symbol.upper()
@@ -449,4 +475,61 @@ async def get_latest_entry_order_for_symbol(symbol: str) -> dict[str, Any] | Non
                 await db.close()
         except Exception as e:
             log.error("latest_entry_order_lookup_failed", symbol=symbol, error=str(e))
+            raise
+
+
+async def append_journal_entry(
+    *,
+    content: str,
+    kind: str = "daily",
+    date: str | None = None,
+) -> int | None:
+    """Append a lightweight operator journal entry."""
+    clean_kind = kind.lower()
+    if clean_kind not in {"daily", "weekly"}:
+        raise ValueError(f"unsupported journal kind: {kind}")
+    clean_date = date or datetime.now(UTC).date().isoformat()
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    INSERT INTO journal_entries (date, kind, content)
+                    VALUES (?, ?, ?)
+                    """,
+                    (clean_date, clean_kind, content),
+                )
+                await db.commit()
+                return int(cur.lastrowid) if cur.lastrowid is not None else None
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("journal_entry_append_failed", kind=clean_kind, date=clean_date, error=str(e))
+            return None
+
+
+async def get_latest_journal_entries(limit: int = 3) -> list[dict[str, Any]]:
+    """Return latest journal entries for operator reports."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT id, date, kind, content, created_at
+                    FROM journal_entries
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cur.fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("latest_journal_entries_failed", error=str(e))
             raise

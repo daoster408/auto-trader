@@ -172,6 +172,42 @@ Append-only by day. Do not remove past entries.
 - Confidence:
   - high
 
+## 2026-06-02 (America/Los_Angeles) - Tuesday Afternoon Operator Visibility
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-02
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Kept `AUTO_ENTRY_ENABLED=false` in local `.env`.
+  - Enabled local supervised paper auto-exit with `AUTO_EXIT_ENABLED=true`.
+  - Restarted the bot with `auto_entry=False, auto_exit=True`.
+  - AMPX auto-exit submitted a paper close while the market was closed:
+    - symbol `AMPX`;
+    - side `sell`;
+    - quantity `0.832986`;
+    - order id `d08fb2a8-7df4-4da5-b3b5-d4c939be1fde`;
+    - status `accepted`.
+  - Confirmed `pending_exits` contains AMPX and duplicate exits are suppressed while the close remains pending.
+  - Added Telegram pending-exit visibility to `/status` and `/report`.
+  - Added latest journal entries to `/report`.
+  - Added lightweight journal append support and supervisor auto-exit journal writes.
+  - Added a Wednesday market-open checklist to `docs/RUNBOOK.md`.
+- NEXT:
+  - Restart the supervised bot after this code is committed so `/status` and `/report` use the new pending-exit visibility code.
+  - On Wednesday, 2026-06-03 market open, verify AMPX fills or remains visibly pending, no duplicate close appears, and `pending_exits` clears only after Alpaca shows AMPX gone.
+  - Keep `AUTO_ENTRY_ENABLED=false` until the close lifecycle is verified.
+- BLOCKED:
+  - None.
+- Evidence:
+  - `.env` has `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=true`.
+  - Local DB has AMPX pending exit for close order `d08fb2a8-7df4-4da5-b3b5-d4c939be1fde`.
+  - `.venv/bin/python -m pytest -q` -> `49 passed`.
+  - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+  - `git diff --check` -> clean.
+- Confidence:
+  - high
+
 ## Week 1 Day-by-Day Plan (Target)
 
 - Day 1:

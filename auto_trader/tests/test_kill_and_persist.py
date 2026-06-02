@@ -21,10 +21,13 @@ from auto_trader.execution.order_manager import OrderManager
 from auto_trader.__main__ import _handle_signal_shutdown, _should_emergency_halt_on_shutdown
 from auto_trader.scheduler.trading_supervisor import TradingSupervisor
 from auto_trader.persistence.db import (
+    append_journal_entry,
     clear_pending_exit,
     configure_db_path,
     count_entry_orders_since,
+    get_latest_journal_entries,
     get_latest_order_records,
+    get_pending_exits,
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
     init_db,
@@ -92,10 +95,14 @@ def patch_empty_pending_exit_state(monkeypatch):
     async def fake_pending_clear(symbol):
         return True
 
+    async def fake_journal_entry(**kwargs):
+        return 1
+
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_symbols", fake_pending_symbols)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.upsert_pending_exit", fake_pending_upsert)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal_entry)
 
 
 class FakeTelegramIdentity:
@@ -503,11 +510,34 @@ def test_telegram_status_and_report_include_account_position_and_order():
         "positions": [{"symbol": "AMPX", "qty": 0.832986, "market_value": 20.07, "unrealized_pl": -0.04}],
         "orders": [
             {
-                "broker_order_id": "eaf99d3e-c577-4b2d-8f4f-74cd74be4178",
+                "broker_order_id": "d08fb2a8-7df4-4da5-b3b5-d4c939be1fde",
                 "symbol": "AMPX",
-                "status": "filled",
-                "filled_qty": 0.832986,
-                "avg_fill_price": 24.134,
+                "status": "accepted",
+                "qty": 0.832986,
+                "avg_fill_price": None,
+            }
+        ],
+        "broker_orders": [
+            {
+                "broker_order_id": "d08fb2a8-7df4-4da5-b3b5-d4c939be1fde",
+                "symbol": "AMPX",
+                "status": "accepted",
+                "qty": 0.832986,
+            }
+        ],
+        "pending_exits": [
+            {
+                "symbol": "AMPX",
+                "broker_order_id": "d08fb2a8-7df4-4da5-b3b5-d4c939be1fde",
+                "reason": "position max loss reached",
+                "qty": 0.832986,
+                "status": "pending",
+            }
+        ],
+        "journal_entries": [
+            {
+                "created_at": "2026-06-02T20:34:23Z",
+                "content": "Auto-exit submitted for AMPX: position max loss reached.",
             }
         ],
         "reconciled": 1,
@@ -523,10 +553,14 @@ def test_telegram_status_and_report_include_account_position_and_order():
     assert "State allows trading: True" in status
     assert "New entries: blocked by open-position limit" in status
     assert "AMPX: qty 0.832986" in status
-    assert "filled" in status
+    assert "accepted" in status
+    assert "Pending exits:" in status
+    assert "duplicate exits suppressed" in status
     assert "Orders reconciled: 1" in status
     assert "DAILY REPORT" in report
     assert "Open unrealized P/L: $-0.04" in report
+    assert "Journal:" in report
+    assert "Auto-exit submitted for AMPX" in report
 
 
 def test_telegram_status_surfaces_warnings():
@@ -777,9 +811,17 @@ async def test_telegram_snapshot_gather_reconciles_and_reads_once(monkeypatch):
     async def fake_count(start_utc_iso):
         return 0
 
+    async def fake_pending_exits(limit=5):
+        return [{"symbol": "AMPX", "broker_order_id": "order-1", "reason": "position max loss reached", "qty": 0.832986}]
+
+    async def fake_journal(limit=3):
+        return [{"content": "Auto-exit submitted for AMPX.", "created_at": "2026-06-02T20:34:23Z"}]
+
     monkeypatch.setattr("auto_trader.comms.telegram_bot.reconcile_broker_orders", fake_reconcile)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_order_records", fake_latest)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_pending_exits", fake_pending_exits)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_journal_entries", fake_journal)
 
     adapter = FakeAdapter()
     bot = TelegramBot(
@@ -795,6 +837,8 @@ async def test_telegram_snapshot_gather_reconciles_and_reads_once(monkeypatch):
     assert snapshot["reconciled"] == 1
     assert snapshot["positions"][0]["symbol"] == "AMPX"
     assert snapshot["orders"][0]["status"] == "filled"
+    assert snapshot["pending_exits"][0]["symbol"] == "AMPX"
+    assert snapshot["journal_entries"][0]["content"] == "Auto-exit submitted for AMPX."
     assert snapshot["today_new_entries"] == 0
     assert snapshot["errors"] == []
     assert adapter.calls == ["account", "clock", "orders:7", "positions:True"]
@@ -828,9 +872,17 @@ async def test_telegram_snapshot_gather_surfaces_account_and_clock_failures(monk
     async def fake_count(start_utc_iso):
         return 0
 
+    async def fake_pending_exits(limit=5):
+        return []
+
+    async def fake_journal(limit=3):
+        return []
+
     monkeypatch.setattr("auto_trader.comms.telegram_bot.reconcile_broker_orders", fake_reconcile)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_order_records", fake_latest)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_pending_exits", fake_pending_exits)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_journal_entries", fake_journal)
 
     bot = TelegramBot(
         token="token",
@@ -875,9 +927,17 @@ async def test_telegram_snapshot_gather_surfaces_returned_error_dicts(monkeypatc
     async def fake_count(start_utc_iso):
         return 0
 
+    async def fake_pending_exits(limit=5):
+        return []
+
+    async def fake_journal(limit=3):
+        return []
+
     monkeypatch.setattr("auto_trader.comms.telegram_bot.reconcile_broker_orders", fake_reconcile)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_order_records", fake_latest)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_pending_exits", fake_pending_exits)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_journal_entries", fake_journal)
 
     bot = TelegramBot(
         token="token",
@@ -1218,10 +1278,32 @@ async def test_pending_exit_persistence_roundtrip():
         assert pending["symbol"] == "AMPX"
         assert pending["broker_order_id"] == "exit-1"
         assert await get_pending_exit_symbols() == {"AMPX"}
+        pending_list = await get_pending_exits()
+        assert pending_list[0]["symbol"] == "AMPX"
+        assert pending_list[0]["reason"] == "position max loss reached"
 
         assert await clear_pending_exit("AMPX")
         assert await get_pending_exit_for_symbol("AMPX") is None
         assert await get_pending_exit_symbols() == set()
+
+
+@pytest.mark.asyncio
+async def test_journal_entry_roundtrip():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "journal.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        entry_id = await append_journal_entry(
+            date="2026-06-02",
+            content="Auto-exit submitted for AMPX: position max loss reached.",
+        )
+
+        assert entry_id is not None
+        entries = await get_latest_journal_entries()
+        assert entries[0]["date"] == "2026-06-02"
+        assert entries[0]["kind"] == "daily"
+        assert "AMPX" in entries[0]["content"]
 
 
 @pytest.mark.asyncio
