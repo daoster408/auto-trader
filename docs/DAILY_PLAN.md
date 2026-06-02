@@ -343,16 +343,18 @@ Append-only by day. Do not remove past entries.
   - Connected local repo to private GitHub repo: `https://github.com/daoster408/auto-trader` as `origin`.
   - Fetched remote `main` safely without pushing.
   - Confirmed remote currently has one `Initial commit` containing only a tiny `README.md`.
+  - Created local commit `4235467` (`Initial auto trader implementation`).
+  - Safely merged remote `main` without force-push; resolved README conflict by keeping/updating the project README.
+  - Pushed local `main` to GitHub; branch now tracks `origin/main`.
 - Evidence:
   - `git remote -v` shows origin fetch/push URL.
   - `git check-ignore -v .env` confirms `.env` ignored.
   - `git ls-remote --heads origin` confirms remote `main` exists.
 - NEXT:
-  - Before first push: inspect/stage intended files only; never stage `.env`.
-  - Because remote already has a README commit, first project push should merge or replace that history deliberately.
-  - Commit/push only after explicit user approval.
+  - Continue normal development on `main` or create feature branches before larger changes.
+  - Keep `.env` local only; never stage or commit secrets.
 - BLOCKED:
-  - No blocker for connection. Commit/push not performed yet by design.
+  - None for GitHub connection.
 - Confidence:
   - high
 

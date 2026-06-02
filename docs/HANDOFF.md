@@ -23,7 +23,7 @@ Quick resume file for any AI session. Update at end of every work session.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
   - Market was closed during preflight; no order was submitted.
   - AI committee design is documented but not active for the first paper trade. It will start later in journal-only mode.
-  - GitHub connection is configured locally: `origin` -> `https://github.com/daoster408/auto-trader` (private repo). Remote `main` has existing initial README commit. No commit/push performed yet.
+  - GitHub is connected and pushed: `origin` -> `https://github.com/daoster408/auto-trader` (private repo). Local `main` tracks `origin/main`. `.env` is ignored and was not committed.
   - Workflow automation policy active: Major Engineer work triggers automatic Reviewer/Optimizer launches.
 
 ## Locked Requirements
@@ -44,10 +44,9 @@ Quick resume file for any AI session. Update at end of every work session.
 1. Tomorrow during regular market hours: run one-shot paper order helper and verify in Alpaca paper dashboard.
 2. If persisted state is HALTED, intentionally resume first via `/resume <token>` after confirming readiness.
 3. If no candidate is found, do not force a trade; inspect scanner logs / candidate filters.
-4. Before first GitHub push: merge/replace remote initial README deliberately, inspect staged files, and confirm `.env` is not staged.
-5. After first paper order: add order reconciliation + journaling/Telegram notification improvements.
-6. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-7. Maintain automatic Reviewer/Optimizer launches for future major milestones.
+4. After first paper order: add order reconciliation + journaling/Telegram notification improvements.
+5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+6. Maintain automatic Reviewer/Optimizer launches for future major milestones.
 
 ## Risks To Watch
 
