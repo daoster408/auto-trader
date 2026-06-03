@@ -5,9 +5,11 @@ Operational notes for supervised paper-trading runs. Keep live-money changes exp
 ## Current Mode
 
 - Day 2 paper burn-in is supervised paper mode.
+- As of 2026-06-03 09:35 PDT, Oracle VM is the single active paper runner.
+- The laptop bot is stopped; do not start it unless intentionally migrating back from Oracle.
 - `AUTO_ENTRY_ENABLED=false` means the supervisor will not open new positions.
-- `AUTO_EXIT_ENABLED=true` is enabled locally after close-path hardening approval so exit rules can close existing paper positions.
-- Current AMPX close order is expected to remain accepted/queued while the market is closed.
+- `AUTO_EXIT_ENABLED=true` is enabled on the active runner after close-path hardening approval.
+- AMPX and POET paper lifecycles are complete; current expected open positions are none.
 - `/kill` remains the emergency path: cancel all orders, flatten all positions, and persist `HALTED`.
 - RiskEngine remains the only path to any order.
 
@@ -51,7 +53,7 @@ For supervised laptop burn-in, `SHUTDOWN_FLATTEN_ON_EXIT=false` is allowed only 
 
 The preferred always-on deployment is a small Linux host using systemd. Oracle Always Free ARM is the default target; Raspberry Pi is acceptable for experimentation if power, network, clock sync, and uptime are reliable.
 
-Tonight's Oracle VM stance: prepare the host, but do not migrate the active bot yet. The laptop bot is currently carrying the accepted AMPX paper close order and local pending-exit marker. The AMPX close lifecycle should validate on Wednesday, 2026-06-03 before Oracle becomes the active runner.
+Current Oracle VM stance: Oracle is the active paper runner. The service is active and enabled, with `AUTO_ENTRY_ENABLED=false`, `AUTO_EXIT_ENABLED=true`, `ALPACA_PAPER=true`, `MAX_NEW_POSITIONS_PER_DAY=1`, and `SHUTDOWN_FLATTEN_ON_EXIT=true`.
 
 Only one active bot host should poll Telegram and trade the paper account at a time. The local single-instance lock protects one SQLite DB path on one machine; it does not coordinate across a laptop and Oracle VM. If Oracle is started with the same Telegram token and Alpaca account while the laptop bot is also running, cross-host duplicate polling and duplicate trading decisions are possible.
 
@@ -110,6 +112,15 @@ ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_prefli
 ```
 
 Expected result while the laptop remains the active runner is `Overall: WARN`, with the local runner warning explaining why Oracle should stay inactive. A true migration-ready result requires no local `python -m auto_trader` process, Oracle systemd still inactive before cutover, paper-mode safety flags present, and broker validation passing for the latest lifecycle symbol.
+
+After cutover, verify Oracle remains the only active runner:
+
+```bash
+pgrep -fl "python.*-m auto_trader"
+ssh -i <ssh-key> ubuntu@<host> "systemctl is-active auto-trader; systemctl is-enabled auto-trader; sudo journalctl -u auto-trader -n 80 --no-pager"
+```
+
+Expected current Oracle state is `active` and `enabled`. Expected current laptop state is no local `python -m auto_trader` process.
 
 Manual stop:
 

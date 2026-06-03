@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-03T16:27:52Z
-- Last updated local (`America/Los_Angeles`): 2026-06-03 09:27:52 PDT
+- Last updated UTC: 2026-06-03T16:35:27Z
+- Last updated local (`America/Los_Angeles`): 2026-06-03 09:35:27 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -27,6 +27,7 @@ Quick resume file for any AI session. Update at end of every work session.
   - Day 3 entry hardening added: auto-entry now suppresses if Alpaca already reports an open buy/long order before candidate generation.
   - Account-level risk halt layer added: daily loss, weekly loss, and peak drawdown breaches now persist `HALTED` and call cancel/flatten through the existing kill-grade path.
   - Account-risk dry-run validator added for operator proof without touching broker cancel/flatten paths.
+  - Oracle migration rehearsal promoted to active paper runner: local laptop bot stopped; Oracle systemd service is active and enabled.
 - System status:
   - RiskEngine remains the **only** path to any real order.
   - Real order submission code is written and gated.
@@ -200,6 +201,14 @@ Quick resume file for any AI session. Update at end of every work session.
     - dry-runs healthy, daily-loss-breach, and peak-drawdown-breach scenarios using configured thresholds;
     - does not call Alpaca cancel/flatten;
     - latest verification: `63 passed`, compileall passed, `git diff --check` clean.
+  - Active hosting state:
+    - laptop runner stopped; no local `python -m auto_trader` process remains;
+    - latest code and SQLite DB were synced to `/opt/auto-trader`;
+    - Oracle service `auto-trader` is `active` and `enabled`;
+    - Oracle startup health passed against Alpaca paper;
+    - Telegram polling is live from Oracle;
+    - supervisor is running `auto_entry=False`, `auto_exit=True`, `monitor_interval=60s`;
+    - repeated Oracle ticks updated account-risk state with equity about `$398.10` and no loss/drawdown breach.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -223,12 +232,11 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Immediate Next Actions
 
-1. Keep the current local bot running for supervised paper burn-in.
-2. Confirm Telegram `/status` shows no open positions, `Today new entries: 1 / 1`, and pending exits clear.
-3. Do not start Oracle service until intentionally migrating the single active runner from laptop to Oracle.
-4. Decide whether next work is Oracle migration rehearsal or AI/Finnhub research scaffolding.
-5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+1. Keep Oracle as the single active paper runner; do not restart the laptop bot unless deliberately migrating back.
+2. Confirm Telegram `/status` from Oracle shows no open positions, `Today new entries: 1 / 1`, and pending exits clear.
+3. Decide the entry-promotion path: either add dynamic runtime config for `AUTO_ENTRY_ENABLED` or use the server restart + `/resume` flow.
+4. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+5. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 

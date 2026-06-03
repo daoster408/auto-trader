@@ -1277,3 +1277,34 @@ Append-only by day. Do not remove past entries.
   - No broker mutation calls are present in the validator.
 - Confidence:
   - high
+
+## 2026-06-03 (America/Los_Angeles) - Oracle Active Runner Cutover
+
+- Date (local): 2026-06-03
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Stopped the local laptop bot to preserve single-runner operation.
+  - Synced latest code and current SQLite trading DB to Oracle at `/opt/auto-trader`.
+  - Refreshed the Oracle editable install.
+  - Ran Oracle account-risk dry-run validation: `Overall: PASS`.
+  - Ran Oracle POET lifecycle validation: `Overall: PASS`.
+  - Started Oracle `auto-trader` systemd service.
+  - Enabled Oracle `auto-trader` service for reboot survival.
+  - Verified Oracle service remains `active` and `enabled`.
+  - Verified Telegram polling, broker reconciliation, and account-risk state updates are running from Oracle.
+- IN_PROGRESS:
+  - Oracle is the active paper runner.
+- NEXT:
+  - Send Telegram `/status` and confirm the visible report matches Oracle active state.
+  - Decide entry-promotion path: dynamic runtime config or server restart plus `/resume`.
+  - Keep laptop bot stopped unless intentionally migrating back.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Local `python -m auto_trader` process is stopped.
+  - Oracle process is running under systemd.
+  - Oracle env remains paper-safe: `ALPACA_PAPER=true`, `AUTO_ENTRY_ENABLED=false`, `AUTO_EXIT_ENABLED=true`, `MAX_NEW_POSITIONS_PER_DAY=1`.
+- Confidence:
+  - high
