@@ -103,6 +103,14 @@ sudo journalctl -u auto-trader -f
 
 Before making Oracle the active runner, stop the laptop bot cleanly or otherwise confirm it is not polling Telegram. Run the Day 3 validation command on the host that owns the current DB/env before promoting new entries.
 
+Run the migration preflight before any Oracle cutover attempt:
+
+```bash
+ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_preflight.sh POET
+```
+
+Expected result while the laptop remains the active runner is `Overall: WARN`, with the local runner warning explaining why Oracle should stay inactive. A true migration-ready result requires no local `python -m auto_trader` process, Oracle systemd still inactive before cutover, paper-mode safety flags present, and broker validation passing for the latest lifecycle symbol.
+
 Manual stop:
 
 ```bash
