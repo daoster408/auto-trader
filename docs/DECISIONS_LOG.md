@@ -169,3 +169,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: Duplicate bot instances caused Telegram `getUpdates` conflicts and can confuse supervised trading state. The second process should fail before Telegram polling or supervisor execution.
 - Impact: Startup now acquires a non-blocking `/tmp/auto_trader_*.lock` keyed by the resolved DB path; duplicate startup exits with a clear fatal message naming the existing holder.
 - Confidence: high
+
+- UTC timestamp: 2026-06-03T00:29:10Z
+- Local timestamp (`America/Los_Angeles`): 2026-06-02 17:29:10 PDT
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- Decision: Prepare Oracle VM after the local bot is stable, but do not make Oracle the active runner until the Day 3 AMPX close lifecycle validates.
+- Rationale: Oracle improves uptime, but a second host can bypass the local single-instance lock and create cross-host Telegram polling or trading conflicts if laptop and VM run at the same time.
+- Impact: Added a read-only Day 3 validation command and documented that Oracle migration must be single-runner: one active host, one Telegram bot token, one Alpaca paper account.
+- Confidence: high

@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from auto_trader.core.models import SystemState, KillResult, TradeIntent
+from auto_trader.day3_validate import build_day3_validation_report, validation_exit_code
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.comms.telegram_bot import TelegramBot
@@ -57,6 +58,31 @@ class DummySupervisorSettings(DummySettings):
     position_trailing_stop_pct = 6.0
     position_max_hold_days = 10
     report_timezone = "America/Los_Angeles"
+
+
+class DummyDay3Settings:
+    alpaca_paper = True
+    auto_entry_enabled = False
+    auto_exit_enabled = True
+
+
+def _day3_account_snapshot():
+    return {
+        "status": "CONNECTED",
+        "account_status": "AccountStatus.ACTIVE",
+        "trading_blocked": False,
+        "account_blocked": False,
+    }
+
+
+def _day3_close_order(order_id="close-1", status="accepted"):
+    return {
+        "id": order_id,
+        "symbol": "AMPX",
+        "side": "sell",
+        "qty": 0.832986,
+        "status": status,
+    }
 
 
 class DummySnapshot:
@@ -136,6 +162,87 @@ def test_single_instance_lock_rejects_duplicate_for_same_db():
         finally:
             first_handle.close()
             lock_path.unlink(missing_ok=True)
+
+
+def test_day3_validation_waits_when_position_open_and_pending_exit_present():
+    report, gates = build_day3_validation_report(
+        symbol="AMPX",
+        settings=DummyDay3Settings(),
+        account=_day3_account_snapshot(),
+        clock={"is_open": False},
+        positions=[{"symbol": "AMPX", "qty": 0.832986, "market_value": 19.08}],
+        broker_orders=[_day3_close_order()],
+        local_orders=[],
+        pending_exits=[
+            {
+                "symbol": "AMPX",
+                "broker_order_id": "close-1",
+                "reason": "position max loss reached",
+            }
+        ],
+        reconciled_orders=2,
+    )
+
+    assert "Overall: WARN" in report
+    assert "WAITING: close lifecycle is still pending" in report
+    assert "[PASS] duplicate close count" in report
+    assert "[PASS] pending-exit marker" in report
+    assert validation_exit_code(gates) == 0
+
+
+def test_day3_validation_fails_duplicate_close_orders():
+    report, gates = build_day3_validation_report(
+        symbol="AMPX",
+        settings=DummyDay3Settings(),
+        account=_day3_account_snapshot(),
+        clock={"is_open": True},
+        positions=[{"symbol": "AMPX", "qty": 0.832986, "market_value": 19.08}],
+        broker_orders=[_day3_close_order("close-1"), _day3_close_order("close-2")],
+        local_orders=[],
+        pending_exits=[{"symbol": "AMPX", "broker_order_id": "close-1"}],
+        reconciled_orders=2,
+    )
+
+    assert "[FAIL] duplicate close count" in report
+    assert "2 non-failed close order(s) found for AMPX" in report
+    assert validation_exit_code(gates) == 2
+
+
+def test_day3_validation_passes_after_position_gone_and_pending_clear():
+    report, gates = build_day3_validation_report(
+        symbol="AMPX",
+        settings=DummyDay3Settings(),
+        account=_day3_account_snapshot(),
+        clock={"is_open": True},
+        positions=[],
+        broker_orders=[_day3_close_order(status="filled")],
+        local_orders=[],
+        pending_exits=[],
+        reconciled_orders=2,
+    )
+
+    assert "Overall: PASS" in report
+    assert "PASSED: close filled, position gone, pending marker clear" in report
+    assert "[PASS] pending-exit marker" in report
+    assert validation_exit_code(gates) == 0
+
+
+def test_day3_validation_fails_when_required_snapshot_is_unavailable():
+    report, gates = build_day3_validation_report(
+        symbol="AMPX",
+        settings=DummyDay3Settings(),
+        account=_day3_account_snapshot(),
+        clock={"is_open": True},
+        positions=[],
+        broker_orders=[_day3_close_order()],
+        local_orders=[],
+        pending_exits=[],
+        reconciled_orders=1,
+        errors=["positions unavailable: broker down"],
+    )
+
+    assert "[FAIL] data availability: positions unavailable: broker down" in report
+    assert validation_exit_code(gates) == 2
 
 
 def test_close_position_submit_is_not_retry_wrapped():

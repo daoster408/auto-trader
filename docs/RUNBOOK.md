@@ -43,6 +43,10 @@ For supervised laptop burn-in, `SHUTDOWN_FLATTEN_ON_EXIT=false` is allowed only 
 
 The preferred always-on deployment is a small Linux host using systemd. Oracle Always Free ARM is the default target; Raspberry Pi is acceptable for experimentation if power, network, clock sync, and uptime are reliable.
 
+Tonight's Oracle VM stance: prepare the host, but do not migrate the active bot yet. The laptop bot is currently carrying the accepted AMPX paper close order and local pending-exit marker. The AMPX close lifecycle should validate on Wednesday, 2026-06-03 before Oracle becomes the active runner.
+
+Only one active bot host should poll Telegram and trade the paper account at a time. The local single-instance lock protects one SQLite DB path on one machine; it does not coordinate across a laptop and Oracle VM. If Oracle is started with the same Telegram token and Alpaca account while the laptop bot is also running, cross-host duplicate polling and duplicate trading decisions are possible.
+
 Example install shape:
 
 ```bash
@@ -89,6 +93,8 @@ sudo journalctl -u auto-trader -n 100 --no-pager
 sudo journalctl -u auto-trader -f
 ```
 
+Before making Oracle the active runner, stop the laptop bot cleanly or otherwise confirm it is not polling Telegram. Run the Day 3 validation command on the host that owns the current DB/env before promoting new entries.
+
 Manual stop:
 
 ```bash
@@ -99,6 +105,12 @@ sudo systemctl stop auto-trader
 
 Use this on Wednesday, 2026-06-03, before enabling new entries:
 
+```bash
+scripts/day3_validate.sh --symbol AMPX
+```
+
+- Exit code `0` means the validation has no hard failures. `Overall: WARN` is expected if the market is still closed or the close order is still legitimately pending.
+- Exit code `2` means a hard gate failed and new entries should stay disabled.
 - Confirm the accepted AMPX close either fills after market open or remains visible as an open/pending broker order.
 - Confirm `/status` shows pending exits and does not hide duplicate-exit suppression.
 - Confirm `/report` shows the AMPX close order, pending-exit state, and latest journal entry.

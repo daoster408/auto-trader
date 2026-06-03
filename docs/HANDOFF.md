@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-02T22:08:55Z
-- Last updated local (`America/Los_Angeles`): 2026-06-02 15:08:55 PDT
+- Last updated UTC: 2026-06-03T00:29:10Z
+- Last updated local (`America/Los_Angeles`): 2026-06-02 17:29:10 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -133,6 +133,20 @@ Quick resume file for any AI session. Update at end of every work session.
   - Normal pending-close suppression is now log-only so Telegram does not repeat expected AMPX pending-close notices.
   - Startup now enforces a single local bot process per SQLite DB with a `/tmp/auto_trader_*.lock`.
   - Duplicate startup was verified to fail before Telegram polling with a clear fatal message naming the existing lock holder.
+  - Day 3 validation command added:
+    - `scripts/day3_validate.sh --symbol AMPX`;
+    - verifies paper mode, auto-entry off, auto-exit on, broker account tradability, market state, broker reconciliation, AMPX position status, close order visibility, duplicate close count, and pending-exit marker state;
+    - exits `0` for PASS/WARN and `2` for hard FAIL gates.
+  - Latest Day 3 validation result:
+    - `Overall: WARN`, expected while market is closed and AMPX remains open;
+    - broker reconciliation found 2 orders;
+    - one accepted AMPX close order is visible;
+    - duplicate close count passed;
+    - pending-exit marker passed.
+  - Oracle VM stance:
+    - Oracle can be prepared tonight;
+    - do not migrate the active bot until the Day 3 AMPX close lifecycle validates;
+    - keep exactly one active bot host polling Telegram and trading the Alpaca account because the local single-instance lock does not coordinate across machines.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -157,11 +171,13 @@ Quick resume file for any AI session. Update at end of every work session.
 ## Immediate Next Actions
 
 1. Keep the current local bot running for supervised paper burn-in.
-2. On Wednesday, 2026-06-03 market open, confirm the accepted AMPX close fills or remains visibly pending without duplicate close submission.
-3. Confirm `pending_exits` clears only after Alpaca shows AMPX gone.
-4. Keep `AUTO_ENTRY_ENABLED=false` until the AMPX close lifecycle is verified.
-5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+2. Run `scripts/day3_validate.sh --symbol AMPX` on Wednesday, 2026-06-03 before enabling new entries or migrating Oracle active service.
+3. On Wednesday, 2026-06-03 market open, confirm the accepted AMPX close fills or remains visibly pending without duplicate close submission.
+4. Confirm `pending_exits` clears only after Alpaca shows AMPX gone.
+5. Keep `AUTO_ENTRY_ENABLED=false` until the AMPX close lifecycle is verified.
+6. After validation passes, decide whether Oracle VM becomes the single active runner.
+7. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+8. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 

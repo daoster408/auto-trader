@@ -211,6 +211,42 @@ Append-only by day. Do not remove past entries.
 - Confidence:
   - high
 
+## 2026-06-02 (America/Los_Angeles) - Night Day 3 Validation Prep
+
+- Date (local): 2026-06-02
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Added a read-only Day 3 validation command for the AMPX close lifecycle:
+    - `scripts/day3_validate.sh --symbol AMPX`;
+    - validates paper mode, auto-entry off, auto-exit on, broker tradability, market state, broker reconciliation, AMPX position state, close-order visibility, duplicate close count, and pending-exit marker state;
+    - exits `0` for PASS/WARN and `2` for hard FAIL gates.
+  - Added regression coverage for:
+    - accepted close still pending with AMPX open and pending-exit marker present;
+    - duplicate close orders failing the validation;
+    - filled close with AMPX gone and pending marker clear passing validation.
+  - Documented Oracle VM sequencing:
+    - prepare Oracle tonight if desired;
+    - do not migrate the active bot until the Day 3 AMPX close lifecycle validates;
+    - keep only one active bot host polling Telegram and trading the Alpaca account.
+- IN_PROGRESS:
+  - Current laptop bot remains the active supervised runner.
+- NEXT:
+  - Run `scripts/day3_validate.sh --symbol AMPX` before Wednesday market-open promotion decisions.
+  - If validation passes after the AMPX close resolves, choose whether Oracle becomes the single active runner.
+  - Keep `AUTO_ENTRY_ENABLED=false` until validation proves no duplicate AMPX close and pending-exit cleanup behaves correctly.
+- BLOCKED:
+  - Oracle active migration is intentionally blocked until Day 3 AMPX close lifecycle validation.
+- Evidence:
+  - `bash -n scripts/day3_validate.sh` -> passed.
+  - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+  - `.venv/bin/python -m pytest -q` -> `54 passed`.
+  - `scripts/day3_validate.sh --symbol AMPX` -> `Overall: WARN`, expected while market is closed and AMPX remains open; data availability passed; one accepted AMPX close order visible; duplicate close count passed; pending-exit marker passed.
+  - One local `python -m auto_trader` process is still running.
+- Confidence:
+  - high
+
 ## Week 1 Day-by-Day Plan (Target)
 
 - Day 1:
