@@ -168,6 +168,8 @@ class TelegramBot:
         self.resume_token = resume_token
         self.allowed_ids = self._parse_allowed_ids(allowed_ids)
         self.app: Application | None = None
+        self._shutdown_lock = asyncio.Lock()
+        self._shutdown_complete = False
 
     @staticmethod
     def _parse_allowed_ids(raw: str | list[int] | None) -> set[int]:
@@ -577,12 +579,23 @@ class TelegramBot:
 
     async def shutdown(self) -> None:
         """Graceful stop for signal handlers. Highest priority cleanup."""
-        if self.app:
-            log.info("telegram_bot_shutting_down")
-            await self.app.updater.stop() if self.app.updater else None
-            await self.app.stop()
-            await self.app.shutdown()
-        log.info("telegram_bot_stopped")
+        async with self._shutdown_lock:
+            if self._shutdown_complete:
+                log.info("telegram_bot_shutdown_skipped_already_stopped")
+                return
+            if self.app:
+                log.info("telegram_bot_shutting_down")
+                if self.app.updater:
+                    try:
+                        await self.app.updater.stop()
+                    except RuntimeError as e:
+                        if "not running" not in str(e).lower():
+                            raise
+                        log.warning("telegram_updater_already_stopped", error=str(e))
+                await self.app.stop()
+                await self.app.shutdown()
+            self._shutdown_complete = True
+            log.info("telegram_bot_stopped")
 
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
         """Start polling. Integrates with external stop_event for clean shutdown."""

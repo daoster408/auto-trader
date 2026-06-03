@@ -852,6 +852,85 @@ def test_telegram_status_and_report_include_account_position_and_order():
     assert "Auto-exit submitted for AMPX" in report
 
 
+@pytest.mark.asyncio
+async def test_telegram_shutdown_is_idempotent():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+
+    class FakeUpdater:
+        def __init__(self):
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls > 1:
+                raise RuntimeError("This Updater is not running!")
+
+    class FakeApp:
+        def __init__(self):
+            self.updater = FakeUpdater()
+            self.stop_calls = 0
+            self.shutdown_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    app = FakeApp()
+    bot.app = app
+
+    await bot.shutdown()
+    await bot.shutdown()
+
+    assert app.updater.stop_calls == 1
+    assert app.stop_calls == 1
+    assert app.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_telegram_shutdown_tolerates_already_stopped_updater():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+
+    class FakeUpdater:
+        async def stop(self):
+            raise RuntimeError("This Updater is not running!")
+
+    class FakeApp:
+        def __init__(self):
+            self.updater = FakeUpdater()
+            self.stop_calls = 0
+            self.shutdown_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    app = FakeApp()
+    bot.app = app
+
+    await bot.shutdown()
+
+    assert app.stop_calls == 1
+    assert app.shutdown_calls == 1
+
+
 def test_telegram_status_surfaces_warnings():
     sm = StateMachine(initial_state=SystemState.PAUSED)
     bot = TelegramBot(
