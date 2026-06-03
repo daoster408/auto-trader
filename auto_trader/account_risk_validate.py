@@ -2,10 +2,28 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import io
+from contextlib import redirect_stdout
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+import tempfile
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from auto_trader.config.settings import get_settings
+from auto_trader.core.models import SystemState
+from auto_trader.core.state_machine import StateMachine
+from auto_trader.persistence.db import (
+    configure_db_path,
+    get_latest_journal_entries,
+    init_db,
+    load_system_state,
+    save_system_state,
+    update_account_risk_state,
+)
+from auto_trader.scheduler.trading_supervisor import TradingSupervisor, _week_start_date
 from auto_trader.utils.logging import setup_logging
 
 
@@ -89,6 +107,14 @@ def _default_scenarios(*, base_equity: float) -> list[AccountRiskScenario]:
             expected_halt=True,
         ),
         AccountRiskScenario(
+            name="weekly-loss-breach",
+            equity=base_equity * 0.95,
+            day_start_equity=base_equity * 0.95,
+            week_start_equity=base_equity,
+            peak_equity=base_equity,
+            expected_halt=True,
+        ),
+        AccountRiskScenario(
             name="peak-drawdown-breach",
             equity=base_equity,
             day_start_equity=base_equity,
@@ -151,14 +177,159 @@ def validation_exit_code(gates: list[ValidationGate]) -> int:
     return 2 if any(gate.status == "FAIL" for gate in gates) else 0
 
 
+class _RehearsalAdapter:
+    paper = True
+
+    def __init__(self) -> None:
+        self.cancel_calls = 0
+        self.flatten_calls = 0
+
+    async def cancel_all_orders(self) -> int:
+        self.cancel_calls += 1
+        return 1
+
+    async def flatten_all_positions(self) -> int:
+        self.flatten_calls += 1
+        return 1
+
+
+class _RehearsalOrderManager:
+    pass
+
+
+async def rehearse_supervisor_account_halt(
+    *,
+    settings: Any,
+    base_equity: float,
+    shock_pct: float = -2.0,
+) -> tuple[str, list[ValidationGate]]:
+    """Run the real supervisor account-halt path in a temp DB with a fake broker."""
+    if shock_pct >= 0:
+        raise ValueError("shock_pct must be negative")
+
+    gates: list[ValidationGate] = []
+    lines = [
+        "SUPERVISOR ACCOUNT HALT REHEARSAL",
+        f"Base equity: ${base_equity:,.2f}",
+        f"Shock: {shock_pct:.2f}%",
+        "",
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "account_risk_rehearsal.db")
+        await init_db()
+
+        async def persist_state(state: SystemState, reason: str | None) -> None:
+            await save_system_state(state, reason)
+
+        timezone = ZoneInfo(getattr(settings, "report_timezone", "America/Los_Angeles"))
+        local_now = datetime.now(timezone)
+        day_date = local_now.date().isoformat()
+        week_start = _week_start_date(local_now)
+        await update_account_risk_state(
+            equity=base_equity,
+            day_date=day_date,
+            week_start_date=week_start,
+        )
+
+        notifications: list[str] = []
+
+        async def notify(message: str) -> None:
+            notifications.append(message)
+
+        state_machine = StateMachine(initial_state=SystemState.ACTIVE, persist_hook=persist_state)
+        adapter = _RehearsalAdapter()
+        supervisor = TradingSupervisor(
+            settings=settings,
+            state_machine=state_machine,
+            adapter=adapter,  # type: ignore[arg-type]
+            order_manager=_RehearsalOrderManager(),  # type: ignore[arg-type]
+            notifier=notify,
+        )
+        shocked_equity = base_equity * (1.0 + shock_pct / 100.0)
+        metrics = await supervisor._enforce_account_risk_halts({"equity": shocked_equity})
+        persisted_state, persisted_meta = await load_system_state()
+        journal_entries = await get_latest_journal_entries(limit=5)
+
+        checks = [
+            (
+                "state halted",
+                state_machine.state == SystemState.HALTED and persisted_state == SystemState.HALTED,
+                f"memory={state_machine.state.value}, persisted={persisted_state.value}",
+            ),
+            (
+                "halt reason persisted",
+                "account risk halt" in str(persisted_meta.get("halt_reason", "")),
+                f"reason={persisted_meta.get('halt_reason')}",
+            ),
+            (
+                "cancel orders called",
+                adapter.cancel_calls == 1,
+                f"cancel_calls={adapter.cancel_calls}",
+            ),
+            (
+                "flatten positions called",
+                adapter.flatten_calls == 1,
+                f"flatten_calls={adapter.flatten_calls}",
+            ),
+            (
+                "notification emitted",
+                any("ACCOUNT RISK HALT" in message for message in notifications),
+                f"notifications={len(notifications)}",
+            ),
+            (
+                "journal entry written",
+                any("Account risk halt triggered" in str(entry.get("content", "")) for entry in journal_entries),
+                f"journal_entries={len(journal_entries)}",
+            ),
+        ]
+
+        lines.append(
+            "Metrics: "
+            f"daily={metrics['daily_loss_pct']:.2f}%, "
+            f"weekly={metrics['weekly_loss_pct']:.2f}%, "
+            f"peak_drawdown={metrics['peak_drawdown_pct']:.2f}%"
+        )
+        lines.append("")
+        lines.append("Gates:")
+        for name, ok, detail in checks:
+            status = "PASS" if ok else "FAIL"
+            gates.append(ValidationGate(name=name, status=status, detail=detail))
+            lines.append(f"- [{status}] {name}: {detail}")
+
+    overall = "FAIL" if any(gate.status == "FAIL" for gate in gates) else "PASS"
+    lines.insert(1, f"Overall: {overall}")
+    return "\n".join(lines), gates
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dry-run validate account risk halt thresholds.")
     parser.add_argument("--base-equity", type=float, default=400.0, help="Synthetic base equity for scenarios.")
+    parser.add_argument(
+        "--rehearse-supervisor-halt",
+        action="store_true",
+        help="Run a temp-DB rehearsal of the real supervisor halt/cancel/flatten path.",
+    )
+    parser.add_argument(
+        "--shock-pct",
+        type=float,
+        default=-2.0,
+        help="Synthetic equity shock percentage for --rehearse-supervisor-halt.",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
-    setup_logging(settings.log_level)
-    report, gates = build_account_risk_validation_report(settings=settings, base_equity=args.base_equity)
+    setup_logging("ERROR")
+    if args.rehearse_supervisor_halt:
+        with redirect_stdout(io.StringIO()):
+            report, gates = asyncio.run(
+                rehearse_supervisor_account_halt(
+                    settings=settings,
+                    base_equity=args.base_equity,
+                    shock_pct=args.shock_pct,
+                )
+            )
+    else:
+        report, gates = build_account_risk_validation_report(settings=settings, base_equity=args.base_equity)
     print(report)
     raise SystemExit(validation_exit_code(gates))
 

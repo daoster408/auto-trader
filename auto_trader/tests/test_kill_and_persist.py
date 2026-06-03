@@ -19,6 +19,7 @@ from auto_trader.account_risk_validate import (
     AccountRiskScenario,
     build_account_risk_validation_report,
     evaluate_account_risk_scenario,
+    rehearse_supervisor_account_halt,
     validation_exit_code as account_risk_validation_exit_code,
 )
 from auto_trader.day3_validate import build_day3_validation_report, validation_exit_code
@@ -315,6 +316,23 @@ def test_account_risk_scenario_evaluates_all_thresholds():
     assert decision.weekly_loss_pct == pytest.approx(-5.0)
     assert decision.peak_drawdown_pct == pytest.approx(-7.31707317)
     assert len(decision.breaches) == 3
+
+
+@pytest.mark.asyncio
+async def test_account_risk_supervisor_halt_rehearsal_passes():
+    report, gates = await rehearse_supervisor_account_halt(
+        settings=DummySupervisorSettings(),
+        base_equity=400.0,
+        shock_pct=-2.0,
+    )
+
+    assert "Overall: PASS" in report
+    assert "[PASS] state halted" in report
+    assert "[PASS] cancel orders called" in report
+    assert "[PASS] flatten positions called" in report
+    assert "[PASS] notification emitted" in report
+    assert "[PASS] journal entry written" in report
+    assert account_risk_validation_exit_code(gates) == 0
 
 
 def test_day3_validation_fails_duplicate_close_orders():

@@ -175,6 +175,17 @@ Before leaving Finnhub enabled unattended:
 - Confirm supervisor ticks do not time out.
 - Watch API-budget logs; Finnhub calls are nonessential and should be disabled if free-tier limits or latency become noisy.
 
+### Account Risk Halt Rehearsal
+
+Before a burn-in session or deploy window, validate both the account-risk threshold math and the real supervisor halt path:
+
+```bash
+scripts/account_risk_validate.sh --base-equity 400
+scripts/account_risk_validate.sh --base-equity 400 --rehearse-supervisor-halt
+```
+
+Both commands should return `Overall: PASS`. The rehearsal uses a temp SQLite DB and a fake broker adapter; it does not submit, cancel, or flatten real broker state. It proves the production supervisor path persists `HALTED`, calls cancel-all, calls flatten-all, emits an alert, and writes a journal entry when a synthetic equity shock breaches the account-risk threshold.
+
 ## Wednesday Market-Open Checklist
 
 Use this on Wednesday, 2026-06-03, before enabling new entries:
