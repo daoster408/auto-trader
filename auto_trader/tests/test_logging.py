@@ -1,6 +1,13 @@
 import logging
+import sys
+from io import StringIO
 
-from auto_trader.utils.logging import RedactingLogFilter, redact_sensitive
+from auto_trader.utils.logging import (
+    RedactingFormatter,
+    RedactingLogFilter,
+    _redacting_plain_traceback,
+    redact_sensitive,
+)
 
 
 def test_redact_sensitive_removes_telegram_bot_token_from_url():
@@ -46,3 +53,39 @@ def test_redacting_log_filter_redacts_stdlib_log_record_args():
     rendered = record.getMessage()
     assert "123456789:ABCdef" not in rendered
     assert "bot<redacted>/sendMessage" in rendered
+
+
+def test_redacting_formatter_redacts_stdlib_exception_text():
+    try:
+        raise RuntimeError("failed https://api.telegram.org/bot123456789:ABCdef_GHIjkl-MNO123/getMe")
+    except RuntimeError:
+        exc_info = sys.exc_info()
+
+    record = logging.LogRecord(
+        name="auto_trader.test",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="request failed",
+        args=(),
+        exc_info=exc_info,
+    )
+
+    rendered = RedactingFormatter("%(message)s").format(record)
+
+    assert "123456789:ABCdef" not in rendered
+    assert "bot<redacted>/getMe" in rendered
+
+
+def test_structlog_plain_traceback_formatter_redacts_exception_text():
+    try:
+        raise RuntimeError("failed https://finnhub.io/api/v1/quote?symbol=AAPL&token=secret-token")
+    except RuntimeError:
+        exc_info = sys.exc_info()
+
+    output = StringIO()
+    _redacting_plain_traceback(output, exc_info)
+    rendered = output.getvalue()
+
+    assert "secret-token" not in rendered
+    assert "token=<redacted>" in rendered

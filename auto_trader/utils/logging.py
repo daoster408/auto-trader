@@ -20,6 +20,7 @@ import re
 import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from io import StringIO
 from typing import Any
 from collections.abc import Generator
 
@@ -69,8 +70,24 @@ class RedactingLogFilter(logging.Filter):
         return True
 
 
+class RedactingFormatter(logging.Formatter):
+    """Stdlib formatter that also redacts exception/traceback text."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_sensitive(super().format(record))
+
+    def formatException(self, ei: tuple[type[BaseException], BaseException, Any] | tuple[None, None, None]) -> str:
+        return redact_sensitive(super().formatException(ei))
+
+
 def _redact_structlog_event_dict(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     return redact_sensitive(event_dict)
+
+
+def _redacting_plain_traceback(sio: Any, exc_info: Any) -> None:
+    buffer = StringIO()
+    structlog.dev.plain_traceback(buffer, exc_info)
+    sio.write(redact_sensitive(buffer.getvalue()))
 
 
 def setup_logging(
@@ -103,6 +120,12 @@ def setup_logging(
     root_logger.addFilter(redacting_filter)
     for handler in root_logger.handlers:
         handler.addFilter(redacting_filter)
+        handler.setFormatter(
+            RedactingFormatter(
+                fmt="%(asctime)sZ %(levelname)s %(name)s %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S",
+            )
+        )
 
     # Structlog processors - strict UTC + context
     processors: list[Any] = [
@@ -120,7 +143,7 @@ def setup_logging(
         processors.append(
             structlog.dev.ConsoleRenderer(
                 colors=True,
-                exception_formatter=structlog.dev.plain_traceback,
+                exception_formatter=_redacting_plain_traceback,
             )
         )
 
