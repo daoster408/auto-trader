@@ -16,6 +16,7 @@ Usage:
 """
 import logging
 import os
+import re
 import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -29,6 +30,47 @@ logging.Formatter.converter = lambda *args: datetime.now(UTC).timetuple()
 
 STRUCTLOG_CONFIGURED = False
 _CURRENT_MODEL_TAG: str | None = None
+
+_TELEGRAM_API_TOKEN_RE = re.compile(r"(api\.telegram\.org/bot)[^/\s\"']+")
+_TELEGRAM_BOT_TOKEN_RE = re.compile(r"\bbot\d{6,}:[A-Za-z0-9_-]+")
+_QUERY_SECRET_RE = re.compile(
+    r"([?&](?:token|api_key|apikey|key|secret)=)[^&\s\"']+",
+    re.IGNORECASE,
+)
+_AUTH_HEADER_RE = re.compile(
+    r"((?:Authorization|Api-Key|X-API-Key):\s*)(?:Bearer\s+|Basic\s+)?[A-Za-z0-9._~+/\-=:]+",
+    re.IGNORECASE,
+)
+
+
+def redact_sensitive(value: Any) -> Any:
+    """Redact secrets from log values before they reach stdout/systemd."""
+    if isinstance(value, str):
+        redacted = _TELEGRAM_API_TOKEN_RE.sub(r"\1<redacted>", value)
+        redacted = _TELEGRAM_BOT_TOKEN_RE.sub("bot<redacted>", redacted)
+        redacted = _QUERY_SECRET_RE.sub(r"\1<redacted>", redacted)
+        return _AUTH_HEADER_RE.sub(r"\1<redacted>", redacted)
+    if isinstance(value, tuple):
+        return tuple(redact_sensitive(item) for item in value)
+    if isinstance(value, list):
+        return [redact_sensitive(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_sensitive(item) for key, item in value.items()}
+    return value
+
+
+class RedactingLogFilter(logging.Filter):
+    """Stdlib logging filter for third-party libraries such as httpx."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact_sensitive(record.msg)
+        if record.args:
+            record.args = redact_sensitive(record.args)
+        return True
+
+
+def _redact_structlog_event_dict(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    return redact_sensitive(event_dict)
 
 
 def setup_logging(
@@ -56,6 +98,11 @@ def setup_logging(
         datefmt="%Y-%m-%dT%H:%M:%S",
         stream=sys.stdout,
     )
+    root_logger = logging.getLogger()
+    redacting_filter = RedactingLogFilter()
+    root_logger.addFilter(redacting_filter)
+    for handler in root_logger.handlers:
+        handler.addFilter(redacting_filter)
 
     # Structlog processors - strict UTC + context
     processors: list[Any] = [
@@ -64,6 +111,7 @@ def setup_logging(
         structlog.processors.TimeStamper(fmt="iso", utc=True, key="ts"),
         structlog.processors.StackInfoRenderer(),
         structlog.dev.set_exc_info,
+        _redact_structlog_event_dict,
     ]
 
     if json_logs or os.getenv("LOG_FORMAT", "").lower() == "json":
