@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-03T14:43:41Z
-- Last updated local (`America/Los_Angeles`): 2026-06-03 07:43:41 PDT
+- Last updated UTC: 2026-06-03T14:49:50Z
+- Last updated local (`America/Los_Angeles`): 2026-06-03 07:49:50 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -151,12 +151,15 @@ Quick resume file for any AI session. Update at end of every work session.
     - do not migrate the active bot until the Day 3 AMPX close lifecycle validates;
     - keep exactly one active bot host polling Telegram and trading the Alpaca account because the local single-instance lock does not coordinate across machines.
   - Day 3 one-entry promotion is active:
-    - local ignored `.env` has `AUTO_ENTRY_ENABLED=true`, `AUTO_EXIT_ENABLED=true`, `MAX_NEW_POSITIONS_PER_DAY=1`, and `ALPACA_PAPER=true`;
+    - local ignored `.env` was temporarily set to `AUTO_ENTRY_ENABLED=true`, with `AUTO_EXIT_ENABLED=true`, `MAX_NEW_POSITIONS_PER_DAY=1`, and `ALPACA_PAPER=true`;
     - local bot restarted with `auto_entry=True, auto_exit=True`;
     - supervisor selected `POET`;
     - RiskEngine approved trace `c47fe60c`;
     - paper order id `a6168fe9-b518-4d08-b9b1-106308138c6c`, client id `1e27fb4b-afcd-40ef-a064-29b9658ed929`, quantity `1.36532`;
     - next monitor saw open POET position quantity `1.365320`, value about `$19.87`, unrealized P/L about `$-0.09`.
+    - after the one allowed entry opened, local ignored `.env` was set back to `AUTO_ENTRY_ENABLED=false`;
+    - local bot restarted with `auto_entry=False, auto_exit=True`;
+    - latest monitor saw POET still open, quantity `1.365320`, value about `$20.24`, unrealized P/L about `$0.28`.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -181,7 +184,7 @@ Quick resume file for any AI session. Update at end of every work session.
 ## Immediate Next Actions
 
 1. Keep the current local bot running for supervised paper burn-in.
-2. Confirm Telegram `/status` shows POET as the open position and `Today new entries: 1 / 1`.
+2. Confirm Telegram `/status` shows POET as the open position, `Today new entries: 1 / 1`, and auto-entry/new entries blocked.
 3. Confirm Telegram `/report` shows the POET order and no pending exits unless an exit condition triggers.
 4. Observe POET auto-exit behavior under existing exit rules.
 5. After the one-entry lifecycle is stable, decide whether Oracle VM becomes the single active runner or AI/Finnhub research scaffolding starts first.

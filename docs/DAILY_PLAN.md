@@ -340,8 +340,16 @@ Append-only by day. Do not remove past entries.
     - quantity `1.365320`;
     - market value about `$19.87`;
     - unrealized P/L about `$-0.09`.
+  - Turned local-only `AUTO_ENTRY_ENABLED=false` again after the one allowed Day 3 entry was opened.
+  - Restarted the local bot in monitor/exit mode:
+    - `auto_entry=False`;
+    - `auto_exit=True`.
+  - Confirmed POET remained open after restart:
+    - quantity `1.365320`;
+    - market value about `$20.24`;
+    - unrealized P/L about `$0.28`.
 - IN_PROGRESS:
-  - POET paper position is being monitored by the supervisor.
+  - POET paper position is being monitored by the supervisor with auto-entry disabled and auto-exit enabled.
 - NEXT:
   - Confirm Telegram `/status` shows `Today new entries: 1 / 1` and blocks any second entry.
   - Confirm `/report` shows POET position and latest POET order.
@@ -352,7 +360,9 @@ Append-only by day. Do not remove past entries.
 - Evidence:
   - Bot startup alert: `auto_entry=True, auto_exit=True`.
   - Entry alert: `ENTRY RESULT: POET`.
-  - Position monitor: `POET: qty 1.365320, value $19.87, P/L $-0.09 (-0.44%)`.
+  - First position monitor: `POET: qty 1.365320, value $19.87, P/L $-0.09 (-0.44%)`.
+  - Post-entry-disable restart alert: `auto_entry=False, auto_exit=True`.
+  - Latest position monitor: `POET: qty 1.365320, value $20.24, P/L $0.28 (1.40%)`.
 - Confidence:
   - high
 
