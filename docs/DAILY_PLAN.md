@@ -308,6 +308,54 @@ Append-only by day. Do not remove past entries.
 - Confidence:
   - high
 
+## 2026-06-03 (America/Los_Angeles) - Day 3 One-Entry Promotion
+
+- Date (local): 2026-06-03
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Verified Telegram `/status` and `/report` showed:
+    - `State: ACTIVE`;
+    - market open;
+    - no open positions;
+    - no pending exits;
+    - AMPX close lifecycle complete.
+  - Promoted supervised paper mode to one new entry:
+    - `.env` local-only `AUTO_ENTRY_ENABLED=true`;
+    - `AUTO_EXIT_ENABLED=true`;
+    - `MAX_NEW_POSITIONS_PER_DAY=1`;
+    - `ALPACA_PAPER=true`.
+  - Restarted the local bot with `auto_entry=True, auto_exit=True`.
+  - Supervisor selected `POET` through rules fallback / dynamic discovery.
+  - RiskEngine approved the entry:
+    - symbol `POET`;
+    - trace id `c47fe60c`;
+    - sized quantity `1.36532`.
+  - Alpaca paper order submitted:
+    - broker order id `a6168fe9-b518-4d08-b9b1-106308138c6c`;
+    - client order id `1e27fb4b-afcd-40ef-a064-29b9658ed929`;
+    - status initially `pending_new`.
+  - Next supervisor monitor saw an open POET position:
+    - quantity `1.365320`;
+    - market value about `$19.87`;
+    - unrealized P/L about `$-0.09`.
+- IN_PROGRESS:
+  - POET paper position is being monitored by the supervisor.
+- NEXT:
+  - Confirm Telegram `/status` shows `Today new entries: 1 / 1` and blocks any second entry.
+  - Confirm `/report` shows POET position and latest POET order.
+  - Keep observing auto-exit behavior for POET under the existing exit rules.
+  - After the one-entry lifecycle is stable, decide whether to prep Oracle VM or start AI/Finnhub research scaffolding.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Bot startup alert: `auto_entry=True, auto_exit=True`.
+  - Entry alert: `ENTRY RESULT: POET`.
+  - Position monitor: `POET: qty 1.365320, value $19.87, P/L $-0.09 (-0.44%)`.
+- Confidence:
+  - high
+
 ## 2026-06-01 (America/Los_Angeles) - GROK Session
 
 - Date (local): 2026-06-01
