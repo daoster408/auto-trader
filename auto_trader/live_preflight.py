@@ -89,6 +89,13 @@ def _runtime_int(values: dict[str, str], key: str) -> int | None:
         return None
 
 
+def _account_status_is_active(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    if "." in normalized:
+        normalized = normalized.rsplit(".", 1)[-1]
+    return normalized == "active"
+
+
 async def rehearse_halt_drill() -> HaltDrillReport:
     """Prove HALTED persistence plus cancel/flatten wiring without touching Alpaca."""
     gates: list[ValidationGate] = []
@@ -219,7 +226,7 @@ def build_live_preflight_report(
     live_mode_ok = alpaca_paper or allow_current_live
     account_tradable = (
         account.get("status") == "CONNECTED"
-        and "active" in str(account.get("account_status", "")).lower()
+        and _account_status_is_active(account.get("account_status"))
         and not account.get("trading_blocked")
         and not account.get("account_blocked")
     )
@@ -302,8 +309,8 @@ def build_live_preflight_report(
                 f"runtime={runtime_auto_exit}, env={getattr(settings, 'auto_exit_enabled', None)}",
             ),
             _gate(
-                "auto-entry explicit",
-                "PASS" if runtime_auto_entry is not None or getattr(settings, "auto_entry_enabled", None) is not None else "FAIL",
+                "auto-entry runtime intent set",
+                "PASS" if runtime_auto_entry is not None else "FAIL",
                 f"runtime={runtime_auto_entry}, env={getattr(settings, 'auto_entry_enabled', None)}",
             ),
             _gate(

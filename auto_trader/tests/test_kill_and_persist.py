@@ -450,6 +450,48 @@ def test_live_preflight_report_fails_unsafe_cutover_state():
     assert "[FAIL] open positions clear" in report
     assert "[FAIL] pending exits clear" in report
     assert "[FAIL] planned deploy capability active" in report
+    assert "[FAIL] auto-entry runtime intent set" in report
+    assert account_risk_validation_exit_code(gates) == 2
+
+
+def test_live_preflight_report_rejects_inactive_account_status_substring():
+    _, account_risk_gates = build_account_risk_validation_report(settings=DummySettings(), base_equity=400.0)
+    halt_drill_gates = [
+        AccountRiskValidationGate(name="drill", status="PASS", detail="ok"),
+    ]
+
+    report, gates = build_live_preflight_report(
+        settings=DummyLivePreflightSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.INACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+            "equity": 398.0,
+        },
+        clock={"is_open": True, "source": "alpaca"},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={
+            "auto_entry_enabled": "true",
+            "auto_exit_enabled": "true",
+            "max_new_positions_per_day": "3",
+            "runtime_capability_planned_maintenance_shutdown": "true",
+            "runtime_capability_planned_maintenance_pid": "123",
+        },
+        account_risk_gates=account_risk_gates,
+        halt_drill_gates=halt_drill_gates,
+        active_service_pid=123,
+        service_pid_detail="systemd MainPID=123",
+        max_equity=500.0,
+        max_new_positions=3,
+    )
+
+    assert "Overall: FAIL" in report
+    assert "[FAIL] broker account tradable" in report
     assert account_risk_validation_exit_code(gates) == 2
 
 
