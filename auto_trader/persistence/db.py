@@ -27,6 +27,10 @@ _DB_PATH: Path = Path("auto_trader.db")
 _DB_LOCK = asyncio.Lock()  # single writer guarantee (simple & cheap for v1)
 
 
+def _utc_iso(dt: datetime) -> str:
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 def configure_db_path(path: str | Path) -> None:
     """Called at startup from settings so DB location is configurable."""
     global _DB_PATH
@@ -517,6 +521,125 @@ async def get_runtime_config_values() -> dict[str, str]:
                 await db.close()
         except Exception as e:
             log.error("runtime_config_list_failed", error=str(e))
+            raise
+
+
+async def request_planned_maintenance_shutdown(
+    *,
+    reason: str,
+    ttl_seconds: int = 300,
+    allow_live: bool = False,
+) -> dict[str, str]:
+    """Arm a short-lived, one-shot shutdown marker for planned service restarts."""
+    clean_reason = str(reason or "planned maintenance").strip()[:200]
+    ttl = max(1, min(int(ttl_seconds), 900))
+    now_dt = datetime.now(UTC)
+    expires_at = _utc_iso(datetime.fromtimestamp(now_dt.timestamp() + ttl, UTC))
+    now = _utc_iso(now_dt)
+    values = {
+        "planned_maintenance_shutdown": "true",
+        "planned_maintenance_reason": clean_reason,
+        "planned_maintenance_expires_at": expires_at,
+        "planned_maintenance_allow_live": "true" if allow_live else "false",
+    }
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                for key, value in values.items():
+                    await db.execute(
+                        """
+                        INSERT INTO runtime_config (key, value, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value=excluded.value,
+                            updated_at=excluded.updated_at
+                        """,
+                        (key, value, now),
+                    )
+                await db.commit()
+            finally:
+                await db.close()
+            log.warning(
+                "planned_maintenance_shutdown_armed",
+                reason=clean_reason,
+                expires_at=expires_at,
+                allow_live=allow_live,
+            )
+            return values
+        except Exception as e:
+            log.error("planned_maintenance_shutdown_arm_failed", error=str(e))
+            raise
+
+
+async def consume_planned_maintenance_shutdown(*, alpaca_paper: bool) -> dict[str, str] | None:
+    """Consume and clear a valid planned-maintenance shutdown marker, if present."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT key, value FROM runtime_config
+                    WHERE key IN (
+                        'planned_maintenance_shutdown',
+                        'planned_maintenance_reason',
+                        'planned_maintenance_expires_at',
+                        'planned_maintenance_allow_live'
+                    )
+                    """
+                )
+                rows = await cur.fetchall()
+                values = {str(row["key"]): str(row["value"]) for row in rows}
+                marker_is_set = values.get("planned_maintenance_shutdown", "").lower() == "true"
+                expires_raw = values.get("planned_maintenance_expires_at")
+                allow_live = values.get("planned_maintenance_allow_live", "").lower() == "true"
+                valid = marker_is_set and bool(expires_raw)
+                if valid:
+                    try:
+                        expires_at = datetime.fromisoformat(str(expires_raw).replace("Z", "+00:00"))
+                        valid = datetime.now(UTC) <= expires_at
+                    except ValueError:
+                        valid = False
+                if valid and not alpaca_paper and not allow_live:
+                    valid = False
+                    log.error("planned_maintenance_live_marker_missing_allow_live")
+
+                if rows:
+                    await db.execute(
+                        """
+                        DELETE FROM runtime_config
+                        WHERE key IN (
+                            'planned_maintenance_shutdown',
+                            'planned_maintenance_reason',
+                            'planned_maintenance_expires_at',
+                            'planned_maintenance_allow_live'
+                        )
+                        """
+                    )
+                    await db.commit()
+                if not valid:
+                    if marker_is_set:
+                        log.warning(
+                            "planned_maintenance_shutdown_marker_ignored",
+                            expires_at=expires_raw,
+                            allow_live=allow_live,
+                            paper=alpaca_paper,
+                        )
+                    return None
+                log.warning(
+                    "planned_maintenance_shutdown_consumed",
+                    reason=values.get("planned_maintenance_reason"),
+                    allow_live=allow_live,
+                    paper=alpaca_paper,
+                )
+                return values
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("planned_maintenance_shutdown_consume_failed", error=str(e))
             raise
 
 

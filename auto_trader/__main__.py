@@ -32,7 +32,12 @@ from auto_trader.core.models import KillResult, SystemState
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
-from auto_trader.persistence.db import init_db, load_system_state, save_system_state
+from auto_trader.persistence.db import (
+    consume_planned_maintenance_shutdown,
+    init_db,
+    load_system_state,
+    save_system_state,
+)
 from auto_trader.scheduler.trading_supervisor import TradingSupervisor
 from auto_trader.utils.logging import setup_logging, get_logger
 
@@ -117,8 +122,20 @@ async def _emergency_halt(
         log.exception("emergency_halt_outer_failed", error=str(e))
 
 
-def _should_emergency_halt_on_shutdown(settings, state_machine: StateMachine) -> bool:
+def _should_emergency_halt_on_shutdown(
+    settings,
+    state_machine: StateMachine,
+    *,
+    planned_maintenance: bool = False,
+) -> bool:
     """Return whether process shutdown should force HALTED + flatten."""
+    if planned_maintenance:
+        log.warning(
+            "shutdown_emergency_halt_skipped_for_planned_maintenance",
+            state=state_machine.state.value,
+            paper=getattr(settings, "alpaca_paper", None),
+        )
+        return False
     if not settings.shutdown_flatten_on_exit:
         log.warning(
             "shutdown_emergency_halt_skipped_by_config",
@@ -135,16 +152,32 @@ async def _handle_signal_shutdown(
     state_machine: StateMachine,
     adapter: AlpacaAdapter,
     stop_event: asyncio.Event,
+    shutdown_context: dict[str, bool] | None = None,
 ) -> None:
     """Handle OS process-exit signals without affecting Telegram /kill semantics."""
     log.critical("signal_kill_initiated", sig=sig)
-    if _should_emergency_halt_on_shutdown(settings, state_machine):
+    planned_maintenance = False
+    try:
+        marker = await consume_planned_maintenance_shutdown(
+            alpaca_paper=bool(getattr(settings, "alpaca_paper", False))
+        )
+        planned_maintenance = marker is not None
+    except Exception as e:
+        log.error("planned_maintenance_shutdown_check_failed", error=str(e))
+    if shutdown_context is not None and planned_maintenance:
+        shutdown_context["planned_maintenance"] = True
+    if _should_emergency_halt_on_shutdown(
+        settings,
+        state_machine,
+        planned_maintenance=planned_maintenance,
+    ):
         await _emergency_halt(state_machine, adapter, f"signal_{sig}")
     else:
         log.warning(
             "signal_emergency_halt_skipped_by_config",
             sig=sig,
             state=state_machine.state.value,
+            planned_maintenance=planned_maintenance,
         )
     stop_event.set()
 
@@ -217,6 +250,7 @@ async def main() -> None:
 
     # Graceful shutdown + dual-path kill (OS signals now also trigger real halt+flatten)
     stop_event = asyncio.Event()
+    shutdown_context = {"planned_maintenance": False}
 
     def _signal_handler(sig: int) -> None:
         log.warning("signal_received", sig=sig, action="process_shutdown_requested")
@@ -228,6 +262,7 @@ async def main() -> None:
                 state_machine=state_machine,
                 adapter=adapter,
                 stop_event=stop_event,
+                shutdown_context=shutdown_context,
             )
         )
 
@@ -270,7 +305,11 @@ async def main() -> None:
             with suppress(asyncio.CancelledError):
                 await supervisor_task
         # Belt + suspenders: production exits force HALTED best-effort unless explicitly disabled for supervised local runs.
-        if _should_emergency_halt_on_shutdown(settings, state_machine):
+        if _should_emergency_halt_on_shutdown(
+            settings,
+            state_machine,
+            planned_maintenance=shutdown_context["planned_maintenance"],
+        ):
             await _emergency_halt(state_machine, adapter, "shutdown_without_explicit_kill")
         await bot.shutdown()
         await _touch_health_file(False)

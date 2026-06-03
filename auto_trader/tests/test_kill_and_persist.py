@@ -8,6 +8,7 @@ import asyncio
 import json
 import sqlite3
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,7 @@ from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_s
 from auto_trader.scheduler.trading_supervisor import TradingSupervisor
 from auto_trader.persistence.db import (
     append_journal_entry,
+    consume_planned_maintenance_shutdown,
     clear_pending_exit,
     configure_db_path,
     count_entry_orders_since,
@@ -50,6 +52,7 @@ from auto_trader.persistence.db import (
     log_signal,
     load_system_state,
     reconcile_broker_orders,
+    request_planned_maintenance_shutdown,
     save_system_state,
     set_runtime_config_value,
     upsert_pending_exit,
@@ -695,8 +698,12 @@ def test_shutdown_emergency_halt_can_be_disabled_for_supervised_local_runs():
 
 
 @pytest.mark.asyncio
-async def test_signal_shutdown_skips_flatten_when_local_opt_out_enabled():
-    settings = type("Settings", (), {"shutdown_flatten_on_exit": False})()
+async def test_signal_shutdown_skips_flatten_when_local_opt_out_enabled(monkeypatch):
+    async def fake_consume_marker(*, alpaca_paper):
+        return None
+
+    monkeypatch.setattr("auto_trader.__main__.consume_planned_maintenance_shutdown", fake_consume_marker)
+    settings = type("Settings", (), {"shutdown_flatten_on_exit": False, "alpaca_paper": True})()
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     stop_event = asyncio.Event()
 
@@ -730,8 +737,12 @@ async def test_signal_shutdown_skips_flatten_when_local_opt_out_enabled():
 
 
 @pytest.mark.asyncio
-async def test_signal_shutdown_defaults_to_emergency_flatten():
-    settings = type("Settings", (), {"shutdown_flatten_on_exit": True})()
+async def test_signal_shutdown_defaults_to_emergency_flatten(monkeypatch):
+    async def fake_consume_marker(*, alpaca_paper):
+        return None
+
+    monkeypatch.setattr("auto_trader.__main__.consume_planned_maintenance_shutdown", fake_consume_marker)
+    settings = type("Settings", (), {"shutdown_flatten_on_exit": True, "alpaca_paper": True})()
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     stop_event = asyncio.Event()
 
@@ -762,6 +773,111 @@ async def test_signal_shutdown_defaults_to_emergency_flatten():
     assert adapter.cancel_calls == 1
     assert adapter.flatten_calls == 1
     assert stop_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_planned_maintenance_marker_roundtrip_consumes_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "maintenance.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        marker = await request_planned_maintenance_shutdown(
+            reason="deploy redaction fix",
+            ttl_seconds=60,
+        )
+
+        assert marker["planned_maintenance_shutdown"] == "true"
+        consumed = await consume_planned_maintenance_shutdown(alpaca_paper=True)
+        assert consumed is not None
+        assert consumed["planned_maintenance_reason"] == "deploy redaction fix"
+        assert await consume_planned_maintenance_shutdown(alpaca_paper=True) is None
+
+
+@pytest.mark.asyncio
+async def test_expired_planned_maintenance_marker_does_not_skip_shutdown():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "maintenance_expired.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        await request_planned_maintenance_shutdown(reason="expired deploy", ttl_seconds=60)
+        expired_at = (datetime.now(UTC) - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "UPDATE runtime_config SET value = ? WHERE key = 'planned_maintenance_expires_at'",
+                (expired_at,),
+            )
+        assert await consume_planned_maintenance_shutdown(alpaca_paper=True) is None
+
+
+@pytest.mark.asyncio
+async def test_live_planned_maintenance_requires_allow_live_marker():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "maintenance_live.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        await request_planned_maintenance_shutdown(reason="live deploy", ttl_seconds=60)
+        assert await consume_planned_maintenance_shutdown(alpaca_paper=False) is None
+
+        await request_planned_maintenance_shutdown(
+            reason="live deploy",
+            ttl_seconds=60,
+            allow_live=True,
+        )
+        assert await consume_planned_maintenance_shutdown(alpaca_paper=False) is not None
+
+
+@pytest.mark.asyncio
+async def test_signal_shutdown_uses_planned_maintenance_marker_once(monkeypatch):
+    settings = type("Settings", (), {"shutdown_flatten_on_exit": True, "alpaca_paper": True})()
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stop_event = asyncio.Event()
+    shutdown_context = {"planned_maintenance": False}
+    consumed = {"count": 0}
+
+    async def fake_consume_marker(*, alpaca_paper):
+        assert alpaca_paper is True
+        consumed["count"] += 1
+        return {"planned_maintenance_reason": "deploy"} if consumed["count"] == 1 else None
+
+    monkeypatch.setattr("auto_trader.__main__.consume_planned_maintenance_shutdown", fake_consume_marker)
+
+    class FakeAdapter:
+        def __init__(self):
+            self.cancel_calls = 0
+            self.flatten_calls = 0
+
+        async def cancel_all_orders(self):
+            self.cancel_calls += 1
+            return 0
+
+        async def flatten_all_positions(self):
+            self.flatten_calls += 1
+            return 0
+
+    adapter = FakeAdapter()
+
+    await _handle_signal_shutdown(
+        sig=15,
+        settings=settings,
+        state_machine=sm,
+        adapter=adapter,
+        stop_event=stop_event,
+        shutdown_context=shutdown_context,
+    )
+
+    assert sm.state == SystemState.ACTIVE
+    assert adapter.cancel_calls == 0
+    assert adapter.flatten_calls == 0
+    assert stop_event.is_set()
+    assert shutdown_context["planned_maintenance"] is True
+    assert _should_emergency_halt_on_shutdown(
+        settings,
+        sm,
+        planned_maintenance=shutdown_context["planned_maintenance"],
+    ) is False
 
 
 @pytest.mark.asyncio

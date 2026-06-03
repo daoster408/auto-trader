@@ -138,7 +138,15 @@ Manual stop:
 sudo systemctl stop auto-trader
 ```
 
-Because Oracle uses `SHUTDOWN_FLATTEN_ON_EXIT=true`, a service restart intentionally persists `HALTED` before shutdown. After deploying new code that requires a restart, inspect `/status`, then send `/resume <token>` only after the state is intentionally ready to trade.
+Because Oracle uses `SHUTDOWN_FLATTEN_ON_EXIT=true`, an unmarked manual stop or restart intentionally persists `HALTED` and may flatten positions before shutdown.
+
+Planned maintenance deploys should use the one-shot maintenance marker instead of a hard kill or an unmarked restart. The marker is short-lived, consumed once by the old process on `SIGTERM`, and lets a normal `systemctl restart` preserve the active paper lifecycle:
+
+```bash
+ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_planned_deploy.sh
+```
+
+For live mode, the maintenance helper refuses preserve-position restarts unless `ALLOW_LIVE=true` is set explicitly. Use that only for a reviewed live deploy window where preserving positions through a fast restart is intentional. After any deploy, inspect `/status`; send `/resume <token>` only if the state is intentionally ready to trade.
 
 ### Optional Finnhub Enrichment
 
@@ -150,7 +158,7 @@ Enable it only after code deployment and a clean service restart/resume:
 FINNHUB_API_KEY=...
 ```
 
-To disable it, remove or blank `FINNHUB_API_KEY` in `/opt/auto-trader/.env` and restart the service. Restarting Oracle intentionally persists `HALTED`; resume manually only after `/status` is clean.
+To disable it, remove or blank `FINNHUB_API_KEY` in `/opt/auto-trader/.env` and use the planned maintenance deploy path above. Resume manually only after `/status` is clean if the restart lands in `HALTED`.
 
 Before leaving Finnhub enabled unattended:
 
