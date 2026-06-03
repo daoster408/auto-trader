@@ -36,6 +36,7 @@ from auto_trader.persistence.db import (
     consume_planned_maintenance_shutdown,
     init_db,
     load_system_state,
+    record_runtime_capabilities,
     save_system_state,
 )
 from auto_trader.scheduler.trading_supervisor import TradingSupervisor
@@ -270,6 +271,7 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda s=sig: _signal_handler(s))
+    await record_runtime_capabilities(pid=os.getpid())
 
     # Periodic health touch (lightweight observability)
     async def _health_watcher():

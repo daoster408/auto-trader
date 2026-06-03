@@ -524,6 +524,42 @@ async def get_runtime_config_values() -> dict[str, str]:
             raise
 
 
+async def record_runtime_capabilities(*, pid: int) -> None:
+    """Record capabilities supported by the currently running process."""
+    now = _utc_iso(datetime.now(UTC))
+    values = {
+        "runtime_capability_planned_maintenance_shutdown": "true",
+        "runtime_capability_planned_maintenance_pid": str(int(pid)),
+    }
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                for key, value in values.items():
+                    await db.execute(
+                        """
+                        INSERT INTO runtime_config (key, value, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value=excluded.value,
+                            updated_at=excluded.updated_at
+                        """,
+                        (key, value, now),
+                    )
+                await db.commit()
+            finally:
+                await db.close()
+            log.info(
+                "runtime_capabilities_recorded",
+                planned_maintenance_shutdown=True,
+                pid=pid,
+            )
+        except Exception as e:
+            log.error("runtime_capabilities_record_failed", error=str(e))
+            raise
+
+
 async def request_planned_maintenance_shutdown(
     *,
     reason: str,

@@ -51,6 +51,7 @@ from auto_trader.persistence.db import (
     log_risk_decision,
     log_signal,
     load_system_state,
+    record_runtime_capabilities,
     reconcile_broker_orders,
     request_planned_maintenance_shutdown,
     save_system_state,
@@ -481,6 +482,20 @@ async def test_runtime_config_int_roundtrip_and_bounds():
         assert await set_runtime_config_value("max_new_positions_per_day", "4") is True
         with pytest.raises(ValueError, match="above maximum"):
             await get_runtime_config_int("max_new_positions_per_day", default=1, minimum=1, maximum=3)
+
+
+@pytest.mark.asyncio
+async def test_runtime_capabilities_record_current_process_pid():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "runtime_capabilities.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        await record_runtime_capabilities(pid=12345)
+
+        values = await get_runtime_config_values()
+        assert values["runtime_capability_planned_maintenance_shutdown"] == "true"
+        assert values["runtime_capability_planned_maintenance_pid"] == "12345"
 
 
 @pytest.mark.asyncio

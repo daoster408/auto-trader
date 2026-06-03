@@ -16,9 +16,10 @@ RSYNC_RSH="ssh -i $ORACLE_KEY"
 REMOTE="${ORACLE_USER}@${ORACLE_HOST}"
 
 REMOTE_PYTHON="cd ${REMOTE_DIR} && sudo -u auto-trader AUTO_TRADER_ENV_FILE=${REMOTE_DIR}/.env ${REMOTE_DIR}/.venv/bin/python"
-REMOTE_SUPPORT_CMD="${REMOTE_PYTHON} -m auto_trader.maintenance request-shutdown --help >/dev/null 2>&1"
+REMOTE_MAIN_PID="$("${SSH[@]}" "$REMOTE" "systemctl show auto-trader -p MainPID --value")"
+REMOTE_RUNTIME_SUPPORT_CMD="cd ${REMOTE_DIR} && sudo -u auto-trader AUTO_TRADER_ENV_FILE=${REMOTE_DIR}/.env AUTO_TRADER_EXPECTED_PID=${REMOTE_MAIN_PID} ${REMOTE_DIR}/.venv/bin/python -c 'import os, sqlite3; from auto_trader.config.settings import get_settings; con = sqlite3.connect(get_settings().db_path); rows = dict(con.execute(\"SELECT key, value FROM runtime_config WHERE key IN (?, ?)\", (\"runtime_capability_planned_maintenance_shutdown\", \"runtime_capability_planned_maintenance_pid\")).fetchall()); con.close(); raise SystemExit(0 if rows.get(\"runtime_capability_planned_maintenance_shutdown\") == \"true\" and rows.get(\"runtime_capability_planned_maintenance_pid\") == os.environ[\"AUTO_TRADER_EXPECTED_PID\"] else 1)'"
 
-if "${SSH[@]}" "$REMOTE" "$REMOTE_SUPPORT_CMD"; then
+if [[ "$REMOTE_MAIN_PID" =~ ^[0-9]+$ && "$REMOTE_MAIN_PID" != "0" ]] && "${SSH[@]}" "$REMOTE" "$REMOTE_RUNTIME_SUPPORT_CMD"; then
   REMOTE_SUPPORTS_MAINTENANCE=true
 else
   REMOTE_SUPPORTS_MAINTENANCE=false

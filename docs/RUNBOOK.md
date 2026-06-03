@@ -146,7 +146,7 @@ Planned maintenance deploys should use the one-shot maintenance marker instead o
 ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_planned_deploy.sh
 ```
 
-The currently running process must already support the maintenance marker. If the script reports that the remote service does not support planned maintenance, it will refuse the normal path before syncing code. For the one-time first rollout of the maintenance feature in paper mode only, use the guarded bootstrap path:
+The currently running process must already support the maintenance marker. The script checks a runtime capability marker written by the active systemd `MainPID`; checking files on disk is not enough. If the script reports that the remote service does not support planned maintenance, it will refuse the normal path before syncing code. For the one-time first rollout of the maintenance feature in paper mode only, use the guarded bootstrap path:
 
 ```bash
 BOOTSTRAP_HARD_KILL=true ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_planned_deploy.sh
