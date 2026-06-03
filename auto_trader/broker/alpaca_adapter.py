@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from auto_trader.utils.api_budget import ApiBudget
 from auto_trader.utils.logging import get_logger
 from auto_trader.utils.retry import retry_external, retry_kill_critical
 
@@ -56,12 +57,20 @@ class AlpacaAdapter:
     /kill paths use kill-critical retry budget.
     """
 
-    def __init__(self, api_key: str, api_secret: str, paper: bool = True) -> None:
+    def __init__(self, api_key: str, api_secret: str, paper: bool = True, api_budget: ApiBudget | None = None) -> None:
         self.api_key = api_key
         self.api_secret = api_secret
         self.paper = paper
         self._client: TradingClient | None = None
+        self.api_budget = api_budget or ApiBudget(name="alpaca")
         log.info("alpaca_adapter_initialized", paper=paper, real_sdk=_ALPACA_AVAILABLE)
+
+    def _record_api_call(self, endpoint: str, *, essential: bool = True) -> None:
+        self.api_budget.record(endpoint, essential=essential)
+
+    def _defer_nonessential_if_needed(self, endpoint: str) -> None:
+        if not self.api_budget.allow_nonessential(endpoint):
+            raise RuntimeError(f"nonessential Alpaca API work deferred by API budget: {endpoint}")
 
     def _get_client(self) -> TradingClient:
         """Lazy init (fast startup, low mem on ARM until first use)."""
@@ -81,7 +90,9 @@ class AlpacaAdapter:
         try:
             client = self._get_client()
             # alpaca-py is sync; run in thread to keep event loop free (ARM friendly)
+            self._record_api_call("account.health", essential=True)
             account = await asyncio.to_thread(client.get_account)
+            self._record_api_call("clock.health", essential=True)
             clock = await asyncio.to_thread(client.get_clock)
             return {
                 "ok": True,
@@ -101,6 +112,7 @@ class AlpacaAdapter:
         """Real equity/cash snapshot from Alpaca (retried)."""
         try:
             client = self._get_client()
+            self._record_api_call("account", essential=True)
             account = await asyncio.to_thread(client.get_account)
             return {
                 "equity": float(getattr(account, "equity", 0.0)),
@@ -120,6 +132,7 @@ class AlpacaAdapter:
         """Return open positions as risk-engine-friendly dictionaries."""
         try:
             client = self._get_client()
+            self._record_api_call("positions", essential=True)
             positions = await asyncio.to_thread(client.get_all_positions)
             results: list[dict[str, Any]] = []
             for pos in positions:
@@ -147,6 +160,7 @@ class AlpacaAdapter:
         try:
             client = self._get_client()
             after = datetime.now(UTC) - timedelta(days=days)
+            self._record_api_call("orders.recent", essential=True)
             orders = await asyncio.to_thread(
                 client.get_orders,
                 GetOrdersRequest(status=QueryOrderStatus.ALL, after=after),
@@ -181,6 +195,7 @@ class AlpacaAdapter:
         """Return currently open broker orders for duplicate close-order guards."""
         try:
             client = self._get_client()
+            self._record_api_call("orders.open", essential=True)
             orders = await asyncio.to_thread(
                 client.get_orders,
                 GetOrdersRequest(status=QueryOrderStatus.OPEN),
@@ -212,6 +227,7 @@ class AlpacaAdapter:
         """Real market clock from Alpaca (retried)."""
         try:
             client = self._get_client()
+            self._record_api_call("clock", essential=True)
             clock = await asyncio.to_thread(client.get_clock)
             return {
                 "is_open": bool(getattr(clock, "is_open", False)),
@@ -227,7 +243,9 @@ class AlpacaAdapter:
     async def get_tradable_assets(self) -> list[dict[str, Any]]:
         """Return active, tradable US equities from Alpaca's assets endpoint."""
         try:
+            self._defer_nonessential_if_needed("assets.tradable")
             client = self._get_client()
+            self._record_api_call("assets.tradable", essential=False)
             assets = await asyncio.to_thread(client.get_all_assets)
             results: list[dict[str, Any]] = []
             for asset in assets:
@@ -269,6 +287,8 @@ class AlpacaAdapter:
         clean_symbols = list(dict.fromkeys(s.upper() for s in symbols if s))[:100]
         if not clean_symbols:
             return {}
+        self._defer_nonessential_if_needed("snapshots")
+        self._record_api_call("snapshots", essential=False)
 
         def _fetch() -> dict[str, dict[str, Any]]:
             params = urlencode({"symbols": ",".join(clean_symbols), "feed": "iex"})
@@ -306,6 +326,7 @@ class AlpacaAdapter:
         try:
             client = self._get_client()
             # Use sync call in thread; cancel all open orders
+            self._record_api_call("orders.open.kill", essential=True)
             orders = await asyncio.to_thread(
                 client.get_orders,
                 GetOrdersRequest(status=QueryOrderStatus.OPEN),
@@ -313,6 +334,7 @@ class AlpacaAdapter:
             count = 0
             for order in orders:
                 try:
+                    self._record_api_call("orders.cancel.kill", essential=True)
                     await asyncio.to_thread(client.cancel_order_by_id, order.id)
                     count += 1
                 except Exception:
@@ -328,6 +350,7 @@ class AlpacaAdapter:
         """Real market liquidation of all positions (kill path). Returns count closed."""
         try:
             client = self._get_client()
+            self._record_api_call("positions.kill", essential=True)
             positions = await asyncio.to_thread(client.get_all_positions)
             count = 0
             for pos in positions:
@@ -342,6 +365,7 @@ class AlpacaAdapter:
                         side=side,
                         time_in_force=TimeInForce.DAY,
                     )
+                    self._record_api_call("orders.submit.kill", essential=True)
                     await asyncio.to_thread(client.submit_order, close_req)
                     count += 1
                 except Exception as e:
@@ -368,6 +392,7 @@ class AlpacaAdapter:
 
         client = self._get_client()
         target_symbol = symbol.upper()
+        self._record_api_call("positions.close", essential=True)
         positions = await asyncio.to_thread(client.get_all_positions)
         target = None
         for pos in positions:
@@ -390,6 +415,7 @@ class AlpacaAdapter:
             side=close_side,
             time_in_force=TimeInForce.DAY,
         )
+        self._record_api_call("orders.submit.close", essential=True)
         submitted = await asyncio.to_thread(client.submit_order, close_req)
         result = {
             "id": str(getattr(submitted, "id", "")),
@@ -449,6 +475,7 @@ class AlpacaAdapter:
                 # Future: support limit, etc.
                 raise ValueError(f"Unsupported order_type for v1: {order_type}")
 
+            self._record_api_call("orders.submit.entry", essential=True)
             submitted = await asyncio.to_thread(client.submit_order, order_data)
 
             result = {

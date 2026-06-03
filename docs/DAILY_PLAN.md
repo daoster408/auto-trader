@@ -366,6 +366,38 @@ Append-only by day. Do not remove past entries.
 - Confidence:
   - high
 
+## 2026-06-03 (America/Los_Angeles) - Quiet API Budget Guard
+
+- Date (local): 2026-06-03
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Added a quiet rolling API budget guard for Alpaca calls.
+  - Counted calls by endpoint in a rolling 60-second window.
+  - Kept normal behavior log-only with no Telegram report noise.
+  - Preserved safety priority:
+    - `/kill`, position/account/clock reads, reconciliation, and exit/close paths are counted but not blocked;
+    - nonessential discovery/snapshot scanning is deferred first if usage becomes too hot.
+  - Wired the budget into AlpacaAdapter calls.
+  - Added regression coverage for:
+    - rolling endpoint counts and nonessential blocking at critical threshold;
+    - snapshot discovery being deferred before a network call when the budget is hot.
+- IN_PROGRESS:
+  - Local bot should be restarted onto this code so POET monitoring uses the new internal guard.
+- NEXT:
+  - Restart local bot with `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=true`.
+  - Continue observing POET.
+- BLOCKED:
+  - None.
+- Evidence:
+  - `.venv/bin/python -m pytest auto_trader/tests/test_api_budget.py -q` -> `2 passed`.
+  - `.venv/bin/python -m pytest -q` -> `57 passed`.
+  - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+  - `git diff --check` -> clean.
+- Confidence:
+  - high
+
 ## 2026-06-01 (America/Los_Angeles) - GROK Session
 
 - Date (local): 2026-06-01

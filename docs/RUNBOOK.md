@@ -37,6 +37,14 @@ Telegram checks after startup:
 - Do not use `/resume <token>` unless the restored state is intentionally ready to trade.
 - Use `/kill` only when you intend to flatten paper positions and persist `HALTED`.
 
+API budget behavior:
+
+- Alpaca API calls are counted internally in a rolling 60-second window.
+- Normal usage is log-only and should not produce Telegram noise.
+- Safety-critical calls are counted but not blocked: `/kill`, account/clock/position reads, order reconciliation, and exit/close paths.
+- Nonessential discovery work is the first thing deferred if API usage reaches the internal critical threshold.
+- The intent is smooth live operation, not another operator report.
+
 For supervised laptop burn-in, `SHUTDOWN_FLATTEN_ON_EXIT=false` is allowed only while `ALPACA_PAPER=true`. This lets Ctrl+C or process termination stop the local process without flattening. The setting is forbidden in live mode.
 
 ## Server Run: Oracle VM Or Raspberry Pi

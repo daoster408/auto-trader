@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-03T14:49:50Z
-- Last updated local (`America/Los_Angeles`): 2026-06-03 07:49:50 PDT
+- Last updated UTC: 2026-06-03T15:16:29Z
+- Last updated local (`America/Los_Angeles`): 2026-06-03 08:16:29 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -160,6 +160,12 @@ Quick resume file for any AI session. Update at end of every work session.
     - after the one allowed entry opened, local ignored `.env` was set back to `AUTO_ENTRY_ENABLED=false`;
     - local bot restarted with `auto_entry=False, auto_exit=True`;
     - latest monitor saw POET still open, quantity `1.365320`, value about `$20.24`, unrealized P/L about `$0.28`.
+  - Quiet API budget guard added:
+    - Alpaca calls are counted by endpoint in a rolling 60-second window;
+    - normal behavior is log-only, not Telegram reporting;
+    - safety-critical calls are counted but not blocked;
+    - nonessential discovery/snapshot scanning is deferred first if the budget becomes hot;
+    - latest verification: `57 passed`, compileall passed, `git diff --check` clean.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -183,13 +189,14 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Immediate Next Actions
 
-1. Keep the current local bot running for supervised paper burn-in.
-2. Confirm Telegram `/status` shows POET as the open position, `Today new entries: 1 / 1`, and auto-entry/new entries blocked.
-3. Confirm Telegram `/report` shows the POET order and no pending exits unless an exit condition triggers.
-4. Observe POET auto-exit behavior under existing exit rules.
-5. After the one-entry lifecycle is stable, decide whether Oracle VM becomes the single active runner or AI/Finnhub research scaffolding starts first.
-6. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-7. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+1. Restart the current local bot onto the quiet API budget guard if not already restarted.
+2. Keep the current local bot running for supervised paper burn-in.
+3. Confirm Telegram `/status` shows POET as the open position, `Today new entries: 1 / 1`, and auto-entry/new entries blocked.
+4. Confirm Telegram `/report` shows the POET order and no pending exits unless an exit condition triggers.
+5. Observe POET auto-exit behavior under existing exit rules.
+6. After the one-entry lifecycle is stable, decide whether Oracle VM becomes the single active runner or AI/Finnhub research scaffolding starts first.
+7. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+8. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 
