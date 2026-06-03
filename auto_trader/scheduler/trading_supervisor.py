@@ -108,6 +108,13 @@ def _is_close_order_for_position(order: dict[str, Any], *, symbol: str, position
     return False
 
 
+def _is_open_entry_order(order: dict[str, Any]) -> bool:
+    if _is_terminal_order_status(order.get("status")):
+        return False
+    side = str(order.get("side", "")).lower()
+    return side in {"buy", "long"}
+
+
 def _order_matches_pending_exit(order: dict[str, Any], pending: dict[str, Any]) -> bool:
     order_ids = {
         str(order.get("broker_order_id") or ""),
@@ -403,6 +410,16 @@ class TradingSupervisor:
         if open_position_count >= int(self.settings.max_new_positions_per_day):
             return None
         if today_new_entries >= int(self.settings.max_new_positions_per_day):
+            return None
+        open_orders = await self.adapter.get_open_orders()
+        open_entry_orders = [order for order in open_orders if _is_open_entry_order(order)]
+        if open_entry_orders:
+            symbols = sorted({str(order.get("symbol", "")).upper() for order in open_entry_orders if order.get("symbol")})
+            log.info(
+                "entry_suppressed_open_entry_order",
+                count=len(open_entry_orders),
+                symbols=symbols,
+            )
             return None
 
         signals = await get_simple_rules_signals(self.adapter, max_signals=1)

@@ -1193,3 +1193,28 @@ Append-only by day. Do not remove past entries.
   - Optimizer thread: `019e8901-b0ce-7522-8f74-063ba926f165`.
 - Confidence:
   - high
+
+## 2026-06-03 (America/Los_Angeles) - Entry Duplicate Hardening
+
+- Date (local): 2026-06-03
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Added an auto-entry guard that reads Alpaca open orders before candidate generation.
+  - Suppresses new entries when a non-terminal broker buy/long order already exists.
+  - This closes the timing gap where a submitted entry is accepted but no broker position is visible yet, especially during restarts or host migration.
+  - Added regression coverage proving normal auto-entry still submits with no open entry order and suppresses when a broker entry order is open.
+  - Verification: `.venv/bin/python -m pytest` -> `58 passed`.
+- IN_PROGRESS:
+  - None.
+- NEXT:
+  - Decide whether to restart the laptop bot onto the new guard now or continue to the next capital-safety hardening item.
+  - Candidate next items: controlled Oracle migration rehearsal, AI research in journal-only mode, or daily loss/equity halt validation.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Code path remains `Supervisor -> OrderManager -> RiskEngine -> AlpacaAdapter`.
+  - Guard is pre-signal and does not weaken any risk threshold.
+- Confidence:
+  - high

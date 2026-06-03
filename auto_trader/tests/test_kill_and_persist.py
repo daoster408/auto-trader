@@ -2361,6 +2361,9 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
         async def get_positions_snapshot(self, *, strict=False):
             return []
 
+        async def get_open_orders(self):
+            return []
+
     class FakeOrderManager:
         def __init__(self):
             self.calls = []
@@ -2399,6 +2402,82 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
 
     assert result.entry_result["order"]["id"] == "entry-1"
     assert manager.calls[0][0].symbol == "AMPX"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_blocks_auto_entry_when_broker_has_open_entry_order(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class EntrySettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+        async def get_open_orders(self):
+            return [
+                {
+                    "id": "entry-open-1",
+                    "symbol": "POET",
+                    "side": "buy",
+                    "qty": 1.0,
+                    "status": "accepted",
+                }
+            ]
+
+    class FakeOrderManager:
+        def __init__(self):
+            self.calls = 0
+
+        async def submit_trade_intent(self, intent, snapshot):
+            self.calls += 1
+            return {"order": {"id": "entry-1"}}
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_signals(adapter, max_signals=1):
+        raise AssertionError("signals should not be evaluated while an entry order is open")
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=EntrySettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=manager,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.entry_result is None
+    assert manager.calls == 0
 
 
 @pytest.mark.asyncio

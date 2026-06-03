@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-03T15:56:18Z
-- Last updated local (`America/Los_Angeles`): 2026-06-03 08:56:18 PDT
+- Last updated UTC: 2026-06-03T16:04:33Z
+- Last updated local (`America/Los_Angeles`): 2026-06-03 09:04:33 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -24,6 +24,7 @@ Quick resume file for any AI session. Update at end of every work session.
   - Supervised local shutdown mode implemented; final Reviewer and Optimizer verdicts: **APPROVE**
   - Automatic Reviewer/Optimizer cycle completed after major Engineer work
   - Final Reviewer verdict for tomorrow readiness: **APPROVE**
+  - Day 3 entry hardening added: auto-entry now suppresses if Alpaca already reports an open buy/long order before candidate generation.
 - System status:
   - RiskEngine remains the **only** path to any real order.
   - Real order submission code is written and gated.
@@ -185,6 +186,9 @@ Quick resume file for any AI session. Update at end of every work session.
     - systemd service installed at `/etc/systemd/system/auto-trader.service`;
     - service is `disabled` and `inactive`;
     - read-only POET validation on Oracle passed without starting Telegram polling or supervisor.
+  - Entry duplicate protection now checks open broker entry orders before signal generation:
+    - protects restart/migration timing where an accepted buy exists but no position has appeared yet;
+    - latest verification: `58 passed`.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
