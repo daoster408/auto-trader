@@ -12,6 +12,12 @@ import pytest
 from pydantic import ValidationError
 
 from auto_trader.core.models import SystemState, KillResult, TradeIntent
+from auto_trader.account_risk_validate import (
+    AccountRiskScenario,
+    build_account_risk_validation_report,
+    evaluate_account_risk_scenario,
+    validation_exit_code as account_risk_validation_exit_code,
+)
 from auto_trader.day3_validate import build_day3_validation_report, validation_exit_code
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
@@ -224,6 +230,59 @@ def test_day3_validation_waits_when_position_open_and_pending_exit_present():
     assert "[PASS] duplicate close count" in report
     assert "[PASS] pending-exit marker" in report
     assert validation_exit_code(gates) == 0
+
+
+def test_account_risk_validation_dry_run_scenarios_pass():
+    report, gates = build_account_risk_validation_report(settings=DummySettings(), base_equity=400.0)
+
+    assert "Overall: PASS" in report
+    assert "[PASS] healthy" in report
+    assert "[PASS] daily-loss-breach" in report
+    assert "[PASS] peak-drawdown-breach" in report
+    assert account_risk_validation_exit_code(gates) == 0
+
+
+def test_account_risk_validation_reports_failed_expectation():
+    report, gates = build_account_risk_validation_report(
+        settings=DummySettings(),
+        base_equity=400.0,
+        scenarios=[
+            AccountRiskScenario(
+                name="bad-expectation",
+                equity=390.0,
+                day_start_equity=400.0,
+                week_start_equity=400.0,
+                peak_equity=400.0,
+                expected_halt=False,
+            )
+        ],
+    )
+
+    assert "Overall: FAIL" in report
+    assert "[FAIL] bad-expectation" in report
+    assert account_risk_validation_exit_code(gates) == 2
+
+
+def test_account_risk_scenario_evaluates_all_thresholds():
+    decision = evaluate_account_risk_scenario(
+        AccountRiskScenario(
+            name="multi-breach",
+            equity=380.0,
+            day_start_equity=400.0,
+            week_start_equity=400.0,
+            peak_equity=410.0,
+            expected_halt=True,
+        ),
+        daily_loss_halt_pct=-1.75,
+        weekly_loss_halt_pct=-4.0,
+        peak_drawdown_halt_pct=-6.0,
+    )
+
+    assert decision.should_halt is True
+    assert decision.daily_loss_pct == pytest.approx(-5.0)
+    assert decision.weekly_loss_pct == pytest.approx(-5.0)
+    assert decision.peak_drawdown_pct == pytest.approx(-7.31707317)
+    assert len(decision.breaches) == 3
 
 
 def test_day3_validation_fails_duplicate_close_orders():

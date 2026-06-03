@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-03T16:20:45Z
-- Last updated local (`America/Los_Angeles`): 2026-06-03 09:20:45 PDT
+- Last updated UTC: 2026-06-03T16:27:52Z
+- Last updated local (`America/Los_Angeles`): 2026-06-03 09:27:52 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -26,6 +26,7 @@ Quick resume file for any AI session. Update at end of every work session.
   - Final Reviewer verdict for tomorrow readiness: **APPROVE**
   - Day 3 entry hardening added: auto-entry now suppresses if Alpaca already reports an open buy/long order before candidate generation.
   - Account-level risk halt layer added: daily loss, weekly loss, and peak drawdown breaches now persist `HALTED` and call cancel/flatten through the existing kill-grade path.
+  - Account-risk dry-run validator added for operator proof without touching broker cancel/flatten paths.
 - System status:
   - RiskEngine remains the **only** path to any real order.
   - Real order submission code is written and gated.
@@ -194,6 +195,11 @@ Quick resume file for any AI session. Update at end of every work session.
     - durable account-risk state tracks daily start equity, weekly start equity, and peak equity;
     - breaches of `DAILY_LOSS_HALT_PCT`, `WEEKLY_LOSS_HALT_PCT`, or `PEAK_DRAWDOWN_HALT_PCT` notify Telegram once, append a journal entry, persist `HALTED`, cancel open orders, and flatten positions;
     - latest verification: `60 passed`, compileall passed, `git diff --check` clean.
+  - Account-risk validation command:
+    - `scripts/account_risk_validate.sh --base-equity 400`;
+    - dry-runs healthy, daily-loss-breach, and peak-drawdown-breach scenarios using configured thresholds;
+    - does not call Alpaca cancel/flatten;
+    - latest verification: `63 passed`, compileall passed, `git diff --check` clean.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.

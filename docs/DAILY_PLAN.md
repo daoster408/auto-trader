@@ -1247,3 +1247,33 @@ Append-only by day. Do not remove past entries.
   - RiskEngine remains the only entry order path; this layer is risk-reducing only.
 - Confidence:
   - high
+
+## 2026-06-03 (America/Los_Angeles) - Account Risk Dry-Run Validator
+
+- Date (local): 2026-06-03
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Added `auto_trader.account_risk_validate` for dry-run validation of account-level halt threshold decisions.
+  - Added `scripts/account_risk_validate.sh --base-equity 400` operator command.
+  - Validator covers healthy, daily-loss-breach, and peak-drawdown-breach scenarios using configured thresholds.
+  - Validator is safe to run because it does not call Alpaca cancel/flatten or mutate trading state.
+  - Added report and threshold-decision regression tests.
+  - Verification:
+    - `scripts/account_risk_validate.sh --base-equity 400` -> `Overall: PASS`.
+    - `.venv/bin/python -m pytest` -> `63 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+    - `git diff --check` -> clean.
+- IN_PROGRESS:
+  - None.
+- NEXT:
+  - Commit and push the validator.
+  - Consider controlled Oracle migration rehearsal now that the laptop runner has the newest safety code.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Dry-run scenarios use the same threshold values as supervisor account-risk halt enforcement.
+  - No broker mutation calls are present in the validator.
+- Confidence:
+  - high
