@@ -7,7 +7,7 @@ Operational notes for supervised paper-trading runs. Keep live-money changes exp
 - Day 2 paper burn-in is supervised paper mode.
 - As of 2026-06-03 09:35 PDT, Oracle VM is the single active paper runner.
 - The laptop bot is stopped; do not start it unless intentionally migrating back from Oracle.
-- `AUTO_ENTRY_ENABLED=false` means the supervisor will not open new positions.
+- `AUTO_ENTRY_ENABLED=false` is the service env default. Runtime Telegram config can override it in SQLite; trust `/status` and `/config` for the effective active-runner entry state.
 - `AUTO_EXIT_ENABLED=true` is enabled on the active runner after close-path hardening approval.
 - AMPX and POET paper lifecycles are complete; current expected open positions are none.
 - `/kill` remains the emergency path: cancel all orders, flatten all positions, and persist `HALTED`.

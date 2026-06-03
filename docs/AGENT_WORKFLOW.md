@@ -25,15 +25,17 @@ Defines responsibilities and handoff rules for the 4-agent build team.
 4. Engineer applies required changes.
 5. Optimizer produces production-grade package.
 
-## Automatic Subagent Rule
+## Standing Subagent Rule
 
-- After every major Engineer implementation pass, launch visible Reviewer and Optimizer background threads automatically without asking the user for permission again.
+- Use one pinned standing Reviewer thread and one pinned standing Optimizer thread per trading day; do not create new Reviewer/Optimizer threads for each implementation delta.
+- Create fresh standing threads only when starting a new trading day, when a thread is wedged/unavailable, or when context pollution makes the thread unsafe to reuse. Archive or clearly mark replaced threads so stale verdicts are not mistaken for current review.
+- After every major Engineer implementation pass, send the delta to the standing Reviewer and standing Optimizer without asking the user for permission again.
 - Engineer must proactively poll/read Reviewer and Optimizer verdicts; the user should not need to ask whether agents are done or whether blockers exist.
-- If Reviewer or Optimizer returns BLOCK or APPROVE WITH CHANGES, Engineer must apply required fixes or explicitly log why a recommendation is deferred, then automatically send the updated working tree back for re-review.
+- If Reviewer or Optimizer returns BLOCK or APPROVE WITH CHANGES, Engineer must apply required fixes or explicitly log why a recommendation is deferred, then automatically send the updated working tree back to the same standing threads for re-review.
 - Continue the Engineer -> Reviewer/Optimizer -> Engineer fix loop until Reviewer is APPROVE and Optimizer is APPROVE or only has documented non-blocking follow-ups.
 - Reviewer must prioritize capital safety, risk bypass checks, kill-switch reliability, and correctness.
 - Optimizer must not remove, weaken, bypass, or defer any risk control in pursuit of performance.
-- If Reviewer returns BLOCK, Engineer fixes required changes and then automatically re-runs Reviewer/Optimizer as appropriate.
+- If Reviewer returns BLOCK, Engineer fixes required changes and then automatically re-runs Reviewer/Optimizer as appropriate in the same standing threads.
 
 ## Mandatory Deliverables
 
