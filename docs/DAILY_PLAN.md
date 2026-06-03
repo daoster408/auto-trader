@@ -273,6 +273,41 @@ Append-only by day. Do not remove past entries.
 - Day 7:
   - Validate full daily cycle and publish weekly summary draft.
 
+## 2026-06-03 (America/Los_Angeles) - Day 3 Market-Open Close Validation
+
+- Date (local): 2026-06-03
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Ran Day 3 AMPX validation at market open.
+  - Confirmed AMPX close order filled and AMPX position is gone.
+  - Found a real validation failure: the local `pending_exits` marker remained after the matched close order filled.
+  - Patched supervisor reconciliation to clear matched terminal pending exits:
+    - rejected/canceled/expired closes still clear and allow retry;
+    - filled closes now clear as completed, append a journal entry, and notify Telegram once.
+  - Restarted the local supervised bot onto the patched code.
+  - Confirmed the patched supervisor cleared the stale AMPX pending-exit marker.
+  - Re-ran Day 3 validation and reached `Overall: PASS`.
+- IN_PROGRESS:
+  - Local paper bot is running with `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=true`.
+- NEXT:
+  - Decide the next Day 3 promotion:
+    - enable one new paper entry for the day, or
+    - keep entries off and move to Oracle VM prep / AI research scaffolding.
+  - If enabling entries, keep the cap at one new position and immediately validate `/status`, `/report`, reconciliation, and any new pending-exit behavior.
+- BLOCKED:
+  - None for close lifecycle. AMPX close lifecycle is now validated.
+- Evidence:
+  - First validation: `Overall: FAIL` only because `pending_exits` remained after AMPX close filled.
+  - `.venv/bin/python -m pytest auto_trader/tests/test_kill_and_persist.py -q` -> `55 passed`.
+  - `.venv/bin/python -m pytest -q` -> `55 passed`.
+  - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+  - `git diff --check` -> clean.
+  - Final validation: `Overall: PASS`; close order `d08fb2a8` filled; AMPX position gone; duplicate close count passed; pending-exit marker clear.
+- Confidence:
+  - high
+
 ## 2026-06-01 (America/Los_Angeles) - GROK Session
 
 - Date (local): 2026-06-01

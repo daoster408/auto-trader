@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-03T00:29:10Z
-- Last updated local (`America/Los_Angeles`): 2026-06-02 17:29:10 PDT
+- Last updated UTC: 2026-06-03T14:37:56Z
+- Last updated local (`America/Los_Angeles`): 2026-06-03 07:37:56 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -138,11 +138,14 @@ Quick resume file for any AI session. Update at end of every work session.
     - verifies paper mode, auto-entry off, auto-exit on, broker account tradability, market state, broker reconciliation, AMPX position status, close order visibility, duplicate close count, and pending-exit marker state;
     - exits `0` for PASS/WARN and `2` for hard FAIL gates.
   - Latest Day 3 validation result:
-    - `Overall: WARN`, expected while market is closed and AMPX remains open;
+    - initial market-open validation found AMPX close filled and position gone, but failed because the stale pending-exit marker remained;
+    - supervisor reconciliation now clears matched filled pending exits as completed, appends a journal entry, and sends one Telegram completion alert;
+    - final validation is `Overall: PASS`;
     - broker reconciliation found 2 orders;
-    - one accepted AMPX close order is visible;
+    - one filled AMPX close order is visible;
+    - AMPX position is gone;
     - duplicate close count passed;
-    - pending-exit marker passed.
+    - pending-exit marker is clear.
   - Oracle VM stance:
     - Oracle can be prepared tonight;
     - do not migrate the active bot until the Day 3 AMPX close lifecycle validates;
@@ -171,13 +174,11 @@ Quick resume file for any AI session. Update at end of every work session.
 ## Immediate Next Actions
 
 1. Keep the current local bot running for supervised paper burn-in.
-2. Run `scripts/day3_validate.sh --symbol AMPX` on Wednesday, 2026-06-03 before enabling new entries or migrating Oracle active service.
-3. On Wednesday, 2026-06-03 market open, confirm the accepted AMPX close fills or remains visibly pending without duplicate close submission.
-4. Confirm `pending_exits` clears only after Alpaca shows AMPX gone.
-5. Keep `AUTO_ENTRY_ENABLED=false` until the AMPX close lifecycle is verified.
-6. After validation passes, decide whether Oracle VM becomes the single active runner.
-7. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-8. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+2. Decide whether Day 3 enables one new paper entry or keeps entries off while Oracle VM / AI research scaffolding proceeds.
+3. If enabling entries, keep `MAX_NEW_POSITIONS_PER_DAY=1`, leave `AUTO_EXIT_ENABLED=true`, and validate `/status`, `/report`, reconciliation, and pending-exit behavior immediately after any new order.
+4. After validation passes for the broader paper loop, decide whether Oracle VM becomes the single active runner.
+5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 

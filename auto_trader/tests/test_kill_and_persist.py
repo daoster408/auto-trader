@@ -2062,6 +2062,95 @@ async def test_supervisor_clears_failed_pending_exit_and_retries_close(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_supervisor_clears_filled_pending_exit_from_reconciliation(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    notifications = []
+    journal_entries = []
+    pending_symbols = {"AMPX"}
+    pending = {"symbol": "AMPX", "broker_order_id": "filled-close", "client_order_id": "filled-close"}
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return [
+                {
+                    "id": "filled-close",
+                    "client_order_id": "filled-close",
+                    "broker_order_id": "filled-close",
+                    "symbol": "AMPX",
+                    "side": "sell",
+                    "qty": 0.832986,
+                    "status": "filled",
+                }
+            ]
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    async def fake_reconcile(orders):
+        return len(orders)
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_pending_symbols():
+        return set(pending_symbols)
+
+    async def fake_pending_lookup(symbol):
+        return pending if symbol == "AMPX" and symbol in pending_symbols else None
+
+    async def fake_pending_clear(symbol):
+        pending_symbols.discard(symbol)
+        return True
+
+    async def fake_journal_entry(**kwargs):
+        journal_entries.append(kwargs["content"])
+        return len(journal_entries)
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_symbols", fake_pending_symbols)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal_entry)
+
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=object(),
+        notifier=fake_notify,
+    )
+    supervisor._pending_exit_symbols.add("AMPX")
+
+    result = await supervisor.tick_once()
+
+    assert result.positions == []
+    assert result.exit_decisions == []
+    assert pending_symbols == set()
+    assert supervisor._pending_exit_symbols == set()
+    assert any("EXIT COMPLETED: close order for AMPX is filled" in message for message in notifications)
+    assert any("Auto-exit completed for AMPX" in entry for entry in journal_entries)
+
+
+@pytest.mark.asyncio
 async def test_supervisor_clears_persisted_pending_exit_after_position_disappears(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     cleared = []

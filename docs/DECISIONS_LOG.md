@@ -178,3 +178,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: Oracle improves uptime, but a second host can bypass the local single-instance lock and create cross-host Telegram polling or trading conflicts if laptop and VM run at the same time.
 - Impact: Added a read-only Day 3 validation command and documented that Oracle migration must be single-runner: one active host, one Telegram bot token, one Alpaca paper account.
 - Confidence: high
+
+- UTC timestamp: 2026-06-03T14:37:56Z
+- Local timestamp (`America/Los_Angeles`): 2026-06-03 07:37:56 PDT
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- Decision: Treat matched filled close orders as completed pending exits during supervisor reconciliation.
+- Rationale: Day 3 market-open validation proved the AMPX close filled and the broker position disappeared, but the durable pending-exit marker remained. A matched filled broker close is enough evidence to clear the marker and complete the exit lifecycle.
+- Impact: Supervisor reconciliation now clears matched filled pending exits, removes them from memory, appends a completion journal entry, and sends one Telegram completion alert; rejected/canceled/expired closes still clear as retry-able failures.
+- Confidence: high

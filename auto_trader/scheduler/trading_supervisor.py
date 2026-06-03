@@ -91,6 +91,10 @@ def _is_failed_terminal_order_status(status: Any) -> bool:
     return str(status or "").lower() in {"canceled", "cancelled", "rejected", "expired"}
 
 
+def _is_filled_order_status(status: Any) -> bool:
+    return str(status or "").lower() == "filled"
+
+
 def _is_close_order_for_position(order: dict[str, Any], *, symbol: str, position_qty: float) -> bool:
     if str(order.get("symbol", "")).upper() != symbol.upper():
         return False
@@ -163,7 +167,7 @@ class TradingSupervisor:
         lookback = int(days if days is not None else self.settings.reconcile_lookback_days)
         recent_orders = await self.adapter.get_recent_orders(days=lookback)
         reconciled = await reconcile_broker_orders(recent_orders)
-        await self._clear_failed_pending_exits_from_orders(recent_orders)
+        await self._clear_terminal_pending_exits_from_orders(recent_orders)
         self._last_reconcile_at = datetime.now(UTC)
         if reconciled != len(recent_orders):
             await self._notify_once(
@@ -240,10 +244,12 @@ class TradingSupervisor:
             return order
         return None
 
-    async def _clear_failed_pending_exits_from_orders(self, orders: list[dict[str, Any]]) -> None:
-        """Clear pending exits whose broker close order is known failed/canceled."""
+    async def _clear_terminal_pending_exits_from_orders(self, orders: list[dict[str, Any]]) -> None:
+        """Clear pending exits whose broker close order is known terminal."""
         for order in orders:
-            if not _is_failed_terminal_order_status(order.get("status")):
+            failed = _is_failed_terminal_order_status(order.get("status"))
+            filled = _is_filled_order_status(order.get("status"))
+            if not failed and not filled:
                 continue
             symbol = str(order.get("symbol", "")).upper()
             if not symbol:
@@ -253,10 +259,22 @@ class TradingSupervisor:
                 continue
             if await clear_pending_exit(symbol):
                 self._pending_exit_symbols.discard(symbol)
-                await self._notify_once(
-                    f"exit-pending-cleared-{symbol}-{order.get('status')}",
-                    f"EXIT PENDING CLEARED: prior close for {symbol} is {order.get('status')}; supervisor may retry.",
-                )
+                if filled:
+                    await append_journal_entry(
+                        content=(
+                            f"Auto-exit completed for {symbol}: matched close order "
+                            f"{order.get('broker_order_id') or order.get('id')} is filled; pending marker cleared."
+                        )
+                    )
+                    await self._notify_once(
+                        f"exit-completed-{symbol}-{order.get('broker_order_id') or order.get('id')}",
+                        f"EXIT COMPLETED: close order for {symbol} is filled; pending marker cleared.",
+                    )
+                else:
+                    await self._notify_once(
+                        f"exit-pending-cleared-{symbol}-{order.get('status')}",
+                        f"EXIT PENDING CLEARED: prior close for {symbol} is {order.get('status')}; supervisor may retry.",
+                    )
 
     async def _execute_exit_if_enabled(self, decision: ExitDecision) -> dict[str, Any] | None:
         if not decision.should_exit:
