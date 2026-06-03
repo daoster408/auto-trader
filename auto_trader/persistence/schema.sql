@@ -67,6 +67,16 @@ CREATE TABLE IF NOT EXISTS pending_exits (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS account_risk_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton row
+    day_date TEXT NOT NULL,
+    day_start_equity REAL NOT NULL,
+    week_start_date TEXT NOT NULL,
+    week_start_equity REAL NOT NULL,
+    peak_equity REAL NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS journal_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,  -- YYYY-MM-DD local report date

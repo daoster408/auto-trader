@@ -258,6 +258,99 @@ async def count_entry_orders_since(start_utc_iso: str) -> int:
             raise
 
 
+async def update_account_risk_state(
+    *,
+    equity: float,
+    day_date: str,
+    week_start_date: str,
+) -> dict[str, Any]:
+    """Persist account equity baselines and return loss/drawdown metrics."""
+    clean_equity = float(equity)
+    if clean_equity <= 0:
+        raise ValueError("equity must be positive to update account risk state")
+    now = datetime.now(UTC).isoformat() + "Z"
+    async with _DB_LOCK:
+        await init_db()
+        db = await _get_conn()
+        try:
+            cur = await db.execute(
+                """
+                SELECT day_date, day_start_equity, week_start_date, week_start_equity, peak_equity
+                FROM account_risk_state
+                WHERE id = 1
+                """
+            )
+            row = await cur.fetchone()
+            if row is None:
+                day_start_equity = clean_equity
+                week_start_equity = clean_equity
+                peak_equity = clean_equity
+            else:
+                day_start_equity = (
+                    clean_equity
+                    if str(row["day_date"]) != day_date
+                    else float(row["day_start_equity"])
+                )
+                week_start_equity = (
+                    clean_equity
+                    if str(row["week_start_date"]) != week_start_date
+                    else float(row["week_start_equity"])
+                )
+                peak_equity = max(float(row["peak_equity"]), clean_equity)
+
+            await db.execute(
+                """
+                INSERT INTO account_risk_state (
+                    id, day_date, day_start_equity, week_start_date, week_start_equity, peak_equity, updated_at
+                )
+                VALUES (1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    day_date=excluded.day_date,
+                    day_start_equity=excluded.day_start_equity,
+                    week_start_date=excluded.week_start_date,
+                    week_start_equity=excluded.week_start_equity,
+                    peak_equity=excluded.peak_equity,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    day_date,
+                    day_start_equity,
+                    week_start_date,
+                    week_start_equity,
+                    peak_equity,
+                    now,
+                ),
+            )
+            await db.commit()
+            daily_loss_pct = ((clean_equity - day_start_equity) / day_start_equity * 100.0) if day_start_equity else 0.0
+            weekly_loss_pct = (
+                ((clean_equity - week_start_equity) / week_start_equity * 100.0) if week_start_equity else 0.0
+            )
+            peak_drawdown_pct = ((clean_equity - peak_equity) / peak_equity * 100.0) if peak_equity else 0.0
+            metrics = {
+                "equity": clean_equity,
+                "day_date": day_date,
+                "day_start_equity": day_start_equity,
+                "daily_loss_pct": daily_loss_pct,
+                "week_start_date": week_start_date,
+                "week_start_equity": week_start_equity,
+                "weekly_loss_pct": weekly_loss_pct,
+                "peak_equity": peak_equity,
+                "peak_drawdown_pct": peak_drawdown_pct,
+                "updated_at": now,
+            }
+            log.info(
+                "account_risk_state_updated",
+                equity=clean_equity,
+                daily_loss_pct=daily_loss_pct,
+                weekly_loss_pct=weekly_loss_pct,
+                peak_drawdown_pct=peak_drawdown_pct,
+            )
+            return metrics
+        finally:
+            await db.close()
+
+
 async def reconcile_broker_orders(orders: list[dict[str, Any]]) -> int:
     """Upsert broker orders into SQLite. Returns number successfully persisted."""
     count = 0

@@ -37,6 +37,7 @@ from auto_trader.persistence.db import (
     save_system_state,
     upsert_pending_exit,
     upsert_order_record,
+    update_account_risk_state,
 )
 
 
@@ -44,6 +45,10 @@ class DummySettings:
     risk_per_trade_pct = 0.5
     max_new_positions_per_day = 1
     max_gross_exposure_pct = 25.0
+    daily_loss_halt_pct = -1.75
+    weekly_loss_halt_pct = -4.0
+    peak_drawdown_halt_pct = -6.0
+    consecutive_sl_halt = 2
 
 
 class DummySupervisorSettings(DummySettings):
@@ -124,11 +129,42 @@ def patch_empty_pending_exit_state(monkeypatch):
     async def fake_journal_entry(**kwargs):
         return 1
 
+    async def fake_account_risk_state(*, equity, day_date, week_start_date):
+        return {
+            "equity": equity,
+            "day_date": day_date,
+            "day_start_equity": equity,
+            "daily_loss_pct": 0.0,
+            "week_start_date": week_start_date,
+            "week_start_equity": equity,
+            "weekly_loss_pct": 0.0,
+            "peak_equity": equity,
+            "peak_drawdown_pct": 0.0,
+        }
+
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_symbols", fake_pending_symbols)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.upsert_pending_exit", fake_pending_upsert)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal_entry)
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.update_account_risk_state",
+        fake_healthy_account_risk_state,
+    )
+
+
+async def fake_healthy_account_risk_state(*, equity, day_date, week_start_date):
+    return {
+        "equity": equity,
+        "day_date": day_date,
+        "day_start_equity": equity,
+        "daily_loss_pct": 0.0,
+        "week_start_date": week_start_date,
+        "week_start_equity": equity,
+        "weekly_loss_pct": 0.0,
+        "peak_equity": equity,
+        "peak_drawdown_pct": 0.0,
+    }
 
 
 class FakeTelegramIdentity:
@@ -278,6 +314,52 @@ async def test_halted_state_survives_real_restart():
         # Simulate full restart: new process loads from disk
         restored, _ = await load_system_state()
         assert restored == SystemState.HALTED, "HALTED must survive real DB roundtrip"
+
+
+@pytest.mark.asyncio
+async def test_account_risk_state_tracks_daily_weekly_and_peak_baselines():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "risk_state.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        first = await update_account_risk_state(
+            equity=100.0,
+            day_date="2026-06-03",
+            week_start_date="2026-06-01",
+        )
+        assert first["day_start_equity"] == 100.0
+        assert first["week_start_equity"] == 100.0
+        assert first["peak_equity"] == 100.0
+        assert first["daily_loss_pct"] == 0.0
+
+        lower = await update_account_risk_state(
+            equity=98.0,
+            day_date="2026-06-03",
+            week_start_date="2026-06-01",
+        )
+        assert lower["day_start_equity"] == 100.0
+        assert lower["week_start_equity"] == 100.0
+        assert lower["peak_equity"] == 100.0
+        assert lower["daily_loss_pct"] == pytest.approx(-2.0)
+        assert lower["weekly_loss_pct"] == pytest.approx(-2.0)
+        assert lower["peak_drawdown_pct"] == pytest.approx(-2.0)
+
+        higher = await update_account_risk_state(
+            equity=105.0,
+            day_date="2026-06-03",
+            week_start_date="2026-06-01",
+        )
+        assert higher["peak_equity"] == 105.0
+
+        next_day = await update_account_risk_state(
+            equity=104.0,
+            day_date="2026-06-04",
+            week_start_date="2026-06-01",
+        )
+        assert next_day["day_start_equity"] == 104.0
+        assert next_day["week_start_equity"] == 100.0
+        assert next_day["peak_equity"] == 105.0
 
 
 @pytest.mark.asyncio
@@ -1501,6 +1583,19 @@ async def test_supervisor_persisted_pending_exit_suppresses_close_after_restart(
     async def fake_pending_clear(symbol):
         return True
 
+    async def fake_account_risk_state(*, equity, day_date, week_start_date):
+        return {
+            "equity": equity,
+            "day_date": day_date,
+            "day_start_equity": equity,
+            "daily_loss_pct": 0.0,
+            "week_start_date": week_start_date,
+            "week_start_equity": equity,
+            "weekly_loss_pct": 0.0,
+            "peak_equity": equity,
+            "peak_drawdown_pct": 0.0,
+        }
+
     async def fake_notify(message):
         notifications.append(message)
 
@@ -1510,6 +1605,7 @@ async def test_supervisor_persisted_pending_exit_suppresses_close_after_restart(
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_symbols", fake_pending_symbols)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.update_account_risk_state", fake_account_risk_state)
 
     adapter = FakeAdapter()
     supervisor = TradingSupervisor(
@@ -1592,6 +1688,19 @@ async def test_supervisor_unresolved_persisted_pending_exit_pauses_for_review(mo
 
     async def fake_pending_clear(symbol):
         return True
+
+    async def fake_account_risk_state(*, equity, day_date, week_start_date):
+        return {
+            "equity": equity,
+            "day_date": day_date,
+            "day_start_equity": equity,
+            "daily_loss_pct": 0.0,
+            "week_start_date": week_start_date,
+            "week_start_equity": equity,
+            "weekly_loss_pct": 0.0,
+            "peak_equity": equity,
+            "peak_drawdown_pct": 0.0,
+        }
 
     async def fake_notify(message):
         notifications.append(message)
@@ -1695,6 +1804,19 @@ async def test_supervisor_unmatched_open_close_order_does_not_resolve_persisted_
 
     async def fake_pending_clear(symbol):
         return True
+
+    async def fake_account_risk_state(*, equity, day_date, week_start_date):
+        return {
+            "equity": equity,
+            "day_date": day_date,
+            "day_start_equity": equity,
+            "daily_loss_pct": 0.0,
+            "week_start_date": week_start_date,
+            "week_start_equity": equity,
+            "weekly_loss_pct": 0.0,
+            "peak_equity": equity,
+            "peak_drawdown_pct": 0.0,
+        }
 
     async def fake_notify(message):
         notifications.append(message)
@@ -1814,6 +1936,10 @@ async def test_supervisor_broker_open_close_order_suppresses_and_persists(monkey
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.upsert_pending_exit", fake_pending_upsert)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.update_account_risk_state",
+        fake_healthy_account_risk_state,
+    )
 
     adapter = FakeAdapter()
     supervisor = TradingSupervisor(
@@ -2478,6 +2604,115 @@ async def test_supervisor_blocks_auto_entry_when_broker_has_open_entry_order(mon
 
     assert result.entry_result is None
     assert manager.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_supervisor_account_risk_halt_flattens_and_blocks_entry(monkeypatch):
+    persisted = []
+    notifications = []
+
+    async def persist(state, reason):
+        persisted.append((state, reason))
+
+    sm = StateMachine(initial_state=SystemState.ACTIVE, persist_hook=persist)
+
+    class EntrySettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.cancel_calls = 0
+            self.flatten_calls = 0
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 98.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+        async def cancel_all_orders(self):
+            self.cancel_calls += 1
+            return 1
+
+        async def flatten_all_positions(self):
+            self.flatten_calls += 1
+            return 1
+
+    class FakeOrderManager:
+        def __init__(self):
+            self.calls = 0
+
+        async def submit_trade_intent(self, intent, snapshot):
+            self.calls += 1
+            return {"order": {"id": "entry-1"}}
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_account_risk_state(*, equity, day_date, week_start_date):
+        return {
+            "equity": equity,
+            "day_date": day_date,
+            "day_start_equity": 100.0,
+            "daily_loss_pct": -2.0,
+            "week_start_date": week_start_date,
+            "week_start_equity": 100.0,
+            "weekly_loss_pct": -2.0,
+            "peak_equity": 100.0,
+            "peak_drawdown_pct": -2.0,
+        }
+
+    async def fake_signals(adapter, max_signals=1):
+        raise AssertionError("signals should not be evaluated after an account risk halt")
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.update_account_risk_state", fake_account_risk_state)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    patch_empty_pending_exit_state(monkeypatch)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.update_account_risk_state", fake_account_risk_state)
+
+    adapter = FakeAdapter()
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=EntrySettings(),
+        state_machine=sm,
+        adapter=adapter,
+        order_manager=manager,
+        notifier=fake_notify,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert sm.state == SystemState.HALTED
+    assert result.entry_result is None
+    assert manager.calls == 0
+    assert adapter.cancel_calls == 1
+    assert adapter.flatten_calls == 1
+    assert persisted[0][0] == SystemState.HALTED
+    assert "account risk halt" in persisted[0][1]
+    assert any("ACCOUNT RISK HALT" in message for message in notifications)
 
 
 @pytest.mark.asyncio

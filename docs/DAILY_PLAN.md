@@ -1218,3 +1218,32 @@ Append-only by day. Do not remove past entries.
   - Guard is pre-signal and does not weaken any risk threshold.
 - Confidence:
   - high
+
+## 2026-06-03 (America/Los_Angeles) - Account Risk Halt Enforcement
+
+- Date (local): 2026-06-03
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Added durable account-risk state for daily start equity, weekly start equity, and peak equity.
+  - Added supervisor account-risk halt enforcement for daily loss, weekly loss, and peak drawdown thresholds.
+  - On breach, supervisor now appends a journal entry, sends one Telegram alert, persists `HALTED`, cancels open orders, and flattens positions through the existing kill-grade path.
+  - Added tests for baseline tracking and supervisor halt/cancel/flatten behavior.
+  - Verification:
+    - `.venv/bin/python -m pytest` -> `60 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+    - `git diff --check` -> clean.
+- IN_PROGRESS:
+  - None.
+- NEXT:
+  - Commit and push the account-risk halt layer.
+  - Restart the local laptop bot onto the newest code if keeping laptop as active runner.
+  - Continue with controlled Oracle migration rehearsal or journal-only AI research scaffolding after the running bot is updated.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Thresholds remain sourced from settings: `DAILY_LOSS_HALT_PCT`, `WEEKLY_LOSS_HALT_PCT`, `PEAK_DRAWDOWN_HALT_PCT`.
+  - RiskEngine remains the only entry order path; this layer is risk-reducing only.
+- Confidence:
+  - high

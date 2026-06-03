@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.state_machine import StateMachine
+from auto_trader.core.models import KillResult, SystemState
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
 from auto_trader.persistence.db import (
@@ -19,6 +20,7 @@ from auto_trader.persistence.db import (
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
     reconcile_broker_orders,
+    update_account_risk_state,
     upsert_pending_exit,
     upsert_order_record,
 )
@@ -71,6 +73,10 @@ def _parse_dt(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
     except ValueError:
         return None
+
+
+def _week_start_date(value: datetime) -> str:
+    return value.date().fromordinal(value.date().toordinal() - value.weekday()).isoformat()
 
 
 def _format_position_line(position: dict[str, Any]) -> str:
@@ -169,6 +175,56 @@ class TradingSupervisor:
             return
         self._seen_alert_keys.add(key)
         await self._notify(message)
+
+    async def _halt_and_flatten(self, reason: str) -> KillResult:
+        async def flatten() -> KillResult:
+            cancelled = await self.adapter.cancel_all_orders()
+            flattened = await self.adapter.flatten_all_positions()
+            return KillResult(
+                success=True,
+                orders_cancelled=cancelled,
+                positions_flattened=flattened,
+                reason=reason,
+                incident_report=f"SUPERVISOR ACCOUNT HALT: {reason}",
+                timestamp=datetime.now(UTC),
+            )
+
+        return await self.sm.halt(reason, flatten_callback=flatten)
+
+    async def _enforce_account_risk_halts(self, account: dict[str, Any]) -> dict[str, Any] | None:
+        if self.sm.state == SystemState.HALTED:
+            return None
+        equity = _float(account.get("equity"))
+        if equity <= 0:
+            raise ValueError("account equity unavailable for account risk halt checks")
+        timezone = ZoneInfo(getattr(self.settings, "report_timezone", "America/Los_Angeles"))
+        local_now = datetime.now(timezone)
+        metrics = await update_account_risk_state(
+            equity=equity,
+            day_date=local_now.date().isoformat(),
+            week_start_date=_week_start_date(local_now),
+        )
+        breaches: list[str] = []
+        if metrics["daily_loss_pct"] <= float(self.settings.daily_loss_halt_pct):
+            breaches.append(
+                f"daily loss {metrics['daily_loss_pct']:.2f}% <= {float(self.settings.daily_loss_halt_pct):.2f}%"
+            )
+        if metrics["weekly_loss_pct"] <= float(self.settings.weekly_loss_halt_pct):
+            breaches.append(
+                f"weekly loss {metrics['weekly_loss_pct']:.2f}% <= {float(self.settings.weekly_loss_halt_pct):.2f}%"
+            )
+        if metrics["peak_drawdown_pct"] <= float(self.settings.peak_drawdown_halt_pct):
+            breaches.append(
+                f"peak drawdown {metrics['peak_drawdown_pct']:.2f}% <= {float(self.settings.peak_drawdown_halt_pct):.2f}%"
+            )
+        if not breaches:
+            return metrics
+
+        reason = "account risk halt: " + "; ".join(breaches)
+        await append_journal_entry(content=f"Account risk halt triggered. {reason}. Metrics {metrics}.")
+        await self._notify_once("account-risk-halt", f"ACCOUNT RISK HALT: {reason}")
+        await self._halt_and_flatten(reason)
+        return metrics
 
     async def reconcile_once(self, *, days: int | None = None) -> int:
         lookback = int(days if days is not None else self.settings.reconcile_lookback_days)
@@ -489,6 +545,12 @@ class TradingSupervisor:
             today_new_entries = await count_entry_orders_since(local_day_start.astimezone(UTC).isoformat())
         except Exception as e:
             errors.append(f"durable entry count unavailable: {e}")
+
+        try:
+            if account is not None and account.get("status") == "CONNECTED":
+                await self._enforce_account_risk_halts(account)
+        except Exception as e:
+            errors.append(f"account risk halt check failed: {e}")
 
         if errors:
             alert = "SUPERVISOR WARNING: " + "; ".join(errors)
