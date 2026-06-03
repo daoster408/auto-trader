@@ -226,4 +226,13 @@ Before live money:
 - Keep Telegram allowlist populated.
 - Start with minimal capital.
 - Confirm paper evidence covers entries, exits, rejects, reconnects, `/kill`, restart, and reporting.
+- Run the live cutover preflight from the intended runner:
+
+```bash
+scripts/live_preflight.sh --max-equity 500 --max-new-positions 3
+```
+
+- The preflight is read-only against Alpaca and the production DB. Its embedded halt drill and account-risk rehearsal use temp SQLite DBs plus fake broker adapters; they do not submit, cancel, or flatten real broker state.
+- Default preflight should run while `ALPACA_PAPER=true` and should fail if there are open positions, open orders, pending exits, unsafe shutdown config, missing planned-deploy capability, failed account-risk rehearsal, or failed halt drill.
+- After a reviewed switch to `ALPACA_PAPER=false`, rerun only with `--allow-current-live`; use `--allow-open-positions` only for a reviewed in-position validation window.
 - Get explicit live cutover approval.

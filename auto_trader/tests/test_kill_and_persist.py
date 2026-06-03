@@ -17,12 +17,14 @@ from pydantic import ValidationError
 from auto_trader.core.models import SystemState, KillResult, TradeIntent
 from auto_trader.account_risk_validate import (
     AccountRiskScenario,
+    ValidationGate as AccountRiskValidationGate,
     build_account_risk_validation_report,
     evaluate_account_risk_scenario,
     rehearse_supervisor_account_halt,
     validation_exit_code as account_risk_validation_exit_code,
 )
 from auto_trader.day3_validate import build_day3_validation_report, validation_exit_code
+from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.comms.telegram_bot import TelegramBot
@@ -91,6 +93,12 @@ class DummyDay3Settings:
     alpaca_paper = True
     auto_entry_enabled = False
     auto_exit_enabled = True
+    shutdown_flatten_on_exit = True
+    max_new_positions_per_day = 1
+
+
+class DummyLivePreflightSettings(DummyDay3Settings):
+    pass
 
 
 def _day3_account_snapshot():
@@ -336,6 +344,108 @@ async def test_account_risk_supervisor_halt_rehearsal_passes():
     assert "[PASS] peak-drawdown notification emitted" in report
     assert "[PASS] peak-drawdown journal entry written" in report
     assert account_risk_validation_exit_code(gates) == 0
+
+
+@pytest.mark.asyncio
+async def test_live_preflight_halt_drill_passes_without_broker():
+    drill = await rehearse_halt_drill()
+
+    assert "Overall: PASS" in drill.report
+    assert "[PASS] drill state halted" in drill.report
+    assert "[PASS] drill cancel path called" in drill.report
+    assert "[PASS] drill flatten path called" in drill.report
+    assert "[PASS] drill broker isolated" in drill.report
+    assert account_risk_validation_exit_code(drill.gates) == 0
+
+
+def test_live_preflight_report_passes_clean_cutover_state():
+    _, account_risk_gates = build_account_risk_validation_report(settings=DummySettings(), base_equity=400.0)
+    halt_drill_gates = [
+        AccountRiskValidationGate(name="drill", status="PASS", detail="ok"),
+    ]
+
+    report, gates = build_live_preflight_report(
+        settings=DummyLivePreflightSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+            "equity": 398.0,
+        },
+        clock={"is_open": True, "source": "alpaca"},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={
+            "auto_entry_enabled": "true",
+            "auto_exit_enabled": "true",
+            "max_new_positions_per_day": "3",
+            "runtime_capability_planned_maintenance_shutdown": "true",
+            "runtime_capability_planned_maintenance_pid": "123",
+        },
+        account_risk_gates=account_risk_gates,
+        halt_drill_gates=halt_drill_gates,
+        max_equity=500.0,
+        max_new_positions=3,
+    )
+
+    assert "Overall: PASS" in report
+    assert "[PASS] open positions clear" in report
+    assert "[PASS] account-risk rehearsal passed" in report
+    assert account_risk_validation_exit_code(gates) == 0
+
+
+def test_live_preflight_report_fails_unsafe_cutover_state():
+    _, account_risk_gates = build_account_risk_validation_report(settings=DummySettings(), base_equity=400.0)
+    halt_drill_gates = [
+        AccountRiskValidationGate(name="drill", status="PASS", detail="ok"),
+    ]
+
+    report, gates = build_live_preflight_report(
+        settings=type(
+            "LiveSettings",
+            (),
+            {
+                "alpaca_paper": False,
+                "shutdown_flatten_on_exit": False,
+                "auto_entry_enabled": True,
+                "auto_exit_enabled": True,
+                "max_new_positions_per_day": 5,
+            },
+        )(),
+        system_state=SystemState.PAUSED,
+        system_meta={"halt_reason": "not ready"},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+            "equity": 750.0,
+        },
+        clock={"is_open": True, "source": "alpaca"},
+        positions=[{"symbol": "POET", "qty": 1.0}],
+        open_orders=[{"symbol": "POET", "status": "accepted"}],
+        pending_exits=[{"symbol": "POET"}],
+        runtime_config={
+            "auto_exit_enabled": "true",
+            "max_new_positions_per_day": "5",
+        },
+        account_risk_gates=account_risk_gates,
+        halt_drill_gates=halt_drill_gates,
+        max_equity=500.0,
+        max_new_positions=3,
+    )
+
+    assert "Overall: FAIL" in report
+    assert "[FAIL] current mode safe for preflight" in report
+    assert "[FAIL] shutdown flatten enabled" in report
+    assert "[FAIL] system state active" in report
+    assert "[FAIL] open positions clear" in report
+    assert "[FAIL] pending exits clear" in report
+    assert account_risk_validation_exit_code(gates) == 2
 
 
 def test_day3_validation_fails_duplicate_close_orders():
