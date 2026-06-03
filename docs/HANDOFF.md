@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-03T15:19:30Z
-- Last updated local (`America/Los_Angeles`): 2026-06-03 08:19:30 PDT
+- Last updated UTC: 2026-06-03T15:56:18Z
+- Last updated local (`America/Los_Angeles`): 2026-06-03 08:56:18 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -174,6 +174,17 @@ Quick resume file for any AI session. Update at end of every work session.
     - nonessential discovery/snapshot scanning is deferred first if the budget becomes hot;
     - latest verification: `57 passed`, compileall passed, `git diff --check` clean;
     - local bot restarted onto this code with `auto_entry=False`, `auto_exit=True`.
+  - Oracle VM prep completed to safe staging point:
+    - SSH works with user `ubuntu`;
+    - VM is Ubuntu 24.04.4 LTS with Python 3.12, about 45GB disk, about 1GB RAM;
+    - source tree copied to `/opt/auto-trader` without `.env`, `.git`, local DB, venv, key files, or caches;
+    - dedicated `auto-trader` system user created;
+    - virtualenv created and project installed;
+    - private server `.env` installed as `auto-trader:auto-trader` with mode `600`;
+    - server-safe flags set: `ALPACA_PAPER=true`, `AUTO_ENTRY_ENABLED=false`, `AUTO_EXIT_ENABLED=true`, `SHUTDOWN_FLATTEN_ON_EXIT=true`, `MAX_NEW_POSITIONS_PER_DAY=1`;
+    - systemd service installed at `/etc/systemd/system/auto-trader.service`;
+    - service is `disabled` and `inactive`;
+    - read-only POET validation on Oracle passed without starting Telegram polling or supervisor.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -199,9 +210,10 @@ Quick resume file for any AI session. Update at end of every work session.
 
 1. Keep the current local bot running for supervised paper burn-in.
 2. Confirm Telegram `/status` shows no open positions, `Today new entries: 1 / 1`, and pending exits clear.
-3. Decide whether Oracle VM becomes the next work item or AI/Finnhub research scaffolding starts first.
-4. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-5. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+3. Do not start Oracle service until intentionally migrating the single active runner from laptop to Oracle.
+4. Decide whether next work is Oracle migration rehearsal or AI/Finnhub research scaffolding.
+5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 

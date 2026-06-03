@@ -403,6 +403,53 @@ Append-only by day. Do not remove past entries.
 - Confidence:
   - high
 
+## 2026-06-03 (America/Los_Angeles) - Oracle VM Prep
+
+- Date (local): 2026-06-03
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - SSH connectivity to Oracle VM is working.
+  - Confirmed VM OS/resources:
+    - Ubuntu 24.04.4 LTS;
+    - Python 3.12 available;
+    - about 45GB root disk;
+    - about 1GB RAM.
+  - Installed required system packages:
+    - `python3.12-venv`;
+    - `python3-pip`;
+    - `sqlite3`;
+    - build dependencies.
+  - Copied the local source tree to `/opt/auto-trader` without `.env`, `.git`, local DB, venv, key files, or caches.
+  - Created dedicated system user `auto-trader`.
+  - Created `/opt/auto-trader/.venv` and installed the project.
+  - Installed private server `.env` with locked permissions.
+  - Forced server-safe env flags:
+    - `ALPACA_PAPER=true`;
+    - `AUTO_ENTRY_ENABLED=false`;
+    - `AUTO_EXIT_ENABLED=true`;
+    - `SHUTDOWN_FLATTEN_ON_EXIT=true`;
+    - `MAX_NEW_POSITIONS_PER_DAY=1`.
+  - Installed systemd service file at `/etc/systemd/system/auto-trader.service`.
+  - Explicitly left Oracle service disabled and inactive.
+  - Ran read-only POET validation on Oracle without starting Telegram polling or supervisor.
+- IN_PROGRESS:
+  - Laptop remains the only active bot runner.
+- NEXT:
+  - Do not start Oracle service until intentionally migrating the single active runner.
+  - Before migration, stop the laptop bot cleanly and confirm no second Telegram poller is active.
+- BLOCKED:
+  - None for VM prep.
+- Evidence:
+  - `systemctl is-enabled auto-trader` on Oracle -> `disabled`.
+  - `systemctl is-active auto-trader` on Oracle -> `inactive`.
+  - Oracle `.env` owner/mode -> `auto-trader:auto-trader`, `600`.
+  - Oracle validation: `scripts/day3_validate` equivalent for `POET` -> `Overall: PASS`; position gone; pending marker clear.
+  - Local laptop bot process remains running.
+- Confidence:
+  - high
+
 ## 2026-06-01 (America/Los_Angeles) - GROK Session
 
 - Date (local): 2026-06-01
