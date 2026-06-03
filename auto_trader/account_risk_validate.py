@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import sqlite3
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
@@ -197,25 +198,81 @@ class _RehearsalOrderManager:
     pass
 
 
-async def rehearse_supervisor_account_halt(
+@dataclass(frozen=True)
+class _SupervisorHaltRehearsalScenario:
+    name: str
+    equity: float
+    day_start_equity: float
+    week_start_equity: float
+    peak_equity: float
+    expected_breach: str
+
+
+def _supervisor_rehearsal_scenarios(
+    *,
+    base_equity: float,
+    daily_shock_pct: float,
+) -> list[_SupervisorHaltRehearsalScenario]:
+    daily_equity = base_equity * (1.0 + daily_shock_pct / 100.0)
+    weekly_equity = base_equity * 0.95
+    return [
+        _SupervisorHaltRehearsalScenario(
+            name="daily-loss",
+            equity=daily_equity,
+            day_start_equity=base_equity,
+            week_start_equity=base_equity,
+            peak_equity=base_equity,
+            expected_breach="daily loss",
+        ),
+        _SupervisorHaltRehearsalScenario(
+            name="weekly-loss",
+            equity=weekly_equity,
+            day_start_equity=weekly_equity,
+            week_start_equity=base_equity,
+            peak_equity=base_equity,
+            expected_breach="weekly loss",
+        ),
+        _SupervisorHaltRehearsalScenario(
+            name="peak-drawdown",
+            equity=base_equity,
+            day_start_equity=base_equity,
+            week_start_equity=base_equity,
+            peak_equity=base_equity * 1.07,
+            expected_breach="peak drawdown",
+        ),
+    ]
+
+
+def _override_rehearsal_baselines(
+    *,
+    db_path: Path,
+    day_start_equity: float,
+    week_start_equity: float,
+    peak_equity: float,
+) -> None:
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            """
+            UPDATE account_risk_state
+            SET day_start_equity = ?, week_start_equity = ?, peak_equity = ?
+            WHERE id = 1
+            """,
+            (day_start_equity, week_start_equity, peak_equity),
+        )
+        db.commit()
+
+
+async def _run_supervisor_rehearsal_scenario(
     *,
     settings: Any,
-    base_equity: float,
-    shock_pct: float = -2.0,
-) -> tuple[str, list[ValidationGate]]:
-    """Run the real supervisor account-halt path in a temp DB with a fake broker."""
-    if shock_pct >= 0:
-        raise ValueError("shock_pct must be negative")
-
+    scenario: _SupervisorHaltRehearsalScenario,
+) -> tuple[list[str], list[ValidationGate]]:
     gates: list[ValidationGate] = []
-    lines = [
-        "SUPERVISOR ACCOUNT HALT REHEARSAL",
-        f"Base equity: ${base_equity:,.2f}",
-        f"Shock: {shock_pct:.2f}%",
-        "",
-    ]
+    lines = [f"{scenario.name}:"]
+
     with tempfile.TemporaryDirectory() as tmp:
-        configure_db_path(Path(tmp) / "account_risk_rehearsal.db")
+        db_path = Path(tmp) / f"{scenario.name}_account_risk_rehearsal.db"
+        configure_db_path(db_path)
         await init_db()
 
         async def persist_state(state: SystemState, reason: str | None) -> None:
@@ -226,9 +283,15 @@ async def rehearse_supervisor_account_halt(
         day_date = local_now.date().isoformat()
         week_start = _week_start_date(local_now)
         await update_account_risk_state(
-            equity=base_equity,
+            equity=scenario.equity,
             day_date=day_date,
             week_start_date=week_start,
+        )
+        _override_rehearsal_baselines(
+            db_path=db_path,
+            day_start_equity=scenario.day_start_equity,
+            week_start_equity=scenario.week_start_equity,
+            peak_equity=scenario.peak_equity,
         )
 
         notifications: list[str] = []
@@ -245,56 +308,87 @@ async def rehearse_supervisor_account_halt(
             order_manager=_RehearsalOrderManager(),  # type: ignore[arg-type]
             notifier=notify,
         )
-        shocked_equity = base_equity * (1.0 + shock_pct / 100.0)
-        metrics = await supervisor._enforce_account_risk_halts({"equity": shocked_equity})
+        metrics = await supervisor._enforce_account_risk_halts({"equity": scenario.equity})
         persisted_state, persisted_meta = await load_system_state()
         journal_entries = await get_latest_journal_entries(limit=5)
-
-        checks = [
-            (
-                "state halted",
-                state_machine.state == SystemState.HALTED and persisted_state == SystemState.HALTED,
-                f"memory={state_machine.state.value}, persisted={persisted_state.value}",
-            ),
-            (
-                "halt reason persisted",
-                "account risk halt" in str(persisted_meta.get("halt_reason", "")),
-                f"reason={persisted_meta.get('halt_reason')}",
-            ),
-            (
-                "cancel orders called",
-                adapter.cancel_calls == 1,
-                f"cancel_calls={adapter.cancel_calls}",
-            ),
-            (
-                "flatten positions called",
-                adapter.flatten_calls == 1,
-                f"flatten_calls={adapter.flatten_calls}",
-            ),
-            (
-                "notification emitted",
-                any("ACCOUNT RISK HALT" in message for message in notifications),
-                f"notifications={len(notifications)}",
-            ),
-            (
-                "journal entry written",
-                any("Account risk halt triggered" in str(entry.get("content", "")) for entry in journal_entries),
-                f"journal_entries={len(journal_entries)}",
-            ),
-        ]
+        halt_reason = str(persisted_meta.get("halt_reason", ""))
 
         lines.append(
-            "Metrics: "
+            "  Metrics: "
             f"daily={metrics['daily_loss_pct']:.2f}%, "
             f"weekly={metrics['weekly_loss_pct']:.2f}%, "
             f"peak_drawdown={metrics['peak_drawdown_pct']:.2f}%"
         )
-        lines.append("")
-        lines.append("Gates:")
+        checks = [
+            (
+                f"{scenario.name} expected breach",
+                scenario.expected_breach in halt_reason,
+                f"reason={persisted_meta.get('halt_reason')}",
+            ),
+            (
+                f"{scenario.name} state halted",
+                state_machine.state == SystemState.HALTED and persisted_state == SystemState.HALTED,
+                f"memory={state_machine.state.value}, persisted={persisted_state.value}",
+            ),
+            (
+                f"{scenario.name} halt reason persisted",
+                "account risk halt" in halt_reason,
+                f"reason={persisted_meta.get('halt_reason')}",
+            ),
+            (
+                f"{scenario.name} cancel orders called",
+                adapter.cancel_calls == 1,
+                f"cancel_calls={adapter.cancel_calls}",
+            ),
+            (
+                f"{scenario.name} flatten positions called",
+                adapter.flatten_calls == 1,
+                f"flatten_calls={adapter.flatten_calls}",
+            ),
+            (
+                f"{scenario.name} notification emitted",
+                any("ACCOUNT RISK HALT" in message for message in notifications),
+                f"notifications={len(notifications)}",
+            ),
+            (
+                f"{scenario.name} journal entry written",
+                any("Account risk halt triggered" in str(entry.get("content", "")) for entry in journal_entries),
+                f"journal_entries={len(journal_entries)}",
+            ),
+        ]
         for name, ok, detail in checks:
             status = "PASS" if ok else "FAIL"
             gates.append(ValidationGate(name=name, status=status, detail=detail))
-            lines.append(f"- [{status}] {name}: {detail}")
+            lines.append(f"  - [{status}] {name}: {detail}")
+
+    return lines, gates
+
+
+async def rehearse_supervisor_account_halt(
+    *,
+    settings: Any,
+    base_equity: float,
+    shock_pct: float = -2.0,
+) -> tuple[str, list[ValidationGate]]:
+    """Run the real supervisor account-halt path in a temp DB with a fake broker."""
+    if shock_pct >= 0:
+        raise ValueError("shock_pct must be negative")
+
+    gates: list[ValidationGate] = []
+    lines = [
+        "SUPERVISOR ACCOUNT HALT REHEARSAL",
+        f"Base equity: ${base_equity:,.2f}",
+        f"Daily shock: {shock_pct:.2f}%",
+        "",
+        "Scenarios:",
+    ]
+    for scenario in _supervisor_rehearsal_scenarios(base_equity=base_equity, daily_shock_pct=shock_pct):
+        scenario_lines, scenario_gates = await _run_supervisor_rehearsal_scenario(
+            settings=settings,
+            scenario=scenario,
+        )
+        lines.extend(scenario_lines)
+        gates.extend(scenario_gates)
 
     overall = "FAIL" if any(gate.status == "FAIL" for gate in gates) else "PASS"
     lines.insert(1, f"Overall: {overall}")
@@ -313,7 +407,7 @@ def main() -> None:
         "--shock-pct",
         type=float,
         default=-2.0,
-        help="Synthetic equity shock percentage for --rehearse-supervisor-halt.",
+        help="Synthetic daily-loss equity shock percentage for --rehearse-supervisor-halt.",
     )
     args = parser.parse_args()
 

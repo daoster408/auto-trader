@@ -271,6 +271,7 @@ def test_account_risk_validation_dry_run_scenarios_pass():
     assert "Overall: PASS" in report
     assert "[PASS] healthy" in report
     assert "[PASS] daily-loss-breach" in report
+    assert "[PASS] weekly-loss-breach" in report
     assert "[PASS] peak-drawdown-breach" in report
     assert account_risk_validation_exit_code(gates) == 0
 
@@ -327,11 +328,13 @@ async def test_account_risk_supervisor_halt_rehearsal_passes():
     )
 
     assert "Overall: PASS" in report
-    assert "[PASS] state halted" in report
-    assert "[PASS] cancel orders called" in report
-    assert "[PASS] flatten positions called" in report
-    assert "[PASS] notification emitted" in report
-    assert "[PASS] journal entry written" in report
+    assert "[PASS] daily-loss expected breach" in report
+    assert "[PASS] weekly-loss expected breach" in report
+    assert "[PASS] peak-drawdown expected breach" in report
+    assert "[PASS] daily-loss cancel orders called" in report
+    assert "[PASS] weekly-loss flatten positions called" in report
+    assert "[PASS] peak-drawdown notification emitted" in report
+    assert "[PASS] peak-drawdown journal entry written" in report
     assert account_risk_validation_exit_code(gates) == 0
 
 
