@@ -348,13 +348,17 @@ Append-only by day. Do not remove past entries.
     - quantity `1.365320`;
     - market value about `$20.24`;
     - unrealized P/L about `$0.28`.
+  - POET later auto-exited through the trailing-stop rule:
+    - exit reason `position trailing stop reached`;
+    - trailing drawdown about `-6.06%`;
+    - close order id `8d620fa9-a1f6-448d-ac1e-e64a87c32f58`;
+    - sell quantity `1.36532`;
+    - filled avg `$14.10`.
 - IN_PROGRESS:
-  - POET paper position is being monitored by the supervisor with auto-entry disabled and auto-exit enabled.
+  - No open paper position after POET completed its entry-to-exit lifecycle.
 - NEXT:
-  - Confirm Telegram `/status` shows `Today new entries: 1 / 1` and blocks any second entry.
-  - Confirm `/report` shows POET position and latest POET order.
-  - Keep observing auto-exit behavior for POET under the existing exit rules.
-  - After the one-entry lifecycle is stable, decide whether to prep Oracle VM or start AI/Finnhub research scaffolding.
+  - Confirm Telegram `/status` shows no open positions, `Today new entries: 1 / 1`, and pending exits clear.
+  - Decide whether the next Day 3 work is Oracle VM prep or AI/Finnhub research scaffolding.
 - BLOCKED:
   - None.
 - Evidence:
@@ -363,6 +367,8 @@ Append-only by day. Do not remove past entries.
   - First position monitor: `POET: qty 1.365320, value $19.87, P/L $-0.09 (-0.44%)`.
   - Post-entry-disable restart alert: `auto_entry=False, auto_exit=True`.
   - Latest position monitor: `POET: qty 1.365320, value $20.24, P/L $0.28 (1.40%)`.
+  - Exit journal: `Auto-exit submitted for POET: position trailing stop reached`.
+  - POET order lifecycle: buy filled at `$14.62`, sell filled at `$14.10`.
 - Confidence:
   - high
 
@@ -384,10 +390,9 @@ Append-only by day. Do not remove past entries.
     - rolling endpoint counts and nonessential blocking at critical threshold;
     - snapshot discovery being deferred before a network call when the budget is hot.
 - IN_PROGRESS:
-  - Local bot should be restarted onto this code so POET monitoring uses the new internal guard.
+  - Local bot is running on the quiet API budget guard code.
 - NEXT:
-  - Restart local bot with `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=true`.
-  - Continue observing POET.
+  - Continue paper burn-in with `AUTO_ENTRY_ENABLED=false` and `AUTO_EXIT_ENABLED=true`.
 - BLOCKED:
   - None.
 - Evidence:
