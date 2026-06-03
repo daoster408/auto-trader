@@ -30,6 +30,7 @@ from auto_trader.persistence.db import (
     get_latest_order_records,
     get_pending_exits,
     get_runtime_config_bool,
+    get_runtime_config_int,
     get_runtime_config_values,
     reconcile_broker_orders,
     set_runtime_config_value,
@@ -147,6 +148,16 @@ def _entry_status(
     if today_new_entries >= max_positions:
         return "blocked by daily-entry limit"
     return "allowed"
+
+
+def _runtime_int_from_values(values: dict[str, Any], key: str, *, default: int) -> int:
+    value = values.get(key)
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 class TelegramBot:
@@ -349,7 +360,11 @@ class TelegramBot:
             cash=float(account.get("cash") or 0.0),
             open_positions=positions,
         )
-        max_positions = int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1)
+        max_positions = _runtime_int_from_values(
+            runtime_config,
+            "max_new_positions_per_day",
+            default=int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1),
+        )
         account_tradable = (
             account.get("status") == "CONNECTED"
             and "active" in str(account.get("account_status", "")).lower()
@@ -389,16 +404,29 @@ class TelegramBot:
             "auto_entry_enabled",
             default=bool(getattr(self.risk.settings, "auto_entry_enabled", False)),
         )
-        source = "runtime" if "auto_entry_enabled" in values else "env default"
+        max_new_positions = await get_runtime_config_int(
+            "max_new_positions_per_day",
+            default=int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1),
+            minimum=1,
+            maximum=self._max_runtime_entries_allowed(),
+        )
+        auto_entry_source = "runtime" if "auto_entry_enabled" in values else "env default"
+        max_positions_source = "runtime" if "max_new_positions_per_day" in values else "env default"
         return "\n".join(
             [
                 "RUNTIME CONFIG",
-                f"auto_entry_enabled: {auto_entry} ({source})",
+                f"auto_entry_enabled: {auto_entry} ({auto_entry_source})",
                 f"auto_exit_enabled: {bool(getattr(self.risk.settings, 'auto_exit_enabled', False))} (env)",
-                f"max_new_positions_per_day: {getattr(self.risk.settings, 'max_new_positions_per_day', 'unknown')} (env)",
+                f"max_new_positions_per_day: {max_new_positions} ({max_positions_source})",
                 "Use: /config auto_entry on | /config auto_entry off",
+                f"     /config max_entries 1-{self._max_runtime_entries_allowed()}",
             ]
         )
+
+    def _max_runtime_entries_allowed(self) -> int:
+        if bool(getattr(self.adapter, "paper", False)):
+            return 3
+        return int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1)
 
     def _build_report_message(self, snapshot: dict[str, Any]) -> str:
         account = snapshot.get("account") or {}
@@ -531,25 +559,57 @@ class TelegramBot:
         if not args:
             await update.message.reply_text(await self._build_config_message())
             return
-        if len(args) != 2 or args[0] not in {"auto_entry", "auto_entry_enabled", "entry"}:
-            await update.message.reply_text("Use: /config auto_entry on | /config auto_entry off")
+        if len(args) != 2:
+            await update.message.reply_text(
+                "Use: /config auto_entry on | /config auto_entry off; "
+                f"/config max_entries 1-{self._max_runtime_entries_allowed()}"
+            )
             return
+        key = args[0]
         raw_value = args[1]
-        if raw_value not in {"on", "off", "true", "false", "1", "0", "enabled", "disabled"}:
-            await update.message.reply_text("Use: /config auto_entry on | /config auto_entry off")
+        if key in {"auto_entry", "auto_entry_enabled", "entry"}:
+            if raw_value not in {"on", "off", "true", "false", "1", "0", "enabled", "disabled"}:
+                await update.message.reply_text("Use: /config auto_entry on | /config auto_entry off")
+                return
+            enabled = raw_value in {"on", "true", "1", "enabled"}
+            persisted = await set_runtime_config_value("auto_entry_enabled", "true" if enabled else "false")
+            if not persisted:
+                await update.message.reply_text("Runtime config update failed. Auto-entry unchanged.")
+                return
+            await append_journal_entry(content=f"Runtime config updated: auto_entry_enabled={enabled}.")
+            state_note = "" if self.sm.can_trade() else f" State is {self.sm.state.value}, so entries remain blocked."
+            await update.message.reply_text(f"Runtime auto-entry set to {enabled}.{state_note}")
+            log.warning(
+                "runtime_auto_entry_updated",
+                enabled=enabled,
+                user=update.effective_user.username if update.effective_user else "unknown",
+            )
             return
-        enabled = raw_value in {"on", "true", "1", "enabled"}
-        persisted = await set_runtime_config_value("auto_entry_enabled", "true" if enabled else "false")
-        if not persisted:
-            await update.message.reply_text("Runtime config update failed. Auto-entry unchanged.")
+        if key in {"max_entries", "max_new_positions_per_day", "daily_entries"}:
+            try:
+                max_entries = int(raw_value)
+            except ValueError:
+                await update.message.reply_text(f"Use: /config max_entries 1-{self._max_runtime_entries_allowed()}")
+                return
+            max_allowed = self._max_runtime_entries_allowed()
+            if max_entries < 1 or max_entries > max_allowed:
+                await update.message.reply_text(f"Use: /config max_entries 1-{max_allowed}")
+                return
+            persisted = await set_runtime_config_value("max_new_positions_per_day", str(max_entries))
+            if not persisted:
+                await update.message.reply_text("Runtime config update failed. Entry cap unchanged.")
+                return
+            await append_journal_entry(content=f"Runtime config updated: max_new_positions_per_day={max_entries}.")
+            await update.message.reply_text(f"Runtime max entries per day set to {max_entries}.")
+            log.warning(
+                "runtime_max_entries_updated",
+                max_entries=max_entries,
+                user=update.effective_user.username if update.effective_user else "unknown",
+            )
             return
-        await append_journal_entry(content=f"Runtime config updated: auto_entry_enabled={enabled}.")
-        state_note = "" if self.sm.can_trade() else f" State is {self.sm.state.value}, so entries remain blocked."
-        await update.message.reply_text(f"Runtime auto-entry set to {enabled}.{state_note}")
-        log.warning(
-            "runtime_auto_entry_updated",
-            enabled=enabled,
-            user=update.effective_user.username if update.effective_user else "unknown",
+        await update.message.reply_text(
+            "Use: /config auto_entry on | /config auto_entry off; "
+            f"/config max_entries 1-{self._max_runtime_entries_allowed()}"
         )
 
     async def _unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

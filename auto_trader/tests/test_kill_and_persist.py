@@ -38,6 +38,7 @@ from auto_trader.persistence.db import (
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
     get_runtime_config_bool,
+    get_runtime_config_int,
     get_runtime_config_value,
     get_runtime_config_values,
     init_db,
@@ -155,6 +156,9 @@ def patch_empty_pending_exit_state(monkeypatch):
     async def fake_runtime_config_bool(key, *, default):
         return default
 
+    async def fake_runtime_config_int(key, *, default, minimum=None, maximum=None):
+        return default
+
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_symbols", fake_pending_symbols)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.upsert_pending_exit", fake_pending_upsert)
@@ -165,6 +169,7 @@ def patch_empty_pending_exit_state(monkeypatch):
         fake_healthy_account_risk_state,
     )
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_runtime_config_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_int", fake_runtime_config_int)
 
 
 async def fake_healthy_account_risk_state(*, equity, day_date, week_start_date):
@@ -450,6 +455,22 @@ async def test_runtime_config_bool_roundtrip_and_default():
 
 
 @pytest.mark.asyncio
+async def test_runtime_config_int_roundtrip_and_bounds():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "runtime_config_int.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        assert await get_runtime_config_int("max_new_positions_per_day", default=1, minimum=1, maximum=3) == 1
+        assert await set_runtime_config_value("max_new_positions_per_day", "3") is True
+        assert await get_runtime_config_int("max_new_positions_per_day", default=1, minimum=1, maximum=3) == 3
+
+        assert await set_runtime_config_value("max_new_positions_per_day", "4") is True
+        with pytest.raises(ValueError, match="above maximum"):
+            await get_runtime_config_int("max_new_positions_per_day", default=1, minimum=1, maximum=3)
+
+
+@pytest.mark.asyncio
 async def test_load_failure_or_corruption_defaults_to_halted():
     """If the DB is garbage or unreadable, we must still default to HALTED (never ACTIVE)."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -664,6 +685,23 @@ def test_risk_engine_blocks_durable_daily_entry_limit_after_restart():
 
     assert decision.approved is False
     assert decision.reason == "Durable daily new position limit reached"
+
+
+def test_risk_engine_uses_runtime_entry_cap_from_snapshot():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, DummySettings())
+    intent = TradeIntent(symbol="MSFT", side="long", entry_price=23.89)
+
+    class RuntimeCapSnapshot:
+        equity = 100.0
+        open_positions = []
+        today_new_entries = 1
+        max_new_positions_per_day = 3
+
+    decision = risk.evaluate(intent, RuntimeCapSnapshot())
+
+    assert decision.approved is True
+    assert decision.sized_quantity is not None
 
 
 def test_risk_engine_blocks_missing_durable_daily_entry_count():
@@ -1107,7 +1145,7 @@ async def test_telegram_authorized_status_reads_snapshot(monkeypatch):
             "orders": [],
             "reconciled": 0,
             "today_new_entries": 0,
-            "runtime_config": {"auto_entry_enabled": "true"},
+            "runtime_config": {"auto_entry_enabled": "true", "max_new_positions_per_day": "3"},
             "errors": [],
         }
 
@@ -1118,6 +1156,7 @@ async def test_telegram_authorized_status_reads_snapshot(monkeypatch):
 
     assert "AUTO-TRADER STATUS" in update.message.replies[0]
     assert "New entries: allowed" in update.message.replies[0]
+    assert "Today new entries: 0 / 3" in update.message.replies[0]
 
 
 def test_telegram_status_surfaces_runtime_auto_entry_disabled():
@@ -1172,6 +1211,10 @@ async def test_telegram_config_handler_sets_auto_entry(monkeypatch):
         value = stored.get(key)
         return default if value is None else value == "true"
 
+    async def fake_int(key, *, default, minimum=None, maximum=None):
+        value = stored.get(key)
+        return default if value is None else int(value)
+
     async def fake_journal(**kwargs):
         journal.append(kwargs["content"])
         return 1
@@ -1179,6 +1222,7 @@ async def test_telegram_config_handler_sets_auto_entry(monkeypatch):
     monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_int", fake_int)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
 
     bot = TelegramBot(
@@ -1199,23 +1243,67 @@ async def test_telegram_config_handler_sets_auto_entry(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_telegram_config_handler_shows_runtime_config(monkeypatch):
+async def test_telegram_config_handler_sets_max_entries(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+    journal = []
 
-    async def fake_values():
-        return {"auto_entry_enabled": "true"}
+    class PaperAdapter:
+        paper = True
 
-    async def fake_bool(key, *, default):
+    async def fake_set(key, value):
+        stored[key] = value
         return True
 
-    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
-    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_bool", fake_bool)
+    async def fake_journal(**kwargs):
+        journal.append(kwargs["content"])
+        return 1
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
 
     bot = TelegramBot(
         token="token",
         state_machine=sm,
         risk_engine=RiskEngine(sm, DummySettings()),
-        adapter=object(),
+        adapter=PaperAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["max_entries", "3"]))
+
+    assert stored == {"max_new_positions_per_day": "3"}
+    assert update.message.replies == ["Runtime max entries per day set to 3."]
+    assert journal == ["Runtime config updated: max_new_positions_per_day=3."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_shows_runtime_config(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    async def fake_values():
+        return {"auto_entry_enabled": "true", "max_new_positions_per_day": "3"}
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_int(key, *, default, minimum=None, maximum=None):
+        return 3
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_int", fake_int)
+
+    class PaperAdapter:
+        paper = True
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=PaperAdapter(),
         resume_token="resume",
         allowed_ids=[123],
     )
@@ -1225,6 +1313,7 @@ async def test_telegram_config_handler_shows_runtime_config(monkeypatch):
 
     assert "RUNTIME CONFIG" in update.message.replies[0]
     assert "auto_entry_enabled: True (runtime)" in update.message.replies[0]
+    assert "max_new_positions_per_day: 3 (runtime)" in update.message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -1916,6 +2005,9 @@ async def test_supervisor_persisted_pending_exit_suppresses_close_after_restart(
     async def fake_runtime_config_bool(key, *, default):
         return default
 
+    async def fake_runtime_config_int(key, *, default, minimum=None, maximum=None):
+        return default
+
     async def fake_notify(message):
         notifications.append(message)
 
@@ -1927,6 +2019,7 @@ async def test_supervisor_persisted_pending_exit_suppresses_close_after_restart(
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.update_account_risk_state", fake_account_risk_state)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_runtime_config_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_int", fake_runtime_config_int)
 
     adapter = FakeAdapter()
     supervisor = TradingSupervisor(
@@ -2250,6 +2343,9 @@ async def test_supervisor_broker_open_close_order_suppresses_and_persists(monkey
     async def fake_runtime_config_bool(key, *, default):
         return default
 
+    async def fake_runtime_config_int(key, *, default, minimum=None, maximum=None):
+        return default
+
     async def fake_notify(message):
         notifications.append(message)
 
@@ -2265,6 +2361,7 @@ async def test_supervisor_broker_open_close_order_suppresses_and_persists(monkey
         fake_healthy_account_risk_state,
     )
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_runtime_config_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_int", fake_runtime_config_int)
 
     adapter = FakeAdapter()
     supervisor = TradingSupervisor(
@@ -2853,6 +2950,84 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
 
     assert result.entry_result["order"]["id"] == "entry-1"
     assert manager.calls[0][0].symbol == "AMPX"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_auto_entry_uses_runtime_entry_cap(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class EntrySettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        max_new_positions_per_day = 1
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        def __init__(self):
+            self.snapshots = []
+
+        async def submit_trade_intent(self, intent, snapshot):
+            self.snapshots.append(snapshot)
+            return {"order": {"id": "entry-runtime-cap"}, "risk_decision": {"approved": True}}
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 1
+
+    async def fake_latest_entry(symbol):
+        return None
+
+    async def fake_signals(adapter, max_signals=1):
+        return [TradeIntent(symbol="POET", side="long", entry_price=20.0)]
+
+    async def fake_runtime_config_int(key, *, default, minimum=None, maximum=None):
+        return 3
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    patch_empty_pending_exit_state(monkeypatch)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_int", fake_runtime_config_int)
+
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=EntrySettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=manager,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.entry_result["order"]["id"] == "entry-runtime-cap"
+    assert manager.snapshots[0].today_new_entries == 1
+    assert manager.snapshots[0].max_new_positions_per_day == 3
 
 
 @pytest.mark.asyncio

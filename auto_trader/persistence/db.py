@@ -419,6 +419,29 @@ async def get_runtime_config_bool(key: str, *, default: bool) -> bool:
     raise ValueError(f"invalid boolean runtime config for {key}: {value}")
 
 
+async def get_runtime_config_int(
+    key: str,
+    *,
+    default: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Return a runtime config value parsed as int and validated against explicit bounds."""
+    value = await get_runtime_config_value(key)
+    if value is None:
+        parsed = int(default)
+    else:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"invalid integer runtime config for {key}: {value}") from e
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"runtime config {key} below minimum {minimum}: {parsed}")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"runtime config {key} above maximum {maximum}: {parsed}")
+    return parsed
+
+
 async def get_runtime_config_values() -> dict[str, str]:
     """Return all persisted runtime configuration values."""
     async with _DB_LOCK:

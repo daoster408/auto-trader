@@ -52,6 +52,9 @@ class RiskEngine:
             )
 
         open_positions = getattr(snapshot, "open_positions", [])
+        max_new_positions_per_day = int(
+            getattr(snapshot, "max_new_positions_per_day", self.settings.max_new_positions_per_day)
+        )
         existing_position_symbols = {
             str(p.get("symbol", "")).upper()
             for p in open_positions
@@ -66,17 +69,14 @@ class RiskEngine:
                 model_tag=model_tag,
                 trace_id=trace_id,
             )
-        if (
-            self.settings.max_new_positions_per_day <= 1
-            and len(existing_position_symbols) >= self.settings.max_new_positions_per_day
-        ):
+        if len(existing_position_symbols) >= max_new_positions_per_day:
             return RiskDecision(
                 approved=False,
                 reason="Open position limit reached for v1",
                 sized_quantity=None,
                 risk_metrics={
                     "open_positions": sorted(existing_position_symbols),
-                    "max_new_positions_per_day": self.settings.max_new_positions_per_day,
+                    "max_new_positions_per_day": max_new_positions_per_day,
                 },
                 model_tag=model_tag,
                 trace_id=trace_id,
@@ -93,14 +93,14 @@ class RiskEngine:
                 trace_id=trace_id,
             )
         durable_today_entries = int(durable_today_entries_raw)
-        if durable_today_entries >= self.settings.max_new_positions_per_day:
+        if durable_today_entries >= max_new_positions_per_day:
             return RiskDecision(
                 approved=False,
                 reason="Durable daily new position limit reached",
                 sized_quantity=None,
                 risk_metrics={
                     "today_new_entries": durable_today_entries,
-                    "max_new_positions_per_day": self.settings.max_new_positions_per_day,
+                    "max_new_positions_per_day": max_new_positions_per_day,
                 },
                 model_tag=model_tag,
                 trace_id=trace_id,
@@ -139,7 +139,7 @@ class RiskEngine:
             )
 
         # 3. Max new positions per day (v1 = 1)
-        if self._daily_new_positions >= self.settings.max_new_positions_per_day:
+        if self._daily_new_positions >= max_new_positions_per_day:
             return RiskDecision(
                 approved=False,
                 reason="Daily new position limit reached",

@@ -20,6 +20,7 @@ from auto_trader.persistence.db import (
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
     get_runtime_config_bool,
+    get_runtime_config_int,
     reconcile_broker_orders,
     update_account_risk_state,
     upsert_pending_exit,
@@ -447,6 +448,7 @@ class TradingSupervisor:
         clock: dict[str, Any],
         positions: list[dict[str, Any]],
         today_new_entries: int,
+        max_new_positions_per_day: int,
     ) -> dict[str, Any] | None:
         auto_entry_enabled = await get_runtime_config_bool(
             "auto_entry_enabled",
@@ -468,9 +470,9 @@ class TradingSupervisor:
             await self._notify_once("entry-account-not-tradable", "ENTRY BLOCKED: Alpaca account is not tradable.")
             return None
         open_position_count = sum(1 for p in positions if abs(_float(p.get("qty"))) > 0)
-        if open_position_count >= int(self.settings.max_new_positions_per_day):
+        if open_position_count >= max_new_positions_per_day:
             return None
-        if today_new_entries >= int(self.settings.max_new_positions_per_day):
+        if today_new_entries >= max_new_positions_per_day:
             return None
         open_orders = await self.adapter.get_open_orders()
         open_entry_orders = [order for order in open_orders if _is_open_entry_order(order)]
@@ -494,6 +496,7 @@ class TradingSupervisor:
                 "equity": _float(account.get("equity")),
                 "open_positions": positions,
                 "today_new_entries": today_new_entries,
+                "max_new_positions_per_day": max_new_positions_per_day,
             },
         )()
         result = await self.order_manager.submit_trade_intent(intent, snapshot)
@@ -512,6 +515,7 @@ class TradingSupervisor:
         positions_snapshot_ok = False
         reconciled: int | None = None
         today_new_entries = 0
+        max_new_positions_per_day = int(self.settings.max_new_positions_per_day)
 
         try:
             account = await self.adapter.get_account_snapshot()
@@ -550,6 +554,20 @@ class TradingSupervisor:
             today_new_entries = await count_entry_orders_since(local_day_start.astimezone(UTC).isoformat())
         except Exception as e:
             errors.append(f"durable entry count unavailable: {e}")
+
+        try:
+            max_new_positions_per_day = await get_runtime_config_int(
+                "max_new_positions_per_day",
+                default=int(self.settings.max_new_positions_per_day),
+                minimum=1,
+                maximum=(
+                    3
+                    if bool(getattr(self.adapter, "paper", False))
+                    else int(self.settings.max_new_positions_per_day)
+                ),
+            )
+        except Exception as e:
+            errors.append(f"runtime entry cap unavailable: {e}")
 
         try:
             if account is not None and account.get("status") == "CONNECTED":
@@ -610,6 +628,7 @@ class TradingSupervisor:
                     clock=clock,
                     positions=positions,
                     today_new_entries=today_new_entries,
+                    max_new_positions_per_day=max_new_positions_per_day,
                 )
             except Exception as e:
                 errors.append(f"entry loop failed: {e}")
