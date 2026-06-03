@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+import subprocess
 import tempfile
 from typing import Any
 
@@ -167,6 +168,30 @@ def _effective_runtime_int(
     return int(default), f"env default {key}={default}"
 
 
+def _active_service_pid(service_name: str) -> tuple[int | None, str]:
+    try:
+        proc = subprocess.run(
+            ["systemctl", "show", "-p", "MainPID", "--value", service_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        return None, f"systemctl unavailable: {exc}"
+    output = proc.stdout.strip()
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or output or f"systemctl exit {proc.returncode}"
+        return None, detail
+    try:
+        pid = int(output)
+    except (TypeError, ValueError):
+        return None, f"invalid MainPID={output or 'empty'}"
+    if pid <= 0:
+        return None, f"inactive MainPID={pid}"
+    return pid, f"systemd MainPID={pid}"
+
+
 def build_live_preflight_report(
     *,
     settings: Any,
@@ -180,6 +205,8 @@ def build_live_preflight_report(
     runtime_config: dict[str, str],
     account_risk_gates: list[ValidationGate],
     halt_drill_gates: list[ValidationGate],
+    active_service_pid: int | None,
+    service_pid_detail: str,
     max_equity: float,
     max_new_positions: int,
     allow_current_live: bool = False,
@@ -206,6 +233,16 @@ def build_live_preflight_report(
     )
     planned_capability = runtime_config.get("runtime_capability_planned_maintenance_shutdown") == "true"
     planned_pid = runtime_config.get("runtime_capability_planned_maintenance_pid")
+    try:
+        planned_pid_int = int(planned_pid) if planned_pid else None
+    except (TypeError, ValueError):
+        planned_pid_int = None
+    planned_pid_matches = (
+        planned_capability
+        and planned_pid_int is not None
+        and active_service_pid is not None
+        and planned_pid_int == active_service_pid
+    )
 
     gates.extend(
         [
@@ -271,8 +308,13 @@ def build_live_preflight_report(
             ),
             _gate(
                 "planned deploy capability active",
-                "PASS" if planned_capability and planned_pid else "FAIL",
-                f"planned_maintenance={planned_capability}, pid={planned_pid or 'missing'}",
+                "PASS" if planned_pid_matches else "FAIL",
+                (
+                    f"planned_maintenance={planned_capability}, "
+                    f"marker_pid={planned_pid or 'missing'}, "
+                    f"active_pid={active_service_pid or 'unknown'}, "
+                    f"{service_pid_detail}"
+                ),
             ),
             _gate(
                 "market clock reachable",
@@ -317,6 +359,7 @@ async def run_live_preflight(
     allow_current_live: bool = False,
     allow_open_positions: bool = False,
     base_equity: float = 400.0,
+    service_name: str = "auto-trader",
 ) -> tuple[str, list[ValidationGate]]:
     settings = get_settings()
     setup_logging("ERROR")
@@ -331,6 +374,7 @@ async def run_live_preflight(
     errors: list[str] = []
     system_state, system_meta = await load_system_state()
     runtime_config = await get_runtime_config_values()
+    active_service_pid, service_pid_detail = _active_service_pid(service_name)
 
     try:
         account = await adapter.get_account_snapshot()
@@ -380,6 +424,8 @@ async def run_live_preflight(
         runtime_config=runtime_config,
         account_risk_gates=account_risk_gates,
         halt_drill_gates=halt_drill.gates,
+        active_service_pid=active_service_pid,
+        service_pid_detail=service_pid_detail,
         max_equity=max_equity,
         max_new_positions=max_new_positions,
         allow_current_live=allow_current_live,
@@ -414,6 +460,11 @@ def main() -> None:
         help="Synthetic base equity for embedded account-risk rehearsal.",
     )
     parser.add_argument(
+        "--service-name",
+        default="auto-trader",
+        help="systemd service name whose active MainPID must match the runtime capability marker.",
+    )
+    parser.add_argument(
         "--allow-current-live",
         action="store_true",
         help="Allow running the preflight after a reviewed switch to ALPACA_PAPER=false.",
@@ -431,6 +482,7 @@ def main() -> None:
             allow_current_live=args.allow_current_live,
             allow_open_positions=args.allow_open_positions,
             base_equity=args.base_equity,
+            service_name=args.service_name,
         )
     )
     print(report)

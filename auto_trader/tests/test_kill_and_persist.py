@@ -388,6 +388,8 @@ def test_live_preflight_report_passes_clean_cutover_state():
         },
         account_risk_gates=account_risk_gates,
         halt_drill_gates=halt_drill_gates,
+        active_service_pid=123,
+        service_pid_detail="systemd MainPID=123",
         max_equity=500.0,
         max_new_positions=3,
     )
@@ -435,6 +437,8 @@ def test_live_preflight_report_fails_unsafe_cutover_state():
         },
         account_risk_gates=account_risk_gates,
         halt_drill_gates=halt_drill_gates,
+        active_service_pid=None,
+        service_pid_detail="systemctl unavailable",
         max_equity=500.0,
         max_new_positions=3,
     )
@@ -445,6 +449,50 @@ def test_live_preflight_report_fails_unsafe_cutover_state():
     assert "[FAIL] system state active" in report
     assert "[FAIL] open positions clear" in report
     assert "[FAIL] pending exits clear" in report
+    assert "[FAIL] planned deploy capability active" in report
+    assert account_risk_validation_exit_code(gates) == 2
+
+
+def test_live_preflight_report_rejects_stale_planned_capability_pid():
+    _, account_risk_gates = build_account_risk_validation_report(settings=DummySettings(), base_equity=400.0)
+    halt_drill_gates = [
+        AccountRiskValidationGate(name="drill", status="PASS", detail="ok"),
+    ]
+
+    report, gates = build_live_preflight_report(
+        settings=DummyLivePreflightSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+            "equity": 398.0,
+        },
+        clock={"is_open": True, "source": "alpaca"},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={
+            "auto_entry_enabled": "true",
+            "auto_exit_enabled": "true",
+            "max_new_positions_per_day": "3",
+            "runtime_capability_planned_maintenance_shutdown": "true",
+            "runtime_capability_planned_maintenance_pid": "123",
+        },
+        account_risk_gates=account_risk_gates,
+        halt_drill_gates=halt_drill_gates,
+        active_service_pid=456,
+        service_pid_detail="systemd MainPID=456",
+        max_equity=500.0,
+        max_new_positions=3,
+    )
+
+    assert "Overall: FAIL" in report
+    assert "[FAIL] planned deploy capability active" in report
+    assert "marker_pid=123" in report
+    assert "active_pid=456" in report
     assert account_risk_validation_exit_code(gates) == 2
 
 
