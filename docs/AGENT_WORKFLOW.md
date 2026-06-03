@@ -27,7 +27,7 @@ Defines responsibilities and handoff rules for the 4-agent build team.
 
 ## Standing Subagent Rule
 
-- Use one pinned standing Reviewer thread and one pinned standing Optimizer thread per trading day; do not create new Reviewer/Optimizer threads for each implementation delta.
+- Use one standing Reviewer thread and one standing Optimizer thread per trading day; do not create new Reviewer/Optimizer threads for each implementation delta. Pinning is optional operator convenience, not a requirement.
 - Create fresh standing threads only when starting a new trading day, when a thread is wedged/unavailable, or when context pollution makes the thread unsafe to reuse. Archive or clearly mark replaced threads so stale verdicts are not mistaken for current review.
 - After every major Engineer implementation pass, send the delta to the standing Reviewer and standing Optimizer without asking the user for permission again.
 - Engineer must proactively poll/read Reviewer and Optimizer verdicts; the user should not need to ask whether agents are done or whether blockers exist.
