@@ -37,10 +37,14 @@ from auto_trader.persistence.db import (
     get_pending_exits,
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
+    get_runtime_config_bool,
+    get_runtime_config_value,
+    get_runtime_config_values,
     init_db,
     load_system_state,
     reconcile_broker_orders,
     save_system_state,
+    set_runtime_config_value,
     upsert_pending_exit,
     upsert_order_record,
     update_account_risk_state,
@@ -148,6 +152,9 @@ def patch_empty_pending_exit_state(monkeypatch):
             "peak_drawdown_pct": 0.0,
         }
 
+    async def fake_runtime_config_bool(key, *, default):
+        return default
+
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_symbols", fake_pending_symbols)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.upsert_pending_exit", fake_pending_upsert)
@@ -157,6 +164,7 @@ def patch_empty_pending_exit_state(monkeypatch):
         "auto_trader.scheduler.trading_supervisor.update_account_risk_state",
         fake_healthy_account_risk_state,
     )
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_runtime_config_bool)
 
 
 async def fake_healthy_account_risk_state(*, equity, day_date, week_start_date):
@@ -192,6 +200,11 @@ class FakeTelegramUpdate:
         self.effective_chat = FakeTelegramIdentity(chat_id)
         self.effective_user = FakeTelegramIdentity(user_id)
         self.message = FakeTelegramMessage()
+
+
+class FakeTelegramContext:
+    def __init__(self, args=None):
+        self.args = args or []
 
 
 def test_single_instance_lock_rejects_duplicate_for_same_db():
@@ -419,6 +432,21 @@ async def test_account_risk_state_tracks_daily_weekly_and_peak_baselines():
         assert next_day["day_start_equity"] == 104.0
         assert next_day["week_start_equity"] == 100.0
         assert next_day["peak_equity"] == 105.0
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_bool_roundtrip_and_default():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "runtime_config.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        assert await get_runtime_config_value("auto_entry_enabled") is None
+        assert await get_runtime_config_bool("auto_entry_enabled", default=False) is False
+        assert await set_runtime_config_value("auto_entry_enabled", "true") is True
+        assert await get_runtime_config_value("auto_entry_enabled") == "true"
+        assert await get_runtime_config_bool("auto_entry_enabled", default=False) is True
+        assert await get_runtime_config_values() == {"auto_entry_enabled": "true"}
 
 
 @pytest.mark.asyncio
@@ -802,6 +830,7 @@ def test_telegram_status_and_report_include_account_position_and_order():
         ],
         "reconciled": 1,
         "today_new_entries": 0,
+        "runtime_config": {"auto_entry_enabled": "true"},
         "errors": [],
     }
 
@@ -840,6 +869,7 @@ def test_telegram_status_surfaces_warnings():
             "orders": [],
             "reconciled": None,
             "today_new_entries": None,
+            "runtime_config": {"auto_entry_enabled": "true"},
             "errors": ["positions unavailable"],
         }
     )
@@ -875,6 +905,7 @@ def test_telegram_status_blocks_entries_when_risk_data_unavailable():
             "orders": [],
             "reconciled": None,
             "today_new_entries": 0,
+            "runtime_config": {"auto_entry_enabled": "true"},
             "errors": ["positions unavailable"],
         }
     )
@@ -908,6 +939,7 @@ def test_telegram_status_blocks_entries_at_durable_daily_limit():
             "orders": [],
             "reconciled": 0,
             "today_new_entries": 1,
+            "runtime_config": {"auto_entry_enabled": "true"},
             "errors": [],
         }
     )
@@ -996,6 +1028,7 @@ async def test_telegram_authorized_status_reads_snapshot(monkeypatch):
             "orders": [],
             "reconciled": 0,
             "today_new_entries": 0,
+            "runtime_config": {"auto_entry_enabled": "true"},
             "errors": [],
         }
 
@@ -1006,6 +1039,140 @@ async def test_telegram_authorized_status_reads_snapshot(monkeypatch):
 
     assert "AUTO-TRADER STATUS" in update.message.replies[0]
     assert "New entries: allowed" in update.message.replies[0]
+
+
+def test_telegram_status_surfaces_runtime_auto_entry_disabled():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+
+    status = bot._build_status_message(
+        {
+            "health": {"status": "CONNECTED", "paper": True, "market_open": True},
+            "account": {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "buying_power": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            },
+            "positions": [],
+            "orders": [],
+            "reconciled": 0,
+            "today_new_entries": 0,
+            "runtime_config": {"auto_entry_enabled": "false"},
+            "errors": [],
+        }
+    )
+
+    assert "Runtime auto-entry: False" in status
+    assert "New entries: disabled by runtime config" in status
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_sets_auto_entry(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+    journal = []
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    async def fake_values():
+        return stored
+
+    async def fake_bool(key, *, default):
+        value = stored.get(key)
+        return default if value is None else value == "true"
+
+    async def fake_journal(**kwargs):
+        journal.append(kwargs["content"])
+        return 1
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["auto_entry", "on"]))
+
+    assert stored == {"auto_entry_enabled": "true"}
+    assert update.message.replies == ["Runtime auto-entry set to True."]
+    assert journal == ["Runtime config updated: auto_entry_enabled=True."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_shows_runtime_config(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    async def fake_values():
+        return {"auto_entry_enabled": "true"}
+
+    async def fake_bool(key, *, default):
+        return True
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_bool", fake_bool)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext())
+
+    assert "RUNTIME CONFIG" in update.message.replies[0]
+    assert "auto_entry_enabled: True (runtime)" in update.message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_telegram_unauthorized_config_does_not_update(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {"set": 0}
+
+    async def fake_set(key, value):
+        called["set"] += 1
+        return True
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[999],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["auto_entry", "on"]))
+
+    assert called["set"] == 0
+    assert update.message.replies == ["Unauthorized."]
 
 
 @pytest.mark.asyncio
@@ -1077,11 +1244,15 @@ async def test_telegram_snapshot_gather_reconciles_and_reads_once(monkeypatch):
     async def fake_journal(limit=3):
         return [{"content": "Auto-exit submitted for AMPX.", "created_at": "2026-06-02T20:34:23Z"}]
 
+    async def fake_runtime_config():
+        return {"auto_entry_enabled": "true"}
+
     monkeypatch.setattr("auto_trader.comms.telegram_bot.reconcile_broker_orders", fake_reconcile)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_order_records", fake_latest)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.count_entry_orders_since", fake_count)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_pending_exits", fake_pending_exits)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_journal_entries", fake_journal)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_runtime_config)
 
     adapter = FakeAdapter()
     bot = TelegramBot(
@@ -1138,11 +1309,15 @@ async def test_telegram_snapshot_gather_surfaces_account_and_clock_failures(monk
     async def fake_journal(limit=3):
         return []
 
+    async def fake_runtime_config():
+        return {}
+
     monkeypatch.setattr("auto_trader.comms.telegram_bot.reconcile_broker_orders", fake_reconcile)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_order_records", fake_latest)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.count_entry_orders_since", fake_count)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_pending_exits", fake_pending_exits)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_journal_entries", fake_journal)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_runtime_config)
 
     bot = TelegramBot(
         token="token",
@@ -1193,11 +1368,15 @@ async def test_telegram_snapshot_gather_surfaces_returned_error_dicts(monkeypatc
     async def fake_journal(limit=3):
         return []
 
+    async def fake_runtime_config():
+        return {}
+
     monkeypatch.setattr("auto_trader.comms.telegram_bot.reconcile_broker_orders", fake_reconcile)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_order_records", fake_latest)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.count_entry_orders_since", fake_count)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_pending_exits", fake_pending_exits)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.get_latest_journal_entries", fake_journal)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_runtime_config)
 
     bot = TelegramBot(
         token="token",
@@ -1655,6 +1834,9 @@ async def test_supervisor_persisted_pending_exit_suppresses_close_after_restart(
             "peak_drawdown_pct": 0.0,
         }
 
+    async def fake_runtime_config_bool(key, *, default):
+        return default
+
     async def fake_notify(message):
         notifications.append(message)
 
@@ -1665,6 +1847,7 @@ async def test_supervisor_persisted_pending_exit_suppresses_close_after_restart(
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.update_account_risk_state", fake_account_risk_state)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_runtime_config_bool)
 
     adapter = FakeAdapter()
     supervisor = TradingSupervisor(
@@ -1985,6 +2168,9 @@ async def test_supervisor_broker_open_close_order_suppresses_and_persists(monkey
     async def fake_pending_clear(symbol):
         return True
 
+    async def fake_runtime_config_bool(key, *, default):
+        return default
+
     async def fake_notify(message):
         notifications.append(message)
 
@@ -1999,6 +2185,7 @@ async def test_supervisor_broker_open_close_order_suppresses_and_persists(monkey
         "auto_trader.scheduler.trading_supervisor.update_account_risk_state",
         fake_healthy_account_risk_state,
     )
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_runtime_config_bool)
 
     adapter = FakeAdapter()
     supervisor = TradingSupervisor(

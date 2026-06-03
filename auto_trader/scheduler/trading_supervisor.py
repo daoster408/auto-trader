@@ -19,6 +19,7 @@ from auto_trader.persistence.db import (
     get_latest_entry_order_for_symbol,
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
+    get_runtime_config_bool,
     reconcile_broker_orders,
     update_account_risk_state,
     upsert_pending_exit,
@@ -447,7 +448,11 @@ class TradingSupervisor:
         positions: list[dict[str, Any]],
         today_new_entries: int,
     ) -> dict[str, Any] | None:
-        if not self.settings.auto_entry_enabled:
+        auto_entry_enabled = await get_runtime_config_bool(
+            "auto_entry_enabled",
+            default=bool(self.settings.auto_entry_enabled),
+        )
+        if not auto_entry_enabled:
             return None
         if not self.sm.can_trade():
             return None
@@ -624,11 +629,15 @@ class TradingSupervisor:
     async def run(self, stop_event: asyncio.Event, *, startup_delay_seconds: float = 5.0) -> None:
         if startup_delay_seconds > 0:
             await asyncio.sleep(startup_delay_seconds)
+        effective_auto_entry = await get_runtime_config_bool(
+            "auto_entry_enabled",
+            default=bool(self.settings.auto_entry_enabled),
+        )
         await self._notify_once(
             "supervisor-started",
             (
                 "TRADING SUPERVISOR STARTED: "
-                f"auto_entry={self.settings.auto_entry_enabled}, "
+                f"auto_entry={effective_auto_entry}, "
                 f"auto_exit={self.settings.auto_exit_enabled}, "
                 f"monitor_interval={self.settings.position_monitor_interval_seconds}s"
             ),

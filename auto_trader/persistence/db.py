@@ -351,6 +351,91 @@ async def update_account_risk_state(
             await db.close()
 
 
+async def set_runtime_config_value(key: str, value: str) -> bool:
+    """Persist a runtime configuration value controlled by Telegram/operator commands."""
+    clean_key = str(key or "").strip().lower()
+    clean_value = str(value).strip().lower()
+    if not clean_key:
+        raise ValueError("runtime config key is required")
+    now = datetime.now(UTC).isoformat() + "Z"
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO runtime_config (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value=excluded.value,
+                        updated_at=excluded.updated_at
+                    """,
+                    (clean_key, clean_value, now),
+                )
+                await db.commit()
+            finally:
+                await db.close()
+            log.warning("runtime_config_updated", key=clean_key, value=clean_value)
+            return True
+        except Exception as e:
+            log.error("runtime_config_update_failed", key=clean_key, error=str(e))
+            return False
+
+
+async def get_runtime_config_value(key: str) -> str | None:
+    """Return a persisted runtime config value, if one exists."""
+    clean_key = str(key or "").strip().lower()
+    if not clean_key:
+        return None
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    "SELECT value FROM runtime_config WHERE key = ?",
+                    (clean_key,),
+                )
+                row = await cur.fetchone()
+                return str(row["value"]) if row else None
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("runtime_config_lookup_failed", key=clean_key, error=str(e))
+            raise
+
+
+async def get_runtime_config_bool(key: str, *, default: bool) -> bool:
+    """Return a runtime config value parsed as bool, with fail-closed defaults."""
+    value = await get_runtime_config_value(key)
+    if value is None:
+        return bool(default)
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    raise ValueError(f"invalid boolean runtime config for {key}: {value}")
+
+
+async def get_runtime_config_values() -> dict[str, str]:
+    """Return all persisted runtime configuration values."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute("SELECT key, value FROM runtime_config ORDER BY key")
+                rows = await cur.fetchall()
+                return {str(row["key"]): str(row["value"]) for row in rows}
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("runtime_config_list_failed", error=str(e))
+            raise
+
+
 async def reconcile_broker_orders(orders: list[dict[str, Any]]) -> int:
     """Upsert broker orders into SQLite. Returns number successfully persisted."""
     count = 0

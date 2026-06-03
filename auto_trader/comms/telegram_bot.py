@@ -24,11 +24,15 @@ from auto_trader.core.models import KillResult
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.persistence.db import (
+    append_journal_entry,
     count_entry_orders_since,
     get_latest_journal_entries,
     get_latest_order_records,
     get_pending_exits,
+    get_runtime_config_bool,
+    get_runtime_config_values,
     reconcile_broker_orders,
+    set_runtime_config_value,
 )
 from auto_trader.utils.logging import get_logger
 from auto_trader.utils.retry import retry_kill_critical
@@ -120,12 +124,15 @@ def _format_journal_entries(entries: list[dict[str, Any]]) -> str:
 
 def _entry_status(
     state_can_trade: bool,
+    auto_entry_enabled: bool,
     positions: list[dict[str, Any]],
     max_positions: int,
     today_new_entries: int | None,
     errors: list[Any],
     account_tradable: bool,
 ) -> str:
+    if not auto_entry_enabled:
+        return "disabled by runtime config"
     if not state_can_trade:
         return "blocked by system state"
     if errors:
@@ -220,6 +227,7 @@ class TelegramBot:
             "broker_orders": [],
             "pending_exits": [],
             "journal_entries": [],
+            "runtime_config": {},
             "reconciled": None,
             "today_new_entries": None,
             "errors": [],
@@ -293,6 +301,12 @@ class TelegramBot:
             log.warning("telegram_journal_failed", error=str(e))
             result["errors"].append(f"journal unavailable: {e}")
 
+        try:
+            result["runtime_config"] = await get_runtime_config_values()
+        except Exception as e:
+            log.warning("telegram_runtime_config_failed", error=str(e))
+            result["errors"].append(f"runtime config unavailable: {e}")
+
         return result
 
     async def _bounded_snapshot(self) -> dict[str, Any]:
@@ -308,6 +322,7 @@ class TelegramBot:
                 "broker_orders": [],
                 "pending_exits": [],
                 "journal_entries": [],
+                "runtime_config": {},
                 "reconciled": None,
                 "today_new_entries": None,
                 "errors": [f"snapshot unavailable: {e}"],
@@ -322,6 +337,10 @@ class TelegramBot:
         pending_exits = snapshot.get("pending_exits") or []
         errors = snapshot.get("errors") or []
         today_new_entries = snapshot.get("today_new_entries")
+        runtime_config = snapshot.get("runtime_config") or {}
+        auto_entry_enabled = str(
+            runtime_config.get("auto_entry_enabled", str(getattr(self.risk.settings, "auto_entry_enabled", False)))
+        ).lower() in {"1", "true", "yes", "on", "enabled"}
         equity = float(account.get("equity") or health.get("equity") or 0.0)
         snap = self.sm.get_snapshot(
             equity=equity,
@@ -339,7 +358,8 @@ class TelegramBot:
             "AUTO-TRADER STATUS",
             f"State: {snap.state.value}",
             f"State allows trading: {self.sm.can_trade()}",
-            f"New entries: {_entry_status(self.sm.can_trade(), positions, max_positions, today_new_entries, errors, account_tradable)}",
+            f"Runtime auto-entry: {auto_entry_enabled}",
+            f"New entries: {_entry_status(self.sm.can_trade(), auto_entry_enabled, positions, max_positions, today_new_entries, errors, account_tradable)}",
             f"Today new entries: {today_new_entries if today_new_entries is not None else 'unknown'} / {max_positions}",
             f"Alpaca: {account.get('status') or health.get('status')}",
             f"Paper: {health.get('paper')}",
@@ -360,6 +380,23 @@ class TelegramBot:
             lines.append("Warnings: " + "; ".join(str(e) for e in errors))
         lines.append(f"Last updated: {snap.updated_at.isoformat()}Z")
         return "\n".join(lines)
+
+    async def _build_config_message(self) -> str:
+        values = await get_runtime_config_values()
+        auto_entry = await get_runtime_config_bool(
+            "auto_entry_enabled",
+            default=bool(getattr(self.risk.settings, "auto_entry_enabled", False)),
+        )
+        source = "runtime" if "auto_entry_enabled" in values else "env default"
+        return "\n".join(
+            [
+                "RUNTIME CONFIG",
+                f"auto_entry_enabled: {auto_entry} ({source})",
+                f"auto_exit_enabled: {bool(getattr(self.risk.settings, 'auto_exit_enabled', False))} (env)",
+                f"max_new_positions_per_day: {getattr(self.risk.settings, 'max_new_positions_per_day', 'unknown')} (env)",
+                "Use: /config auto_entry on | /config auto_entry off",
+            ]
+        )
 
     def _build_report_message(self, snapshot: dict[str, Any]) -> str:
         account = snapshot.get("account") or {}
@@ -485,10 +522,38 @@ class TelegramBot:
             warnings=len(snapshot.get("errors") or []),
         )
 
+    async def _config_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_authorized(update, "/config"):
+            return
+        args = [str(arg).strip().lower() for arg in (context.args or []) if str(arg).strip()]
+        if not args:
+            await update.message.reply_text(await self._build_config_message())
+            return
+        if len(args) != 2 or args[0] not in {"auto_entry", "auto_entry_enabled", "entry"}:
+            await update.message.reply_text("Use: /config auto_entry on | /config auto_entry off")
+            return
+        raw_value = args[1]
+        if raw_value not in {"on", "off", "true", "false", "1", "0", "enabled", "disabled"}:
+            await update.message.reply_text("Use: /config auto_entry on | /config auto_entry off")
+            return
+        enabled = raw_value in {"on", "true", "1", "enabled"}
+        persisted = await set_runtime_config_value("auto_entry_enabled", "true" if enabled else "false")
+        if not persisted:
+            await update.message.reply_text("Runtime config update failed. Auto-entry unchanged.")
+            return
+        await append_journal_entry(content=f"Runtime config updated: auto_entry_enabled={enabled}.")
+        state_note = "" if self.sm.can_trade() else f" State is {self.sm.state.value}, so entries remain blocked."
+        await update.message.reply_text(f"Runtime auto-entry set to {enabled}.{state_note}")
+        log.warning(
+            "runtime_auto_entry_updated",
+            enabled=enabled,
+            user=update.effective_user.username if update.effective_user else "unknown",
+        )
+
     async def _unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_authorized(update, "unknown"):
             return
-        await update.message.reply_text("Unknown command. Use /status, /pause, /resume <token>, /kill, /report")
+        await update.message.reply_text("Unknown command. Use /status, /pause, /resume <token>, /kill, /report, /config")
 
     def build(self) -> Application:
         """Build the Application with all command handlers."""
@@ -499,6 +564,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("resume", self._resume_handler))
         app.add_handler(CommandHandler("kill", self._kill_handler))
         app.add_handler(CommandHandler("report", self._report_handler))
+        app.add_handler(CommandHandler("config", self._config_handler))
         app.add_handler(CommandHandler("start", self._status_handler))
         app.add_handler(CommandHandler("help", self._status_handler))
 

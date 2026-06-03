@@ -1308,3 +1308,34 @@ Append-only by day. Do not remove past entries.
   - Oracle env remains paper-safe: `ALPACA_PAPER=true`, `AUTO_ENTRY_ENABLED=false`, `AUTO_EXIT_ENABLED=true`, `MAX_NEW_POSITIONS_PER_DAY=1`.
 - Confidence:
   - high
+
+## 2026-06-03 (America/Los_Angeles) - Runtime Auto-Entry Config Switch
+
+- Date (local): 2026-06-03
+- Date (UTC): 2026-06-03
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Added persisted `runtime_config` table.
+  - Added runtime config helpers for bool values.
+  - Wired supervisor to read `auto_entry_enabled` from runtime config every tick, with env value as default.
+  - Added Telegram `/config`, `/config auto_entry on`, and `/config auto_entry off`.
+  - Added `/status` visibility for `Runtime auto-entry`.
+  - Added tests for runtime config persistence, Telegram config authorization/update/show, status rendering, and supervisor runtime gating.
+  - Verification:
+    - `.venv/bin/python -m pytest` -> `68 passed`.
+    - `.venv/bin/python -m compileall -q auto_trader` -> passed.
+    - `git diff --check` -> clean.
+- IN_PROGRESS:
+  - Runtime switch built locally; Oracle deployment still requires sync and service restart.
+- NEXT:
+  - Commit and push the runtime config switch.
+  - Deploy to Oracle; expect service restart to persist `HALTED` by design, then use `/resume <token>`.
+  - After `/status` is clean, use `/config auto_entry on` for the next paper entry promotion.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Future entry promotion no longer requires env edit or service restart after this code is deployed.
+  - Runtime switch does not bypass RiskEngine or daily-entry limits.
+- Confidence:
+  - high

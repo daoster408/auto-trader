@@ -32,12 +32,21 @@ Expected startup checks:
 Telegram checks after startup:
 
 - Send `/status` and confirm account, state, and warnings.
+- Send `/config` and confirm runtime auto-entry state before changing entry automation.
 - Send `/status` and confirm pending exits show the close order ID, reason, status, and duplicate-exit suppression.
 - Send `/report` and confirm positions, orders, pending exits, and latest journal entries are visible.
 - Expected pending-close suppression is log-only; Telegram alerts are reserved for submitted exits, failures, unresolved pending exits, and operator actions.
 - A duplicate local bot process should fail fast on startup instead of creating Telegram `getUpdates` conflicts.
 - Do not use `/resume <token>` unless the restored state is intentionally ready to trade.
 - Use `/kill` only when you intend to flatten paper positions and persist `HALTED`.
+
+Runtime config:
+
+- `/config` shows runtime switches.
+- `/config auto_entry on` enables new-entry automation without a service restart.
+- `/config auto_entry off` disables new-entry automation without a service restart.
+- Runtime `auto_entry_enabled` is persisted in SQLite and overrides the env default.
+- `/status` reports `Runtime auto-entry` plus the effective new-entry status.
 
 API budget behavior:
 
@@ -127,6 +136,8 @@ Manual stop:
 ```bash
 sudo systemctl stop auto-trader
 ```
+
+Because Oracle uses `SHUTDOWN_FLATTEN_ON_EXIT=true`, a service restart intentionally persists `HALTED` before shutdown. After deploying new code that requires a restart, inspect `/status`, then send `/resume <token>` only after the state is intentionally ready to trade.
 
 ## Wednesday Market-Open Checklist
 

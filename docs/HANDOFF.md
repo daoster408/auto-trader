@@ -4,8 +4,8 @@ Quick resume file for any AI session. Update at end of every work session.
 
 ## Current Snapshot
 
-- Last updated UTC: 2026-06-03T16:35:27Z
-- Last updated local (`America/Los_Angeles`): 2026-06-03 09:35:27 PDT
+- Last updated UTC: 2026-06-03T16:43:07Z
+- Last updated local (`America/Los_Angeles`): 2026-06-03 09:43:07 PDT
 - Updated by: openai/gpt-5-codex
 - Active role: Engineer
 - Project phase: 
@@ -28,6 +28,7 @@ Quick resume file for any AI session. Update at end of every work session.
   - Account-level risk halt layer added: daily loss, weekly loss, and peak drawdown breaches now persist `HALTED` and call cancel/flatten through the existing kill-grade path.
   - Account-risk dry-run validator added for operator proof without touching broker cancel/flatten paths.
   - Oracle migration rehearsal promoted to active paper runner: local laptop bot stopped; Oracle systemd service is active and enabled.
+  - Runtime config switch built locally: `/config auto_entry on|off` persists `auto_entry_enabled` in SQLite and supervisor reads it every tick.
 - System status:
   - RiskEngine remains the **only** path to any real order.
   - Real order submission code is written and gated.
@@ -209,6 +210,16 @@ Quick resume file for any AI session. Update at end of every work session.
     - Telegram polling is live from Oracle;
     - supervisor is running `auto_entry=False`, `auto_exit=True`, `monitor_interval=60s`;
     - repeated Oracle ticks updated account-risk state with equity about `$398.10` and no loss/drawdown breach.
+  - Runtime config switch:
+    - new table: `runtime_config`;
+    - Telegram command: `/config`, `/config auto_entry on`, `/config auto_entry off`;
+    - `/status` now shows `Runtime auto-entry`;
+    - supervisor uses runtime `auto_entry_enabled` override without requiring future service restarts;
+    - latest local verification: `68 passed`, compileall passed, `git diff --check` clean.
+  - Deployment note:
+    - Oracle is still running the prior active code until this commit is synced/restarted;
+    - restarting Oracle service with `SHUTDOWN_FLATTEN_ON_EXIT=true` is expected to persist `HALTED`;
+    - after deploy restart, operator should send `/resume <token>` once state is reviewed, then `/config auto_entry on` can promote entries without another restart.
   - Discovery now pulls Alpaca active/tradable/fractionable US equities and free IEX snapshots, then ranks by liquidity, spread, relative volume, constructive momentum, and non-parabolic behavior.
   - `.env` now exists with Alpaca paper keys, Telegram bot token, and generated RESUME_TOKEN. Do not print or commit secrets.
   - Safe preflight passed: Alpaca paper account connected, Telegram bot token valid, dynamic tradable universe fetch works.
@@ -234,9 +245,10 @@ Quick resume file for any AI session. Update at end of every work session.
 
 1. Keep Oracle as the single active paper runner; do not restart the laptop bot unless deliberately migrating back.
 2. Confirm Telegram `/status` from Oracle shows no open positions, `Today new entries: 1 / 1`, and pending exits clear.
-3. Decide the entry-promotion path: either add dynamic runtime config for `AUTO_ENTRY_ENABLED` or use the server restart + `/resume` flow.
-4. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
-5. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
+3. Deploy the runtime config switch to Oracle, then resume after the intentional restart HALT.
+4. Use `/config auto_entry on` for the next paper entry promotion after `/status` is clean.
+5. After the rules-only paper loop is proven: implement AI committee in journal-only mode using `docs/ARCHITECTURE.md` section `9.1`.
+6. Maintain automatic visible Reviewer/Optimizer polling/fix/re-review loop and automatic GitHub push for future major milestones.
 
 ## Risks To Watch
 
