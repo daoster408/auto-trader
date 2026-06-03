@@ -37,6 +37,32 @@ def test_redact_sensitive_removes_query_tokens_recursively():
     assert "api_key=<redacted>" in redacted["nested"][0]
 
 
+def test_redact_sensitive_removes_structured_secret_fields_by_key():
+    raw = {
+        "headers": {
+            "Authorization": "Bearer auth-secret",
+            "X-API-Key": "provider-key",
+            "APCA-API-SECRET-KEY": "alpaca-secret",
+        },
+        "body": {
+            "token": "body-token",
+            "safe_symbol": "AAPL",
+        },
+    }
+
+    redacted = redact_sensitive(raw)
+
+    assert "auth-secret" not in str(redacted)
+    assert "provider-key" not in str(redacted)
+    assert "alpaca-secret" not in str(redacted)
+    assert "body-token" not in str(redacted)
+    assert redacted["headers"]["Authorization"] == "<redacted>"
+    assert redacted["headers"]["X-API-Key"] == "<redacted>"
+    assert redacted["headers"]["APCA-API-SECRET-KEY"] == "<redacted>"
+    assert redacted["body"]["token"] == "<redacted>"
+    assert redacted["body"]["safe_symbol"] == "AAPL"
+
+
 def test_redacting_log_filter_redacts_stdlib_log_record_args():
     record = logging.LogRecord(
         name="httpx",

@@ -42,6 +42,27 @@ _AUTH_HEADER_RE = re.compile(
     r"((?:Authorization|Api-Key|X-API-Key):\s*)(?:Bearer\s+|Basic\s+)?[A-Za-z0-9._~+/\-=:]+",
     re.IGNORECASE,
 )
+_SENSITIVE_KEY_NAMES = {
+    "apikey",
+    "authorization",
+    "key",
+    "password",
+    "secret",
+    "token",
+    "xaccesstoken",
+    "xapikey",
+    "xauth",
+    "xauthorization",
+    "apcaapikeyid",
+    "apcaapisecretkey",
+}
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return normalized in _SENSITIVE_KEY_NAMES or any(
+        marker in normalized for marker in ("apikey", "authorization", "password", "secret", "token")
+    )
 
 
 def redact_sensitive(value: Any) -> Any:
@@ -56,7 +77,10 @@ def redact_sensitive(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_sensitive(item) for item in value]
     if isinstance(value, dict):
-        return {key: redact_sensitive(item) for key, item in value.items()}
+        return {
+            key: "<redacted>" if _is_sensitive_key(key) else redact_sensitive(item)
+            for key, item in value.items()
+        }
     return value
 
 
