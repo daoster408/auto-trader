@@ -146,6 +146,14 @@ Planned maintenance deploys should use the one-shot maintenance marker instead o
 ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_planned_deploy.sh
 ```
 
+The currently running process must already support the maintenance marker. If the script reports that the remote service does not support planned maintenance, it will refuse the normal path before syncing code. For the one-time first rollout of the maintenance feature in paper mode only, use the guarded bootstrap path:
+
+```bash
+BOOTSTRAP_HARD_KILL=true ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_planned_deploy.sh
+```
+
+The bootstrap path requires the remote `.env` to contain `ALPACA_PAPER=true` and refuses `ALLOW_LIVE=true`. After that first rollout, future deploys should use the normal planned maintenance command above.
+
 For live mode, the maintenance helper refuses preserve-position restarts unless `ALLOW_LIVE=true` is set explicitly. Use that only for a reviewed live deploy window where preserving positions through a fast restart is intentional. After any deploy, inspect `/status`; send `/resume <token>` only if the state is intentionally ready to trade.
 
 ### Optional Finnhub Enrichment
