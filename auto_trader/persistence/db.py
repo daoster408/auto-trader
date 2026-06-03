@@ -171,6 +171,46 @@ async def log_risk_decision(**kwargs: Any) -> int | None:
             return None
 
 
+async def log_signal(
+    *,
+    symbol: str,
+    thesis: str | None,
+    confidence: float | None,
+    source: str,
+    model_tag: str | None = None,
+    features: dict[str, Any] | None = None,
+) -> int | None:
+    """Persist a pre-risk candidate signal with optional enrichment features."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    INSERT INTO signals (
+                        symbol, thesis, confidence, source, model_tag, features_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(symbol).upper(),
+                        thesis,
+                        confidence,
+                        source,
+                        model_tag,
+                        json.dumps(features or {}, sort_keys=True),
+                    ),
+                )
+                await db.commit()
+                return int(cur.lastrowid) if cur.lastrowid is not None else None
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("signal_log_failed", symbol=symbol, source=source, error=str(e))
+            return None
+
+
 async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | None = None, rationale: str | None = None) -> bool:
     """Persist or refresh an order row from broker/manager normalized data."""
     client_order_id = str(order.get("client_order_id") or order.get("id") or order.get("broker_order_id") or "")

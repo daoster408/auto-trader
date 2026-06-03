@@ -18,6 +18,7 @@ from typing import Any
 
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.models import TradeIntent
+from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.utils.logging import get_logger
 
 log = get_logger("auto_trader.intelligence.rules_fallback")
@@ -143,6 +144,18 @@ def _candidate_from_snapshot(symbol: str, snapshot: dict[str, Any]) -> Discovery
     )
 
 
+def _alpaca_candidate_features(candidate: DiscoveryCandidate) -> dict[str, Any]:
+    return {
+        "provider": "alpaca",
+        "price": candidate.price,
+        "score": candidate.score,
+        "dollar_volume": candidate.dollar_volume,
+        "rel_volume": candidate.rel_volume,
+        "change_pct": candidate.change_pct,
+        "spread_pct": candidate.spread_pct,
+    }
+
+
 async def discover_dynamic_candidates(
     adapter: AlpacaAdapter,
     *,
@@ -184,11 +197,17 @@ async def discover_dynamic_candidates(
 async def get_simple_rules_signals(
     adapter: AlpacaAdapter,
     max_signals: int = 2,
+    finnhub_client: FinnhubClient | None = None,
 ) -> list[TradeIntent]:
     """Return TradeIntents from dynamic market discovery (no watchlist)."""
     candidates = await discover_dynamic_candidates(adapter, max_candidates=max(max_signals, 5))
     signals: list[TradeIntent] = []
     for candidate in candidates[:max_signals]:
+        features: dict[str, Any] = {
+            "discovery": _alpaca_candidate_features(candidate),
+        }
+        if finnhub_client is not None and finnhub_client.enabled:
+            features["finnhub"] = await finnhub_client.enrich_symbol(candidate.symbol)
         signals.append(
             TradeIntent(
                 symbol=candidate.symbol,
@@ -196,6 +215,7 @@ async def get_simple_rules_signals(
                 entry_price=candidate.price,
                 rationale=candidate.rationale,
                 confidence=min(max(candidate.score / 8, 0.35), 0.9),
+                features=features,
             )
         )
     return signals

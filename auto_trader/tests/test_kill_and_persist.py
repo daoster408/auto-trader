@@ -5,6 +5,8 @@ These tests must actually exercise real DB save → load roundtrips
 and verify the safety default to HALTED on failure.
 """
 import asyncio
+import json
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -25,6 +27,8 @@ from auto_trader.comms.telegram_bot import TelegramBot
 from auto_trader.config.settings import Settings
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
+from auto_trader.intelligence.finnhub_client import FinnhubClient
+from auto_trader.intelligence.rules_fallback import DiscoveryCandidate, get_simple_rules_signals
 from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_shutdown, _should_emergency_halt_on_shutdown
 from auto_trader.scheduler.trading_supervisor import TradingSupervisor
 from auto_trader.persistence.db import (
@@ -42,6 +46,7 @@ from auto_trader.persistence.db import (
     get_runtime_config_value,
     get_runtime_config_values,
     init_db,
+    log_signal,
     load_system_state,
     reconcile_broker_orders,
     save_system_state,
@@ -140,6 +145,9 @@ def patch_empty_pending_exit_state(monkeypatch):
     async def fake_journal_entry(**kwargs):
         return 1
 
+    async def fake_log_signal(**kwargs):
+        return 1
+
     async def fake_account_risk_state(*, equity, day_date, week_start_date):
         return {
             "equity": equity,
@@ -164,6 +172,7 @@ def patch_empty_pending_exit_state(monkeypatch):
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.upsert_pending_exit", fake_pending_upsert)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal_entry)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
     monkeypatch.setattr(
         "auto_trader.scheduler.trading_supervisor.update_account_risk_state",
         fake_healthy_account_risk_state,
@@ -468,6 +477,95 @@ async def test_runtime_config_int_roundtrip_and_bounds():
         assert await set_runtime_config_value("max_new_positions_per_day", "4") is True
         with pytest.raises(ValueError, match="above maximum"):
             await get_runtime_config_int("max_new_positions_per_day", default=1, minimum=1, maximum=3)
+
+
+@pytest.mark.asyncio
+async def test_signal_log_persists_features_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "signals.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        signal_id = await log_signal(
+            symbol="poet",
+            thesis="rules found momentum",
+            confidence=0.72,
+            source="rules_fallback",
+            model_tag="rules_fallback/v0",
+            features={"finnhub": {"quote": {"current": 14.2}}},
+        )
+
+        assert signal_id is not None
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT symbol, source, features_json FROM signals WHERE id = ?",
+                (signal_id,),
+            ).fetchone()
+
+        assert row[0] == "POET"
+        assert row[1] == "rules_fallback"
+        assert json.loads(row[2])["finnhub"]["quote"]["current"] == 14.2
+
+
+@pytest.mark.asyncio
+async def test_finnhub_client_enriches_symbol_with_compact_payload(monkeypatch):
+    client = FinnhubClient("test-key")
+
+    async def fake_get_json(path, params, *, endpoint):
+        if endpoint == "quote":
+            return {"c": 14.2, "d": 0.3, "dp": 2.1, "h": 14.5, "l": 13.7, "o": 13.9, "pc": 13.9}
+        if endpoint == "profile2":
+            return {
+                "name": "POET Technologies Inc",
+                "ticker": "POET",
+                "exchange": "NASDAQ",
+                "finnhubIndustry": "Semiconductors",
+                "marketCapitalization": 900.0,
+                "shareOutstanding": 65.0,
+            }
+        if endpoint == "company-news":
+            return [{"headline": "POET headline", "source": "Wire", "datetime": 1_717_200_000, "url": "https://example.com"}]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(client, "_get_json", fake_get_json)
+
+    enriched = await client.enrich_symbol("POET")
+
+    assert enriched["enabled"] is True
+    assert enriched["quote"]["current"] == 14.2
+    assert enriched["profile"]["industry"] == "Semiconductors"
+    assert enriched["news"][0]["headline"] == "POET headline"
+
+
+@pytest.mark.asyncio
+async def test_rules_signals_attach_finnhub_enrichment(monkeypatch):
+    async def fake_discover(adapter, *, max_assets=750, batch_size=100, max_candidates=10):
+        return [
+            DiscoveryCandidate(
+                symbol="POET",
+                price=14.2,
+                score=6.0,
+                dollar_volume=3_000_000,
+                rel_volume=2.0,
+                change_pct=0.04,
+                spread_pct=0.002,
+                rationale="candidate rationale",
+            )
+        ]
+
+    class FakeFinnhub:
+        enabled = True
+
+        async def enrich_symbol(self, symbol):
+            return {"provider": "finnhub", "enabled": True, "quote": {"current": 14.2}}
+
+    monkeypatch.setattr("auto_trader.intelligence.rules_fallback.discover_dynamic_candidates", fake_discover)
+
+    signals = await get_simple_rules_signals(object(), max_signals=1, finnhub_client=FakeFinnhub())
+
+    assert signals[0].symbol == "POET"
+    assert signals[0].features["discovery"]["provider"] == "alpaca"
+    assert signals[0].features["finnhub"]["quote"]["current"] == 14.2
 
 
 @pytest.mark.asyncio
@@ -2929,7 +3027,7 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
     async def fake_latest_entry(symbol):
         return None
 
-    async def fake_signals(adapter, max_signals=1):
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None):
         return [TradeIntent(symbol="AMPX", side="long", entry_price=20.0)]
 
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
@@ -3002,7 +3100,7 @@ async def test_supervisor_auto_entry_uses_runtime_entry_cap(monkeypatch):
     async def fake_latest_entry(symbol):
         return None
 
-    async def fake_signals(adapter, max_signals=1):
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None):
         return [TradeIntent(symbol="POET", side="long", entry_price=20.0)]
 
     async def fake_runtime_config_int(key, *, default, minimum=None, maximum=None):
@@ -3084,7 +3182,7 @@ async def test_supervisor_blocks_auto_entry_when_broker_has_open_entry_order(mon
     async def fake_count(start_utc_iso):
         return 0
 
-    async def fake_signals(adapter, max_signals=1):
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None):
         raise AssertionError("signals should not be evaluated while an entry order is open")
 
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
@@ -3180,7 +3278,7 @@ async def test_supervisor_account_risk_halt_flattens_and_blocks_entry(monkeypatc
             "peak_drawdown_pct": -2.0,
         }
 
-    async def fake_signals(adapter, max_signals=1):
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None):
         raise AssertionError("signals should not be evaluated after an account risk halt")
 
     async def fake_notify(message):
@@ -3258,7 +3356,7 @@ async def test_supervisor_blocks_auto_entry_when_positions_unavailable(monkeypat
     async def fake_count(start_utc_iso):
         return 0
 
-    async def fake_signals(adapter, max_signals=1):
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None):
         return [TradeIntent(symbol="AMPX", side="long", entry_price=20.0)]
 
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)

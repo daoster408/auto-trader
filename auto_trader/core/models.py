@@ -1,8 +1,8 @@
 """Core domain models (immutable where possible)."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 
 class SystemState(str, Enum):
@@ -31,6 +31,7 @@ class TradeIntent:
     stop_price: float | None = None
     rationale: str = ""
     confidence: float = 0.0
+    features: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

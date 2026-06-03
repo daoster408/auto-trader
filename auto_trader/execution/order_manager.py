@@ -59,6 +59,7 @@ class OrderManager:
                 "side": intent.side,
                 "entry_price": intent.entry_price,
                 "rationale": intent.rationale,
+                "features": intent.features,
             },
             "risk_decision": {
                 "approved": decision.approved,

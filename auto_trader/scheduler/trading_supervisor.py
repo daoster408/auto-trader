@@ -11,6 +11,7 @@ from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.core.models import KillResult, SystemState
 from auto_trader.execution.order_manager import OrderManager
+from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
 from auto_trader.persistence.db import (
     append_journal_entry,
@@ -21,6 +22,7 @@ from auto_trader.persistence.db import (
     get_pending_exit_symbols,
     get_runtime_config_bool,
     get_runtime_config_int,
+    log_signal,
     reconcile_broker_orders,
     update_account_risk_state,
     upsert_pending_exit,
@@ -162,6 +164,7 @@ class TradingSupervisor:
         self._seen_alert_keys: set[str] = set()
         self._position_high_values: dict[str, float] = {}
         self._pending_exit_symbols: set[str] = set()
+        self.finnhub_client = FinnhubClient(getattr(settings, "finnhub_api_key", None))
 
     async def _notify(self, message: str) -> None:
         log.warning("supervisor_alert", message=message)
@@ -485,10 +488,22 @@ class TradingSupervisor:
             )
             return None
 
-        signals = await get_simple_rules_signals(self.adapter, max_signals=1)
+        signals = await get_simple_rules_signals(
+            self.adapter,
+            max_signals=1,
+            finnhub_client=self.finnhub_client,
+        )
         if not signals:
             return None
         intent = signals[0]
+        signal_id = await log_signal(
+            symbol=intent.symbol,
+            thesis=intent.rationale,
+            confidence=intent.confidence,
+            source="rules_fallback",
+            model_tag="rules_fallback/v0",
+            features=intent.features,
+        )
         snapshot = type(
             "SupervisorSnapshot",
             (object,),
@@ -500,6 +515,7 @@ class TradingSupervisor:
             },
         )()
         result = await self.order_manager.submit_trade_intent(intent, snapshot)
+        result.setdefault("persistence", {})["signal_id"] = signal_id
         if result.get("order"):
             await self._notify(f"ENTRY RESULT: {intent.symbol} - {result.get('risk_decision')} - {result.get('order')}")
         return result

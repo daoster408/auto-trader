@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     db_path: str = Field("auto_trader.db", alias="DB_PATH")
 
     # Optional LLM (populated later)
+    finnhub_api_key: str | None = Field(None, alias="FINNHUB_API_KEY")
     openai_api_key: str | None = Field(None, alias="OPENAI_API_KEY")
     anthropic_api_key: str | None = Field(None, alias="ANTHROPIC_API_KEY")
     xai_api_key: str | None = Field(None, alias="XAI_API_KEY")
