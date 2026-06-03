@@ -43,8 +43,28 @@ async def init_db() -> None:
     async with aiosqlite.connect(_DB_PATH) as db:
         schema = schema_path.read_text()
         await db.executescript(schema)
+        await _ensure_column(
+            db,
+            table="risk_decisions",
+            column="signal_id",
+            definition="INTEGER REFERENCES signals(id)",
+        )
         await db.commit()
     log.info("db_initialized", path=str(_DB_PATH), size_kb=round(_DB_PATH.stat().st_size / 1024, 1) if _DB_PATH.exists() else 0)
+
+
+async def _ensure_column(
+    db: aiosqlite.Connection,
+    *,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    cur = await db.execute(f"PRAGMA table_info({table})")
+    rows = await cur.fetchall()
+    if any(str(row[1]) == column for row in rows):
+        return
+    await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 async def _get_conn() -> aiosqlite.Connection:
@@ -144,12 +164,13 @@ async def log_risk_decision(**kwargs: Any) -> int | None:
                 cur = await db.execute(
                     """
                     INSERT INTO risk_decisions (
-                        approved, reason, symbol, side, proposed_qty, sized_qty,
+                        signal_id, approved, reason, symbol, side, proposed_qty, sized_qty,
                         equity_snapshot, metrics_json, model_tag, trace_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        kwargs.get("signal_id"),
                         1 if kwargs.get("approved") else 0,
                         str(kwargs.get("reason", "")),
                         str(kwargs.get("symbol", "")).upper(),

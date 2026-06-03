@@ -31,6 +31,7 @@ class OrderManager:
         self,
         intent: TradeIntent,
         snapshot: Any,  # SystemSnapshot or dict for now
+        signal_id: int | None = None,
     ) -> dict[str, Any]:
         """
         Main entry point for submitting a trade.
@@ -51,6 +52,7 @@ class OrderManager:
             risk_metrics=decision.risk_metrics,
             model_tag=decision.model_tag,
             trace_id=decision.trace_id,
+            signal_id=signal_id,
         )
 
         result: dict[str, Any] = {
@@ -71,6 +73,7 @@ class OrderManager:
             },
             "order": None,
             "persistence": {"order_record_saved": None},
+            "signal_id": signal_id,
             "timestamp": datetime.now(UTC).isoformat() + "Z",
         }
 

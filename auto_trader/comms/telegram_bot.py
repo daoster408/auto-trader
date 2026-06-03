@@ -365,6 +365,7 @@ class TelegramBot:
             "max_new_positions_per_day",
             default=int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1),
         )
+        max_positions = min(max(max_positions, 1), self._max_runtime_entries_allowed())
         account_tradable = (
             account.get("status") == "CONNECTED"
             and "active" in str(account.get("account_status", "")).lower()

@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS system_state (
 CREATE TABLE IF NOT EXISTS risk_decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    signal_id INTEGER REFERENCES signals(id),
     approved INTEGER NOT NULL CHECK (approved IN (0,1)),
     reason TEXT NOT NULL,
     symbol TEXT NOT NULL,

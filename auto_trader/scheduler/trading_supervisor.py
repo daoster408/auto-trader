@@ -514,8 +514,7 @@ class TradingSupervisor:
                 "max_new_positions_per_day": max_new_positions_per_day,
             },
         )()
-        result = await self.order_manager.submit_trade_intent(intent, snapshot)
-        result.setdefault("persistence", {})["signal_id"] = signal_id
+        result = await self.order_manager.submit_trade_intent(intent, snapshot, signal_id=signal_id)
         if result.get("order"):
             await self._notify(f"ENTRY RESULT: {intent.symbol} - {result.get('risk_decision')} - {result.get('order')}")
         return result

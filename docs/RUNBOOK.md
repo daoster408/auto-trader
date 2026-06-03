@@ -62,7 +62,7 @@ For supervised laptop burn-in, `SHUTDOWN_FLATTEN_ON_EXIT=false` is allowed only 
 
 The preferred always-on deployment is a small Linux host using systemd. Oracle Always Free ARM is the default target; Raspberry Pi is acceptable for experimentation if power, network, clock sync, and uptime are reliable.
 
-Current Oracle VM stance: Oracle is the active paper runner. The service is active and enabled, with `AUTO_ENTRY_ENABLED=false`, `AUTO_EXIT_ENABLED=true`, `ALPACA_PAPER=true`, `MAX_NEW_POSITIONS_PER_DAY=1`, and `SHUTDOWN_FLATTEN_ON_EXIT=true`.
+Current Oracle VM stance: Oracle is the active paper runner. The service is active and enabled, with `AUTO_ENTRY_ENABLED=false`, `AUTO_EXIT_ENABLED=true`, `ALPACA_PAPER=true`, `MAX_NEW_POSITIONS_PER_DAY=1`, and `SHUTDOWN_FLATTEN_ON_EXIT=true`. Runtime Telegram config may promote paper-only entry controls without editing `.env`; as of Day 3, `auto_entry_enabled=true` and `max_new_positions_per_day=3` are runtime values, not service env defaults.
 
 Only one active bot host should poll Telegram and trade the paper account at a time. The local single-instance lock protects one SQLite DB path on one machine; it does not coordinate across a laptop and Oracle VM. If Oracle is started with the same Telegram token and Alpaca account while the laptop bot is also running, cross-host duplicate polling and duplicate trading decisions are possible.
 
@@ -81,6 +81,7 @@ Copy the repo to `/opt/auto-trader`, create the virtualenv, install dependencies
 - `AUTO_ENTRY_ENABLED=false` until entry automation is explicitly promoted.
 - `AUTO_EXIT_ENABLED=true` only after the close path has been reviewed, pushed, and validated on the supervised laptop run.
 - `TELEGRAM_ALLOWED_IDS` populated so commands fail closed.
+- `FINNHUB_API_KEY` blank unless Finnhub enrichment is deliberately being tested.
 
 Recommended install commands from `/opt/auto-trader`:
 
@@ -138,6 +139,25 @@ sudo systemctl stop auto-trader
 ```
 
 Because Oracle uses `SHUTDOWN_FLATTEN_ON_EXIT=true`, a service restart intentionally persists `HALTED` before shutdown. After deploying new code that requires a restart, inspect `/status`, then send `/resume <token>` only after the state is intentionally ready to trade.
+
+### Optional Finnhub Enrichment
+
+Finnhub is optional market-data enrichment for candidate audit context. It must not be treated as trade approval, sizing, or a risk override. Orders still require `RiskEngine -> OrderManager -> AlpacaAdapter`.
+
+Enable it only after code deployment and a clean service restart/resume:
+
+```bash
+FINNHUB_API_KEY=...
+```
+
+To disable it, remove or blank `FINNHUB_API_KEY` in `/opt/auto-trader/.env` and restart the service. Restarting Oracle intentionally persists `HALTED`; resume manually only after `/status` is clean.
+
+Before leaving Finnhub enabled unattended:
+
+- Confirm `/status` has no warnings after one supervisor tick.
+- Confirm `signals.features_json` contains Finnhub context for new candidates.
+- Confirm supervisor ticks do not time out.
+- Watch API-budget logs; Finnhub calls are nonessential and should be disabled if free-tier limits or latency become noisy.
 
 ## Wednesday Market-Open Checklist
 

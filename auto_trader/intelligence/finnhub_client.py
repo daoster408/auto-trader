@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
@@ -32,6 +33,10 @@ def _str_or_none(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _safe_error(value: Exception) -> str:
+    return re.sub(r"token=[^&\s)]+", "token=[REDACTED]", str(value))
 
 
 class FinnhubClient:
@@ -68,22 +73,26 @@ class FinnhubClient:
         if not clean_symbol:
             return {"provider": "finnhub", "enabled": True, "error": "missing_symbol"}
 
-        try:
-            quote, profile, news = await asyncio.gather(
-                self.quote(clean_symbol),
-                self.company_profile(clean_symbol),
-                self.company_news(clean_symbol, days=news_days, limit=max_news),
-            )
-            return {
-                "provider": "finnhub",
-                "enabled": True,
-                "quote": quote,
-                "profile": profile,
-                "news": news,
-            }
-        except Exception as e:
-            log.warning("finnhub_enrichment_failed", symbol=clean_symbol, error=str(e))
-            return {"provider": "finnhub", "enabled": True, "error": str(e)}
+        quote, profile, news = await asyncio.gather(
+            self.quote(clean_symbol),
+            self.company_profile(clean_symbol),
+            self.company_news(clean_symbol, days=news_days, limit=max_news),
+            return_exceptions=True,
+        )
+        return {
+            "provider": "finnhub",
+            "enabled": True,
+            "quote": self._value_or_error("quote", clean_symbol, quote),
+            "profile": self._value_or_error("profile", clean_symbol, profile),
+            "news": self._value_or_error("company-news", clean_symbol, news),
+        }
+
+    def _value_or_error(self, endpoint: str, symbol: str, value: Any) -> Any:
+        if not isinstance(value, Exception):
+            return value
+        error = _safe_error(value)
+        log.warning("finnhub_endpoint_failed", symbol=symbol, endpoint=endpoint, error=error)
+        return {"error": error}
 
     async def quote(self, symbol: str) -> dict[str, Any]:
         data = await self._get_json("/quote", {"symbol": symbol}, endpoint="quote")

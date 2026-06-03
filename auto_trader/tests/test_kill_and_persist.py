@@ -46,6 +46,7 @@ from auto_trader.persistence.db import (
     get_runtime_config_value,
     get_runtime_config_values,
     init_db,
+    log_risk_decision,
     log_signal,
     load_system_state,
     reconcile_broker_orders,
@@ -508,6 +509,45 @@ async def test_signal_log_persists_features_json():
 
 
 @pytest.mark.asyncio
+async def test_risk_decision_persists_signal_id_link():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "signal_link.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        signal_id = await log_signal(
+            symbol="POET",
+            thesis="rules found momentum",
+            confidence=0.72,
+            source="rules_fallback",
+            features={"discovery": {"score": 6.0}},
+        )
+        risk_decision_id = await log_risk_decision(
+            signal_id=signal_id,
+            approved=True,
+            reason="Passed v1 risk gates",
+            symbol="POET",
+            side="long",
+            proposed_qty=1.0,
+            sized_qty=1.0,
+            equity_snapshot=100.0,
+            risk_metrics={"state": "ACTIVE"},
+            model_tag="rules_fallback/v0",
+            trace_id="trace1234",
+        )
+
+        assert signal_id is not None
+        assert risk_decision_id is not None
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT signal_id FROM risk_decisions WHERE id = ?",
+                (risk_decision_id,),
+            ).fetchone()
+
+        assert row[0] == signal_id
+
+
+@pytest.mark.asyncio
 async def test_finnhub_client_enriches_symbol_with_compact_payload(monkeypatch):
     client = FinnhubClient("test-key")
 
@@ -535,6 +575,28 @@ async def test_finnhub_client_enriches_symbol_with_compact_payload(monkeypatch):
     assert enriched["quote"]["current"] == 14.2
     assert enriched["profile"]["industry"] == "Semiconductors"
     assert enriched["news"][0]["headline"] == "POET headline"
+
+
+@pytest.mark.asyncio
+async def test_finnhub_client_preserves_partial_endpoint_failures(monkeypatch):
+    client = FinnhubClient("test-key")
+
+    async def fake_get_json(path, params, *, endpoint):
+        if endpoint == "quote":
+            return {"c": 14.2, "d": 0.3, "dp": 2.1, "h": 14.5, "l": 13.7, "o": 13.9, "pc": 13.9}
+        if endpoint == "profile2":
+            return {"name": "POET Technologies Inc", "ticker": "POET"}
+        if endpoint == "company-news":
+            raise RuntimeError("news endpoint unavailable token=secret123&symbol=POET")
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(client, "_get_json", fake_get_json)
+
+    enriched = await client.enrich_symbol("POET")
+
+    assert enriched["quote"]["current"] == 14.2
+    assert enriched["profile"]["name"] == "POET Technologies Inc"
+    assert enriched["news"]["error"] == "news endpoint unavailable token=[REDACTED]&symbol=POET"
 
 
 @pytest.mark.asyncio
@@ -911,6 +973,46 @@ async def test_order_manager_pauses_on_post_submit_persistence_failure(monkeypat
     assert sm.state == SystemState.PAUSED
 
 
+@pytest.mark.asyncio
+async def test_order_manager_persists_signal_id_in_risk_decision(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, DummySettings())
+    captured = {}
+
+    class FakeAdapter:
+        async def submit_order(self, **kwargs):
+            return {
+                "id": "broker-ok",
+                "client_order_id": "broker-ok",
+                "symbol": kwargs["symbol"],
+                "qty": kwargs["qty"],
+                "side": kwargs["side"],
+                "order_type": kwargs["order_type"],
+                "status": "accepted",
+            }
+
+    async def fake_log_risk_decision(**kwargs):
+        captured.update(kwargs)
+        return 42
+
+    async def fake_upsert_order_record(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr("auto_trader.execution.order_manager.log_risk_decision", fake_log_risk_decision)
+    monkeypatch.setattr("auto_trader.execution.order_manager.upsert_order_record", fake_upsert_order_record)
+
+    manager = OrderManager(risk, FakeAdapter())
+    result = await manager.submit_trade_intent(
+        TradeIntent(symbol="AMPX", side="long", entry_price=23.89),
+        DummySnapshot(),
+        signal_id=7,
+    )
+
+    assert captured["signal_id"] == 7
+    assert result["signal_id"] == 7
+    assert result["risk_decision"]["risk_decision_id"] == 42
+
+
 def test_telegram_status_and_report_include_account_position_and_order():
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     bot = TelegramBot(
@@ -1218,11 +1320,15 @@ async def test_telegram_allowlisted_user_id_does_not_authorize_group_chat():
 @pytest.mark.asyncio
 async def test_telegram_authorized_status_reads_snapshot(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class PaperAdapter:
+        paper = True
+
     bot = TelegramBot(
         token="token",
         state_machine=sm,
         risk_engine=RiskEngine(sm, DummySettings()),
-        adapter=object(),
+        adapter=PaperAdapter(),
         resume_token="resume",
         allowed_ids=[123],
     )
@@ -1290,6 +1396,45 @@ def test_telegram_status_surfaces_runtime_auto_entry_disabled():
 
     assert "Runtime auto-entry: False" in status
     assert "New entries: disabled by runtime config" in status
+
+
+def test_telegram_status_clamps_stale_runtime_cap_in_live_mode():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class LiveAdapter:
+        paper = False
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=LiveAdapter(),
+        resume_token="resume",
+    )
+
+    status = bot._build_status_message(
+        {
+            "health": {"status": "CONNECTED", "paper": False, "market_open": True},
+            "account": {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "buying_power": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            },
+            "positions": [],
+            "orders": [],
+            "reconciled": 0,
+            "today_new_entries": 1,
+            "runtime_config": {"auto_entry_enabled": "true", "max_new_positions_per_day": "3"},
+            "errors": [],
+        }
+    )
+
+    assert "Today new entries: 1 / 1" in status
+    assert "New entries: blocked by daily-entry limit" in status
 
 
 @pytest.mark.asyncio
@@ -3014,7 +3159,7 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        async def submit_trade_intent(self, intent, snapshot):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             self.calls.append((intent, snapshot))
             return {"order": {"id": "entry-1"}, "risk_decision": {"approved": True}}
 
@@ -3087,7 +3232,7 @@ async def test_supervisor_auto_entry_uses_runtime_entry_cap(monkeypatch):
         def __init__(self):
             self.snapshots = []
 
-        async def submit_trade_intent(self, intent, snapshot):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             self.snapshots.append(snapshot)
             return {"order": {"id": "entry-runtime-cap"}, "risk_decision": {"approved": True}}
 
@@ -3172,7 +3317,7 @@ async def test_supervisor_blocks_auto_entry_when_broker_has_open_entry_order(mon
         def __init__(self):
             self.calls = 0
 
-        async def submit_trade_intent(self, intent, snapshot):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             self.calls += 1
             return {"order": {"id": "entry-1"}}
 
@@ -3255,7 +3400,7 @@ async def test_supervisor_account_risk_halt_flattens_and_blocks_entry(monkeypatc
         def __init__(self):
             self.calls = 0
 
-        async def submit_trade_intent(self, intent, snapshot):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             self.calls += 1
             return {"order": {"id": "entry-1"}}
 
@@ -3346,7 +3491,7 @@ async def test_supervisor_blocks_auto_entry_when_positions_unavailable(monkeypat
         def __init__(self):
             self.calls = 0
 
-        async def submit_trade_intent(self, intent, snapshot):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             self.calls += 1
             return {"order": {"id": "entry-1"}}
 
