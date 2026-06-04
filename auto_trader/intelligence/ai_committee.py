@@ -78,12 +78,18 @@ def build_research_packet(intent: TradeIntent, *, signal_id: int | None = None) 
 
 
 def packet_hash(packet: dict[str, Any]) -> str:
-    payload = json.dumps(packet, sort_keys=True, separators=(",", ":"), default=str)
+    stable_packet = dict(packet)
+    stable_packet.pop("generated_at", None)
+    stable_packet.pop("signal_id", None)
+    payload = json.dumps(stable_packet, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def validate_committee_output(symbol: str, output: dict[str, Any]) -> tuple[bool, list[str]]:
     errors: list[str] = []
+    for field in COMMITTEE_REQUIRED_FIELDS:
+        if field not in output:
+            errors.append(f"missing_{field}")
     if str(output.get("symbol", "")).upper() != symbol.upper():
         errors.append("symbol_mismatch")
     if output.get("verdict") not in VALID_VERDICTS:
@@ -91,13 +97,15 @@ def validate_committee_output(symbol: str, output: dict[str, Any]) -> tuple[bool
     if output.get("used_only_provided_data") is not True:
         errors.append("used_unverified_data")
     confidence = output.get("confidence")
-    if confidence is not None:
-        try:
-            value = float(confidence)
-            if value < 0 or value > 1:
-                errors.append("confidence_out_of_range")
-        except (TypeError, ValueError):
-            errors.append("confidence_not_numeric")
+    try:
+        value = float(confidence)
+        if value < 0 or value > 1:
+            errors.append("confidence_out_of_range")
+    except (TypeError, ValueError):
+        errors.append("confidence_not_numeric")
+    for field in ("bull_case", "bear_case", "judge_summary"):
+        if not isinstance(output.get(field), str) or not output.get(field, "").strip():
+            errors.append(f"invalid_{field}")
     return not errors, errors
 
 
@@ -372,28 +380,33 @@ class GeminiResearchCommittee(HTTPResearchCommittee):
 
 def create_research_committee(settings: Any) -> ResearchCommittee:
     provider = str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()
-    model = str(getattr(settings, "ai_research_model", "") or _default_model(provider))
     if provider == "shadow":
         return ShadowResearchCommittee()
+    model = _required_model(settings, provider)
+    timeout_seconds = float(getattr(settings, "ai_research_timeout_seconds", 8.0) or 8.0)
     if provider == "openai":
         return OpenAIResearchCommittee(
             _required_key(settings, "openai_api_key", provider),
             model=model,
+            timeout_seconds=timeout_seconds,
         )
     if provider == "xai":
         return XAIResearchCommittee(
             _required_key(settings, "xai_api_key", provider),
             model=model,
+            timeout_seconds=timeout_seconds,
         )
     if provider == "anthropic":
         return AnthropicResearchCommittee(
             _required_key(settings, "anthropic_api_key", provider),
             model=model,
+            timeout_seconds=timeout_seconds,
         )
     if provider == "gemini":
         return GeminiResearchCommittee(
             _required_key(settings, "gemini_api_key", provider),
             model=model,
+            timeout_seconds=timeout_seconds,
         )
     raise ValueError(f"unsupported AI_RESEARCH_PROVIDER={provider}")
 
@@ -405,13 +418,11 @@ def _required_key(settings: Any, attr: str, provider: str) -> str:
     return value
 
 
-def _default_model(provider: str) -> str:
-    return {
-        "openai": "gpt-5.1",
-        "xai": "grok-4.3",
-        "anthropic": "claude-sonnet-4-20250514",
-        "gemini": "gemini-3.5-flash",
-    }.get(provider, "gpt-5.1")
+def _required_model(settings: Any, provider: str) -> str:
+    value = str(getattr(settings, "ai_research_model", "") or "").strip()
+    if not value:
+        raise ValueError(f"AI_RESEARCH_PROVIDER={provider} requires AI_RESEARCH_MODEL")
+    return value
 
 
 def _extract_openai_response_json(response: dict[str, Any]) -> dict[str, Any]:

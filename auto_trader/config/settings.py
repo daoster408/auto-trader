@@ -57,6 +57,8 @@ class Settings(BaseSettings):
         alias="AI_RESEARCH_PROVIDER",
     )
     ai_research_model: str = Field("", alias="AI_RESEARCH_MODEL")
+    ai_research_timeout_seconds: float = Field(8.0, ge=1.0, le=15.0, alias="AI_RESEARCH_TIMEOUT_SECONDS")
+    ai_research_max_calls_per_day: int = Field(0, ge=0, alias="AI_RESEARCH_MAX_CALLS_PER_DAY")
     openai_api_key: str | None = Field(None, alias="OPENAI_API_KEY")
     anthropic_api_key: str | None = Field(None, alias="ANTHROPIC_API_KEY")
     xai_api_key: str | None = Field(None, alias="XAI_API_KEY")

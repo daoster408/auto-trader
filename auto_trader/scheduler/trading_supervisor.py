@@ -11,13 +11,19 @@ from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.core.models import KillResult, SystemState
 from auto_trader.execution.order_manager import OrderManager
-from auto_trader.intelligence.ai_committee import create_research_committee
+from auto_trader.intelligence.ai_committee import (
+    ShadowResearchCommittee,
+    build_research_packet,
+    create_research_committee,
+    packet_hash,
+)
 from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
 from auto_trader.persistence.db import (
     append_journal_entry,
     clear_pending_exit,
     count_entry_orders_since,
+    count_ai_research_memos,
     get_latest_entry_order_for_symbol,
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
@@ -172,7 +178,11 @@ class TradingSupervisor:
         self._pending_exit_symbols: set[str] = set()
         self._last_risk_sweep_dates: set[str] = set()
         self.finnhub_client = FinnhubClient(getattr(settings, "finnhub_api_key", None))
-        self.research_committee = create_research_committee(settings)
+        self.research_committee = (
+            create_research_committee(settings)
+            if bool(getattr(settings, "ai_research_enabled", True))
+            else ShadowResearchCommittee()
+        )
 
     async def _notify(self, message: str) -> None:
         log.warning("supervisor_alert", message=message)
@@ -545,23 +555,7 @@ class TradingSupervisor:
             features=intent.features,
         )
         if bool(getattr(self.settings, "ai_research_enabled", True)):
-            try:
-                memo = await self.research_committee.research(intent, signal_id=signal_id)
-                await log_ai_research_memo(
-                    signal_id=signal_id,
-                    symbol=memo.symbol,
-                    provider=memo.provider,
-                    model_tag=memo.model_tag,
-                    prompt_version=memo.prompt_version,
-                    input_hash=memo.input_hash,
-                    verdict=memo.verdict,
-                    confidence=memo.confidence,
-                    used_only_provided_data=memo.used_only_provided_data,
-                    validation_passed=memo.validation_passed,
-                    memo=memo.memo,
-                )
-            except Exception as e:
-                log.warning("ai_research_shadow_failed", symbol=intent.symbol, error=str(e))
+            await self._run_ai_research(intent, signal_id=signal_id)
         snapshot = type(
             "SupervisorSnapshot",
             (object,),
@@ -576,6 +570,95 @@ class TradingSupervisor:
         if result.get("order"):
             await self._notify(f"ENTRY RESULT: {intent.symbol} - {result.get('risk_decision')} - {result.get('order')}")
         return result
+
+    async def _run_ai_research(self, intent, *, signal_id: int | None) -> None:
+        provider = str(getattr(self.research_committee, "provider", "shadow"))
+        packet = build_research_packet(intent, signal_id=signal_id)
+        digest = packet_hash(packet)
+        model_tag = str(getattr(self.research_committee, "model_tag", provider))
+        if provider != "shadow":
+            existing = await count_ai_research_memos(provider=provider, input_hash=digest)
+            if existing is None:
+                log.warning("ai_research_skipped_budget_count_failed", symbol=intent.symbol, provider=provider)
+                return
+            if existing > 0:
+                log.info("ai_research_deduped", symbol=intent.symbol, provider=provider, input_hash=digest[:12])
+                return
+            daily_max = int(getattr(self.settings, "ai_research_max_calls_per_day", 0) or 0)
+            daily_count = await count_ai_research_memos(provider=provider, today_utc=True)
+            if daily_count is None:
+                log.warning("ai_research_skipped_budget_count_failed", symbol=intent.symbol, provider=provider)
+                return
+            if daily_max <= 0 or daily_count >= daily_max:
+                await log_ai_research_memo(
+                    signal_id=signal_id,
+                    symbol=intent.symbol,
+                    provider=provider,
+                    model_tag=model_tag,
+                    prompt_version="ai_research_budget/v0",
+                    input_hash=digest,
+                    verdict="watch",
+                    confidence=None,
+                    used_only_provided_data=True,
+                    validation_passed=False,
+                    memo={
+                        "input_packet": packet,
+                        "committee": {
+                            "symbol": intent.symbol.upper(),
+                            "verdict": "watch",
+                            "confidence": None,
+                            "used_only_provided_data": True,
+                            "validation_errors": ["ai_research_budget_exhausted"],
+                            "judge_summary": (
+                                "Real-provider research skipped because daily paid-call budget is exhausted "
+                                "or not explicitly enabled."
+                            ),
+                        },
+                        "budget": {"daily_max": daily_max, "daily_count": daily_count},
+                    },
+                )
+                return
+        try:
+            memo = await self.research_committee.research(intent, signal_id=signal_id)
+            await log_ai_research_memo(
+                signal_id=signal_id,
+                symbol=memo.symbol,
+                provider=memo.provider,
+                model_tag=memo.model_tag,
+                prompt_version=memo.prompt_version,
+                input_hash=memo.input_hash,
+                verdict=memo.verdict,
+                confidence=memo.confidence,
+                used_only_provided_data=memo.used_only_provided_data,
+                validation_passed=memo.validation_passed,
+                memo=memo.memo,
+            )
+        except Exception as e:
+            await log_ai_research_memo(
+                signal_id=signal_id,
+                symbol=intent.symbol,
+                provider=provider,
+                model_tag=model_tag,
+                prompt_version="ai_research_failure/v0",
+                input_hash=digest,
+                verdict="watch",
+                confidence=None,
+                used_only_provided_data=True,
+                validation_passed=False,
+                memo={
+                    "input_packet": packet,
+                    "committee": {
+                        "symbol": intent.symbol.upper(),
+                        "verdict": "watch",
+                        "confidence": None,
+                        "used_only_provided_data": True,
+                        "validation_errors": ["ai_research_provider_failed"],
+                        "judge_summary": "Real-provider research failed; deterministic RiskEngine remains authoritative.",
+                    },
+                    "error": str(e),
+                },
+            )
+            log.warning("ai_research_failed", symbol=intent.symbol, provider=provider, error=str(e))
 
     async def tick_once(self) -> SupervisorTickResult:
         alerts: list[str] = []

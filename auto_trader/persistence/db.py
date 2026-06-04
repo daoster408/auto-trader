@@ -339,6 +339,42 @@ async def get_latest_ai_research_memos(limit: int = 10) -> list[dict[str, Any]]:
             return []
 
 
+async def count_ai_research_memos(
+    *,
+    provider: str | None = None,
+    input_hash: str | None = None,
+    today_utc: bool = False,
+) -> int | None:
+    """Count AI research audit rows for budget and dedupe gates."""
+    conditions: list[str] = []
+    params: list[Any] = []
+    if provider is not None:
+        conditions.append("provider = ?")
+        params.append(str(provider))
+    if input_hash is not None:
+        conditions.append("input_hash = ?")
+        params.append(str(input_hash))
+    if today_utc:
+        conditions.append("date(created_at) = date('now')")
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    f"SELECT COUNT(*) AS count FROM ai_research_memos {where}",
+                    tuple(params),
+                )
+                row = await cur.fetchone()
+                return int(row["count"] if row is not None else 0)
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("ai_research_memo_count_failed", provider=provider, input_hash=input_hash, error=str(e))
+            return None
+
+
 async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | None = None, rationale: str | None = None) -> bool:
     """Persist or refresh an order row from broker/manager normalized data."""
     client_order_id = str(order.get("client_order_id") or order.get("id") or order.get("broker_order_id") or "")

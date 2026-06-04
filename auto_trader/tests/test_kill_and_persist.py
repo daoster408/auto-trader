@@ -38,6 +38,7 @@ from auto_trader.intelligence.ai_committee import (
     OpenAIResearchCommittee,
     ShadowResearchCommittee,
     XAIResearchCommittee,
+    packet_hash,
     create_research_committee,
     validate_committee_output,
 )
@@ -101,7 +102,9 @@ class DummySupervisorSettings(DummySettings):
     report_timezone = "America/Los_Angeles"
     ai_research_enabled = False
     ai_research_provider = "shadow"
-    ai_research_model = "gpt-4.1-mini"
+    ai_research_model = ""
+    ai_research_timeout_seconds = 8
+    ai_research_max_calls_per_day = 0
 
 
 class DummyDay3Settings:
@@ -843,9 +846,23 @@ def test_ai_committee_validator_rejects_unverified_data():
     assert "used_unverified_data" in errors
 
 
+def test_ai_committee_validator_rejects_missing_required_fields():
+    valid, errors = validate_committee_output(
+        "POET",
+        {"symbol": "POET", "verdict": "watch", "used_only_provided_data": True},
+    )
+
+    assert valid is False
+    assert "missing_confidence" in errors
+    assert "missing_bull_case" in errors
+    assert "missing_bear_case" in errors
+    assert "missing_judge_summary" in errors
+
+
 def test_research_committee_factory_wires_real_providers_and_requires_keys():
     class Base:
-        ai_research_model = ""
+        ai_research_model = "explicit-model"
+        ai_research_timeout_seconds = 4
         openai_api_key = "openai-key"
         xai_api_key = "xai-key"
         anthropic_api_key = "anthropic-key"
@@ -867,16 +884,23 @@ def test_research_committee_factory_wires_real_providers_and_requires_keys():
         ai_research_provider = "openai"
         openai_api_key = ""
 
+    class MissingModel(Base):
+        ai_research_provider = "openai"
+        ai_research_model = ""
+
     assert isinstance(create_research_committee(OpenAISettings()), OpenAIResearchCommittee)
-    assert create_research_committee(OpenAISettings()).model == "gpt-5.1"
+    assert create_research_committee(OpenAISettings()).model == "explicit-model"
+    assert create_research_committee(OpenAISettings()).timeout_seconds == 4
     assert isinstance(create_research_committee(XAISettings()), XAIResearchCommittee)
-    assert create_research_committee(XAISettings()).model == "grok-4.3"
+    assert create_research_committee(XAISettings()).model == "explicit-model"
     assert isinstance(create_research_committee(AnthropicSettings()), AnthropicResearchCommittee)
-    assert create_research_committee(AnthropicSettings()).model == "claude-sonnet-4-20250514"
+    assert create_research_committee(AnthropicSettings()).model == "explicit-model"
     assert isinstance(create_research_committee(GeminiSettings()), GeminiResearchCommittee)
-    assert create_research_committee(GeminiSettings()).model == "gemini-3.5-flash"
+    assert create_research_committee(GeminiSettings()).model == "explicit-model"
     with pytest.raises(ValueError, match="requires OPENAI_API_KEY"):
         create_research_committee(MissingOpenAI())
+    with pytest.raises(ValueError, match="requires AI_RESEARCH_MODEL"):
+        create_research_committee(MissingModel())
 
 
 def test_real_provider_extractors_parse_structured_json():
@@ -900,6 +924,120 @@ def test_real_provider_extractors_parse_structured_json():
     assert xai._extract_output({"choices": [{"message": {"content": text}}]}) == payload
     assert anthropic._extract_output({"content": [{"type": "text", "text": text}]}) == payload
     assert gemini._extract_output({"candidates": [{"content": {"parts": [{"text": text}]}}]}) == payload
+
+
+def test_provider_http_errors_redact_api_keys(monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise RuntimeError("provider rejected secret-key-value")
+
+    monkeypatch.setattr("auto_trader.intelligence.ai_committee.urlopen", fake_urlopen)
+    gemini = GeminiResearchCommittee("secret-key-value", model="gemini-2.5-flash")
+
+    with pytest.raises(RuntimeError) as exc:
+        gemini._post_json(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            {},
+            {"x-goog-api-key": "secret-key-value"},
+        )
+
+    assert "secret-key-value" not in str(exc.value)
+    assert "[REDACTED]" in str(exc.value)
+
+
+def test_ai_research_packet_hash_ignores_volatile_metadata():
+    base = {
+        "generated_at": "2026-06-04T15:00:00Z",
+        "signal_id": 1,
+        "candidate": {"symbol": "POET", "confidence": 0.7},
+        "features": {"discovery": {"score": 5.0}},
+    }
+    later = {
+        **base,
+        "generated_at": "2026-06-04T15:01:00Z",
+        "signal_id": 2,
+    }
+
+    assert packet_hash(base) == packet_hash(later)
+
+
+def test_supervisor_does_not_instantiate_real_provider_when_ai_disabled():
+    class DisabledAISettings(DummySupervisorSettings):
+        ai_research_enabled = False
+        ai_research_provider = "openai"
+        ai_research_model = ""
+        openai_api_key = ""
+
+    supervisor = TradingSupervisor(
+        settings=DisabledAISettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+
+    assert isinstance(supervisor.research_committee, ShadowResearchCommittee)
+
+
+@pytest.mark.asyncio
+async def test_real_provider_budget_zero_skips_and_persists_audit_row():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_budget.db")
+        await init_db()
+
+        class BudgetSettings(DummySupervisorSettings):
+            ai_research_enabled = True
+            ai_research_provider = "openai"
+            ai_research_model = "gpt-5.5"
+            ai_research_max_calls_per_day = 0
+            openai_api_key = "openai-key"
+
+        supervisor = TradingSupervisor(
+            settings=BudgetSettings(),
+            state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+            adapter=object(),
+            order_manager=object(),
+        )
+        intent = TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7)
+
+        await supervisor._run_ai_research(intent, signal_id=12)
+
+        memos = await get_latest_ai_research_memos(limit=1)
+        assert len(memos) == 1
+        assert memos[0]["provider"] == "openai"
+        assert memos[0]["prompt_version"] == "ai_research_budget/v0"
+        assert memos[0]["validation_passed"] is False
+        assert memos[0]["memo"]["budget"]["daily_max"] == 0
+
+
+@pytest.mark.asyncio
+async def test_real_provider_budget_count_failure_skips_provider_call(monkeypatch):
+    class BudgetSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 5
+        openai_api_key = "openai-key"
+
+    class ExplodingCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+        async def research(self, intent, *, signal_id=None):
+            raise AssertionError("provider should not be called when budget count fails")
+
+    async def fake_count(**kwargs):
+        return None
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", fake_count)
+    supervisor = TradingSupervisor(
+        settings=BudgetSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+    supervisor.research_committee = ExplodingCommittee()
+    intent = TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7)
+
+    await supervisor._run_ai_research(intent, signal_id=12)
 
 
 @pytest.mark.asyncio
