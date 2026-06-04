@@ -32,6 +32,8 @@ from auto_trader.ai_research_preflight import (
     run_ai_research_preflight,
 )
 import auto_trader.ai_research_smoke as ai_research_smoke
+import auto_trader.ai_entry_gate_rehearsal as ai_entry_gate_rehearsal
+from auto_trader.ai_entry_gate_rehearsal import run_ai_entry_gate_rehearsal, render_ai_entry_gate_rehearsal
 from auto_trader.ai_research_smoke import run_ai_research_smoke
 from auto_trader.ai_research_smoke import render_ai_research_smoke
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
@@ -1557,6 +1559,202 @@ async def test_ai_research_preflight_count_failure_uses_no_provider_call(monkeyp
     assert "State: NOT_READY" in report_text
     assert "budget count unavailable" in report_text
     assert any(gate.name == "Budget count available" and gate.status == "FAIL" for gate in gates)
+
+
+class FakeRehearsalAdapter:
+    async def get_account_snapshot(self):
+        return {
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 100.0,
+            "cash": 90.0,
+            "buying_power": 90.0,
+        }
+
+    async def get_clock(self):
+        return {"is_open": True, "next_close": "2026-06-04T20:00:00+00:00"}
+
+    async def get_positions_snapshot(self, *, strict=False):
+        return []
+
+
+class FakeRehearsalCommittee:
+    provider = "openai"
+    model_tag = "openai/model"
+
+    def __init__(self, verdict: str):
+        self.verdict = verdict
+
+    async def research(self, intent, *, signal_id=None):
+        return _provider_memo("openai", self.verdict, confidence=0.8)
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_rehearsal_approve_would_continue(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_entry_gate_rehearsal.db")
+
+        class RehearsalSettings(DummySupervisorSettings):
+            db_path = str(Path(tmp) / "ai_entry_gate_rehearsal.db")
+            ai_research_enabled = True
+            ai_research_provider = "openai"
+            ai_research_model = "gpt-5.5"
+            ai_research_max_calls_per_day = 1
+            openai_api_key = "openai-key"
+
+        async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+            return [
+                TradeIntent(
+                    symbol="POET",
+                    side="long",
+                    entry_price=10.0,
+                    confidence=0.8,
+                    features={"research_context": {"market": {"provider": "alpaca"}}},
+                )
+            ]
+
+        async def fake_entry_count(start_utc_iso):
+            return 0
+
+        monkeypatch.setattr("auto_trader.ai_entry_gate_rehearsal.get_simple_rules_signals", fake_signals)
+        monkeypatch.setattr("auto_trader.ai_entry_gate_rehearsal.count_entry_orders_since", fake_entry_count)
+
+        result = await run_ai_entry_gate_rehearsal(
+            settings=RehearsalSettings(),
+            adapter=FakeRehearsalAdapter(),
+            committee=FakeRehearsalCommittee("approve"),
+        )
+        text = render_ai_entry_gate_rehearsal(result)
+
+        assert result.ok is True
+        assert result.called_provider is True
+        assert result.would_continue_to_risk_engine is True
+        assert result.verdict == "approve"
+        assert "State: WOULD_CONTINUE_TO_RISKENGINE" in text
+        assert "No orders submitted" in text
+        memos = await get_latest_ai_research_memos(limit=1)
+        assert memos[0]["provider"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_rehearsal_reject_would_block(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_entry_gate_rehearsal_reject.db")
+
+        class RehearsalSettings(DummySupervisorSettings):
+            db_path = str(Path(tmp) / "ai_entry_gate_rehearsal_reject.db")
+            ai_research_enabled = True
+            ai_research_provider = "openai"
+            ai_research_model = "gpt-5.5"
+            ai_research_max_calls_per_day = 1
+            openai_api_key = "openai-key"
+
+        async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+            return [TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.8)]
+
+        async def fake_entry_count(start_utc_iso):
+            return 0
+
+        monkeypatch.setattr("auto_trader.ai_entry_gate_rehearsal.get_simple_rules_signals", fake_signals)
+        monkeypatch.setattr("auto_trader.ai_entry_gate_rehearsal.count_entry_orders_since", fake_entry_count)
+
+        result = await run_ai_entry_gate_rehearsal(
+            settings=RehearsalSettings(),
+            adapter=FakeRehearsalAdapter(),
+            committee=FakeRehearsalCommittee("reject"),
+        )
+        text = render_ai_entry_gate_rehearsal(result)
+
+        assert result.ok is True
+        assert result.would_continue_to_risk_engine is False
+        assert result.verdict == "reject"
+        assert "State: WOULD_BLOCK_BEFORE_RISKENGINE" in text
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_rehearsal_provider_failure_is_chargeable(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_entry_gate_rehearsal_failure.db")
+
+        class RehearsalSettings(DummySupervisorSettings):
+            db_path = str(Path(tmp) / "ai_entry_gate_rehearsal_failure.db")
+            ai_research_enabled = True
+            ai_research_provider = "openai"
+            ai_research_model = "gpt-5.5"
+            ai_research_max_calls_per_day = 3
+            openai_api_key = "openai-key"
+
+        class FailingRehearsalCommittee:
+            provider = "openai"
+            model_tag = "openai/model"
+
+            async def research(self, intent, *, signal_id=None):
+                raise RuntimeError("provider timeout")
+
+        async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+            return [TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.8)]
+
+        async def fake_entry_count(start_utc_iso):
+            return 0
+
+        monkeypatch.setattr("auto_trader.ai_entry_gate_rehearsal.get_simple_rules_signals", fake_signals)
+        monkeypatch.setattr("auto_trader.ai_entry_gate_rehearsal.count_entry_orders_since", fake_entry_count)
+
+        result = await run_ai_entry_gate_rehearsal(
+            settings=RehearsalSettings(),
+            adapter=FakeRehearsalAdapter(),
+            committee=FailingRehearsalCommittee(),
+        )
+
+        assert result.ok is True
+        assert result.called_provider is True
+        assert result.would_continue_to_risk_engine is False
+        assert result.prompt_version == "ai_research_failure/v0"
+        assert result.used_before == 0
+        assert result.used_after == 1
+        assert await count_ai_research_chargeable_attempts(provider="openai", today_utc=True) == 1
+        memos = await get_latest_ai_research_memos(limit=1)
+        assert memos[0]["prompt_version"] == "ai_research_failure/v0"
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_rehearsal_zero_budget_does_not_call_provider(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_entry_gate_rehearsal_zero.db")
+
+        class RehearsalSettings(DummySupervisorSettings):
+            db_path = str(Path(tmp) / "ai_entry_gate_rehearsal_zero.db")
+            ai_research_enabled = True
+            ai_research_provider = "openai"
+            ai_research_model = "gpt-5.5"
+            ai_research_max_calls_per_day = 0
+            openai_api_key = "openai-key"
+
+        class ExplodingCommittee:
+            provider = "openai"
+            model_tag = "openai/model"
+
+            async def research(self, intent, *, signal_id=None):
+                raise AssertionError("provider should not be called with zero budget")
+
+        result = await run_ai_entry_gate_rehearsal(
+            settings=RehearsalSettings(),
+            adapter=FakeRehearsalAdapter(),
+            committee=ExplodingCommittee(),
+        )
+
+        assert result.ok is False
+        assert result.called_provider is False
+        assert result.reason == "AI_RESEARCH_MAX_CALLS_PER_DAY must be positive"
+
+
+def test_ai_entry_gate_rehearsal_does_not_import_order_or_risk_stack():
+    source = inspect.getsource(ai_entry_gate_rehearsal)
+
+    assert "OrderManager" not in source
+    assert "RiskEngine" not in source
+    assert "submit_trade_intent" not in source
+    assert "submit_order" not in source
 
 
 def test_supervisor_does_not_instantiate_real_provider_when_ai_disabled():

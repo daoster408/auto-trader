@@ -214,6 +214,20 @@ sudo -u auto-trader AUTO_TRADER_ENV_FILE=/opt/auto-trader/.env /opt/auto-trader/
 
 The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit model, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, enough calls remaining for the UTC day, and a bounded timeout. It also prints the effective `AI entry gate enabled` state after runtime config is applied. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
 
+After preflight is `READY`, run a no-order rehearsal against the real current candidate packet:
+
+```bash
+scripts/ai_entry_gate_rehearsal.sh
+```
+
+On Oracle:
+
+```bash
+sudo -u auto-trader AUTO_TRADER_ENV_FILE=/opt/auto-trader/.env /opt/auto-trader/scripts/ai_entry_gate_rehearsal.sh
+```
+
+The rehearsal can call paid AI providers and consume the configured daily AI budget. It uses live discovery plus Finnhub/FRED/risk context, logs AI research memos for audit, and prints whether the gate would block before `RiskEngine` or would continue to `RiskEngine`. It never imports `OrderManager`, never calls `RiskEngine`, and never submits an order.
+
 For Claude/Anthropic testing, set pricing assumptions explicitly in `.env` before trusting the estimate:
 
 ```bash
