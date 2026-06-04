@@ -86,7 +86,7 @@ def build_ai_research_preflight_report(
     timeout_seconds = float(getattr(settings, "ai_research_timeout_seconds", 8.0) or 8.0)
     real_provider = provider in _PROVIDER_KEY_ATTRS
     key_present = _provider_key_present(settings, provider)
-    remaining_calls = max_calls - used_calls if used_calls is not None else None
+    remaining_calls = max(0, max_calls - used_calls) if used_calls is not None else None
     cost = cost or _cost_assumptions_from_settings(settings)
 
     gates = [

@@ -1027,6 +1027,7 @@ def test_ai_research_preflight_zero_budget_not_ready():
     report = build_ai_research_preflight_report(settings=ZeroBudgetSettings(), used_calls=0)
 
     assert report.ready is False
+    assert report.remaining_calls == 0
     assert any(gate.name == "Daily call budget" and gate.status == "FAIL" for gate in report.gates)
 
 

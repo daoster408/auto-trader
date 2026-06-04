@@ -185,6 +185,12 @@ Run the read-only activation preflight before enabling any paid provider:
 scripts/ai_research_preflight.sh
 ```
 
+On Oracle, run it as the service user so it can read the locked `/opt/auto-trader/.env`:
+
+```bash
+sudo -u auto-trader AUTO_TRADER_ENV_FILE=/opt/auto-trader/.env /opt/auto-trader/scripts/ai_research_preflight.sh
+```
+
 The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit `AI_RESEARCH_MODEL`, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, calls remaining for the UTC day, and a bounded timeout. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
 
 For Claude/Anthropic testing, set pricing assumptions explicitly in `.env` before trusting the estimate:
