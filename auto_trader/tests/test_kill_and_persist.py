@@ -43,6 +43,7 @@ from auto_trader.intelligence.ai_committee import (
     OpenAIResearchCommittee,
     ShadowResearchCommittee,
     XAIResearchCommittee,
+    normalize_committee_output,
     packet_hash,
     create_research_committee,
     validate_committee_output,
@@ -934,6 +935,165 @@ def test_real_provider_extractors_parse_structured_json():
     assert xai._extract_output({"choices": [{"message": {"content": text}}]}) == payload
     assert anthropic._extract_output({"content": [{"type": "text", "text": text}]}) == payload
     assert gemini._extract_output({"candidates": [{"content": {"parts": [{"text": text}]}}]}) == payload
+
+
+def _opus_nested_committee_output(**committee_overrides):
+    committee = {
+        "advisory_note": (
+            "This is advisory research only. No order sizing or order submission is provided. "
+            "All conclusions are limited strictly to the supplied data packet."
+        ),
+        "assessment": {
+            "confidence_provided": 0.8428879654203442,
+            "entry_price": 4.67,
+            "side": "long",
+            "supporting_factors": [
+                "Positive intraday momentum with change_pct of +8.86%",
+                "Relative volume of 1.25 indicates above-average participation",
+                "Tight spread of 0.21% suggests adequate liquidity for entry/exit",
+            ],
+            "risk_factors": [
+                "Low absolute price can increase volatility.",
+                "Modest dollar volume may widen realized execution slippage.",
+                "Chasing an extended move increases reversal risk.",
+            ],
+        },
+        "data_limitations": [
+            "No historical price context.",
+            "No broader market/sector context.",
+            "Single snapshot metrics only.",
+            "No fundamental/catalyst data.",
+        ],
+    }
+    committee.update(committee_overrides)
+    return {"committee": committee}
+
+
+def test_normalizes_opus_nested_shape_but_requires_explicit_provided_data():
+    packet = {"candidate": {"symbol": "SPCE"}}
+
+    normalized, meta = normalize_committee_output(_opus_nested_committee_output(), packet)
+    valid, errors = validate_committee_output("SPCE", normalized)
+
+    assert meta["source_shape"] == "committee_wrapper"
+    assert normalized["symbol"] == "SPCE"
+    assert normalized["verdict"] == "watch"
+    assert normalized["confidence"] == 0.8428879654203442
+    assert normalized["used_only_provided_data"] is False
+    assert "Positive intraday momentum" in normalized["bull_case"]
+    assert "No historical price context" in normalized["bear_case"]
+    assert "advisory research only" in normalized["judge_summary"]
+    assert "normalized_missing_verdict" in normalized["normalization_errors"]
+    assert valid is False
+    assert "used_unverified_data" in errors
+
+
+def test_normalized_nested_shape_validates_with_explicit_provided_data_true():
+    packet = {"candidate": {"symbol": "SPCE"}}
+    output = _opus_nested_committee_output(used_only_provided_data=True)
+
+    normalized, _meta = normalize_committee_output(output, packet)
+    valid, errors = validate_committee_output("SPCE", normalized)
+
+    assert normalized["verdict"] == "watch"
+    assert normalized["used_only_provided_data"] is True
+    assert valid is True
+    assert errors == []
+
+
+def test_normalized_nested_shape_keeps_conflicting_provider_symbol_invalid():
+    packet = {"candidate": {"symbol": "SPCE"}}
+    output = _opus_nested_committee_output(symbol="TSLA", used_only_provided_data=True)
+
+    normalized, _meta = normalize_committee_output(output, packet)
+    valid, errors = validate_committee_output("SPCE", normalized)
+
+    assert normalized["symbol"] == "TSLA"
+    assert valid is False
+    assert "symbol_mismatch" in errors
+
+
+def test_normalized_nested_shape_does_not_invent_missing_confidence():
+    packet = {"candidate": {"symbol": "SPCE"}}
+    output = _opus_nested_committee_output(used_only_provided_data=True)
+    output["committee"]["assessment"].pop("confidence_provided")
+
+    normalized, _meta = normalize_committee_output(output, packet)
+    valid, errors = validate_committee_output("SPCE", normalized)
+
+    assert "confidence" not in normalized
+    assert "normalized_missing_confidence" in normalized["normalization_errors"]
+    assert valid is False
+    assert "missing_confidence" in errors
+
+
+def test_normalized_nested_shape_bounds_provider_text():
+    packet = {"candidate": {"symbol": "SPCE"}}
+    long_factor = "momentum " * 200
+    output = _opus_nested_committee_output(used_only_provided_data=True)
+    output["committee"]["assessment"]["supporting_factors"] = [long_factor]
+
+    normalized, _meta = normalize_committee_output(output, packet)
+
+    assert len(normalized["bull_case"]) <= 800
+    assert normalized["bull_case"].endswith("...")
+
+
+@pytest.mark.asyncio
+async def test_http_research_memo_preserves_raw_provider_output():
+    raw_output = _opus_nested_committee_output(used_only_provided_data=True)
+    anthropic = AnthropicResearchCommittee("key", model="claude-opus-4-8")
+
+    def fake_call_provider(packet):
+        return {
+            "id": "msg_test",
+            "content": [{"type": "text", "text": json.dumps(raw_output)}],
+        }
+
+    anthropic._call_provider = fake_call_provider
+    intent = TradeIntent(
+        symbol="SPCE",
+        side="long",
+        entry_price=4.67,
+        rationale="rules found momentum",
+        confidence=0.7,
+        features={},
+    )
+
+    memo = await anthropic.research(intent, signal_id=3)
+
+    assert memo.validation_passed is True
+    assert memo.memo["raw_committee_output"] == raw_output
+    assert memo.memo["normalization"]["source_shape"] == "committee_wrapper"
+    assert memo.memo["response_id"] == "msg_test"
+
+
+def test_anthropic_prompt_requires_exact_schema_without_wrapper_keys():
+    payload = {
+        "symbol": "SPCE",
+        "verdict": "watch",
+        "confidence": 0.5,
+        "used_only_provided_data": True,
+        "bull_case": "Provided packet shows momentum.",
+        "bear_case": "Catalyst is unverified.",
+        "judge_summary": "Watch only.",
+    }
+    packet = {"candidate": {"symbol": "SPCE"}}
+    captured = {}
+    anthropic = AnthropicResearchCommittee("key", model="claude-opus-4-8")
+
+    def fake_post(url, body, headers):
+        captured["body"] = body
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+
+    anthropic._post_json = fake_post
+    assert anthropic._call_provider(packet)["content"]
+
+    body = captured["body"]
+    assert "Return exactly one top-level JSON object" in body["system"]
+    assert "Do not wrap the object in committee" in body["system"]
+    assert "Return exactly the required JSON object" in body["messages"][0]["content"]
+    assert "no wrapper keys" in body["messages"][0]["content"]
 
 
 def test_provider_http_errors_redact_api_keys(monkeypatch):

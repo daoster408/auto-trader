@@ -23,7 +23,10 @@ PROMPT_VERSION = "ai_research_committee/v0"
 VALID_VERDICTS = {"approve", "reject", "watch"}
 COMMITTEE_INSTRUCTIONS = (
     "You are an advisory trading research committee. Use only the provided JSON packet. "
-    "Do not invent market facts. Do not recommend order size. Return only valid JSON."
+    "Do not invent market facts. Do not recommend order size. Return only valid JSON. "
+    "Return exactly one top-level JSON object with these keys only: symbol, verdict, "
+    "confidence, used_only_provided_data, bull_case, bear_case, judge_summary. "
+    "Do not wrap the object in committee, assessment, analysis, result, or any other key."
 )
 COMMITTEE_REQUIRED_FIELDS = [
     "symbol",
@@ -109,6 +112,103 @@ def validate_committee_output(symbol: str, output: dict[str, Any]) -> tuple[bool
     return not errors, errors
 
 
+def normalize_committee_output(
+    output: dict[str, Any], packet: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Convert common provider wrapper shapes into the strict committee schema.
+
+    Normalization preserves useful text but keeps validation conservative: missing
+    proof that only packet data was used still fails validation.
+    """
+    source = _committee_source(output)
+    assessment = source.get("assessment") if isinstance(source.get("assessment"), dict) else {}
+    normalized: dict[str, Any] = {}
+    markers: list[str] = []
+
+    provider_symbol = _first_present(output, source, assessment, key="symbol")
+    if isinstance(provider_symbol, str) and provider_symbol.strip():
+        normalized["symbol"] = provider_symbol.strip().upper()
+    else:
+        packet_symbol = (((packet or {}).get("candidate") or {}).get("symbol") if isinstance(packet, dict) else None)
+        if isinstance(packet_symbol, str) and packet_symbol.strip():
+            normalized["symbol"] = packet_symbol.strip().upper()
+            markers.append("normalized_symbol_from_packet")
+        else:
+            markers.append("normalized_missing_symbol")
+
+    verdict = _first_present(output, source, assessment, key="verdict")
+    if isinstance(verdict, str) and verdict.lower() in VALID_VERDICTS:
+        normalized["verdict"] = verdict.lower()
+    else:
+        normalized["verdict"] = "watch"
+        markers.append("normalized_missing_verdict" if verdict in (None, "") else "normalized_invalid_verdict")
+
+    confidence = _first_present(output, source, assessment, key="confidence")
+    if confidence is None:
+        confidence = _first_present(output, source, assessment, key="confidence_provided")
+    if confidence is not None:
+        normalized["confidence"] = confidence
+    else:
+        markers.append("normalized_missing_confidence")
+
+    used_only = _explicit_true(output, "used_only_provided_data")
+    if not used_only:
+        used_only = _explicit_true(source, "used_only_provided_data") or _explicit_true(
+            assessment, "used_only_provided_data"
+        )
+    normalized["used_only_provided_data"] = bool(used_only)
+    if not used_only:
+        markers.append("normalized_missing_used_only_provided_data")
+
+    bull_case = _bounded_text(
+        _first_text(
+            source.get("bull_case"),
+            assessment.get("bull_case"),
+            assessment.get("supporting_factors"),
+            source.get("supporting_factors"),
+        )
+    )
+    if bull_case:
+        normalized["bull_case"] = bull_case
+    else:
+        markers.append("normalized_missing_bull_case")
+
+    bear_parts = [
+        _first_text(source.get("bear_case"), assessment.get("bear_case"), assessment.get("risk_factors")),
+        _first_text(source.get("risk_factors")),
+        _first_text(source.get("data_limitations"), assessment.get("data_limitations")),
+    ]
+    bear_case = _bounded_text(" ".join(part for part in bear_parts if part))
+    if bear_case:
+        normalized["bear_case"] = bear_case
+    else:
+        markers.append("normalized_missing_bear_case")
+
+    judge_summary = _bounded_text(
+        _first_text(
+            source.get("judge_summary"),
+            assessment.get("judge_summary"),
+            source.get("advisory_note"),
+            source.get("final_judgment"),
+            source.get("recommendation"),
+            source.get("summary"),
+            assessment.get("summary"),
+        )
+    )
+    if judge_summary:
+        normalized["judge_summary"] = judge_summary
+    else:
+        markers.append("normalized_missing_judge_summary")
+
+    if markers:
+        normalized["normalization_errors"] = markers
+    return normalized, {
+        "applied": normalized != output,
+        "source_shape": "committee_wrapper" if source is not output else "top_level",
+        "markers": markers,
+    }
+
+
 def committee_json_schema(*, strict: bool = True) -> dict[str, Any]:
     schema: dict[str, Any] = {
         "type": "object",
@@ -130,7 +230,8 @@ def committee_json_schema(*, strict: bool = True) -> dict[str, Any]:
 
 def committee_prompt(packet: dict[str, Any]) -> str:
     return (
-        "Review this verified candidate packet and return the required JSON object.\n\n"
+        "Review this verified candidate packet. Return exactly the required JSON object, "
+        "with no wrapper keys and no extra prose.\n\n"
         f"{json.dumps(packet, sort_keys=True, default=str)}"
     )
 
@@ -211,7 +312,8 @@ class HTTPResearchCommittee:
         packet = build_research_packet(intent, signal_id=signal_id)
         digest = packet_hash(packet)
         raw = await asyncio.to_thread(self._call_provider, packet)
-        output = self._extract_output(raw)
+        raw_output = self._extract_output(raw)
+        output, normalization = normalize_committee_output(raw_output, packet)
         validation_passed, validation_errors = validate_committee_output(intent.symbol, output)
         if validation_errors:
             output["validation_errors"] = validation_errors
@@ -225,7 +327,13 @@ class HTTPResearchCommittee:
             confidence=_nullable_float(output.get("confidence")),
             used_only_provided_data=output.get("used_only_provided_data") is True,
             validation_passed=validation_passed,
-            memo={"input_packet": packet, "committee": output, "response_id": raw.get("id")},
+            memo={
+                "input_packet": packet,
+                "committee": output,
+                "raw_committee_output": raw_output,
+                "normalization": normalization,
+                "response_id": raw.get("id"),
+            },
         )
 
     def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
@@ -447,6 +555,57 @@ def _parse_json_text(text: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("committee output must be a JSON object")
     return value
+
+
+def _committee_source(output: dict[str, Any]) -> dict[str, Any]:
+    committee = output.get("committee")
+    if isinstance(committee, dict):
+        return committee
+    return output
+
+
+def _first_present(*sources: dict[str, Any], key: str) -> Any:
+    for source in sources:
+        if isinstance(source, dict) and key in source:
+            return source.get(key)
+    return None
+
+
+def _explicit_true(source: dict[str, Any], key: str) -> bool:
+    return isinstance(source, dict) and source.get(key) is True
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = _stringify_points(value)
+        if text:
+            return text
+    return ""
+
+
+def _stringify_points(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return " ".join(value.split())
+    if isinstance(value, list):
+        parts = [_stringify_points(item) for item in value]
+        return " ".join(part for part in parts if part)
+    if isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            text = _stringify_points(item)
+            if text:
+                parts.append(f"{key}: {text}")
+        return " ".join(parts)
+    return str(value).strip()
+
+
+def _bounded_text(text: str, *, limit: int = 800) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
 
 
 def _float(value: Any, default: float = 0.0) -> float:
