@@ -22,6 +22,7 @@ from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
 from auto_trader.persistence.db import (
     append_journal_entry,
     clear_pending_exit,
+    count_ai_research_chargeable_attempts,
     count_entry_orders_since,
     count_ai_research_memos,
     get_latest_entry_order_for_symbol,
@@ -585,7 +586,7 @@ class TradingSupervisor:
                 log.info("ai_research_deduped", symbol=intent.symbol, provider=provider, input_hash=digest[:12])
                 return
             daily_max = int(getattr(self.settings, "ai_research_max_calls_per_day", 0) or 0)
-            daily_count = await count_ai_research_memos(provider=provider, today_utc=True)
+            daily_count = await count_ai_research_chargeable_attempts(provider=provider, today_utc=True)
             if daily_count is None:
                 log.warning("ai_research_skipped_budget_count_failed", symbol=intent.symbol, provider=provider)
                 return

@@ -25,6 +25,7 @@ log = get_logger("auto_trader.persistence.db")
 
 _DB_PATH: Path = Path("auto_trader.db")
 _DB_LOCK = asyncio.Lock()  # single writer guarantee (simple & cheap for v1)
+CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = ("ai_research_committee/v0", "ai_research_failure/v0")
 
 
 def _utc_iso(dt: datetime) -> str:
@@ -372,6 +373,50 @@ async def count_ai_research_memos(
                 await db.close()
         except Exception as e:
             log.error("ai_research_memo_count_failed", provider=provider, input_hash=input_hash, error=str(e))
+            return None
+
+
+async def count_ai_research_chargeable_attempts(
+    *,
+    provider: str | None = None,
+    input_hash: str | None = None,
+    today_utc: bool = False,
+) -> int | None:
+    """Count real-provider AI attempts that should consume paid-call budget."""
+    conditions: list[str] = [
+        "provider != ?",
+        f"prompt_version IN ({','.join('?' for _ in CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS)})",
+    ]
+    params: list[Any] = ["shadow", *CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS]
+    if provider is not None:
+        conditions.append("provider = ?")
+        params.append(str(provider))
+    if input_hash is not None:
+        conditions.append("input_hash = ?")
+        params.append(str(input_hash))
+    if today_utc:
+        conditions.append("date(created_at) = date('now')")
+    where = f"WHERE {' AND '.join(conditions)}"
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    f"SELECT COUNT(*) AS count FROM ai_research_memos {where}",
+                    tuple(params),
+                )
+                row = await cur.fetchone()
+                return int(row["count"] if row is not None else 0)
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error(
+                "ai_research_chargeable_attempt_count_failed",
+                provider=provider,
+                input_hash=input_hash,
+                error=str(e),
+            )
             return None
 
 

@@ -8,7 +8,7 @@ from typing import Any
 
 from auto_trader.account_risk_validate import ValidationGate, validation_exit_code
 from auto_trader.config.settings import get_settings
-from auto_trader.persistence.db import configure_db_path, count_ai_research_memos, init_db
+from auto_trader.persistence.db import configure_db_path, count_ai_research_chargeable_attempts, init_db
 from auto_trader.utils.logging import setup_logging
 
 
@@ -133,7 +133,7 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
         f"Provider: {report.provider}",
         f"Model: {model}",
         f"Key present: {str(report.key_present).lower()}",
-        f"Daily calls: used {used} / max {report.max_calls}; remaining {remaining}",
+        f"Chargeable daily calls: used {used} / max {report.max_calls}; remaining {remaining}",
         f"Timeout: {report.timeout_seconds:g}s",
         (
             "Cost assumptions: "
@@ -155,7 +155,7 @@ async def run_ai_research_preflight(settings: Any | None = None) -> tuple[str, l
     configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
     await init_db()
     provider = str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()
-    used_calls = await count_ai_research_memos(provider=provider, today_utc=True)
+    used_calls = await count_ai_research_chargeable_attempts(provider=provider, today_utc=True)
     report = build_ai_research_preflight_report(settings=settings, used_calls=used_calls)
     return render_ai_research_preflight(report), report.gates
 

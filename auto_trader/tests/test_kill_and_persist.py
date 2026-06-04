@@ -5,6 +5,7 @@ These tests must actually exercise real DB save → load roundtrips
 and verify the safety default to HALTED on failure.
 """
 import asyncio
+import inspect
 import json
 import sqlite3
 import tempfile
@@ -30,6 +31,8 @@ from auto_trader.ai_research_preflight import (
     render_ai_research_preflight,
     run_ai_research_preflight,
 )
+import auto_trader.ai_research_smoke as ai_research_smoke
+from auto_trader.ai_research_smoke import run_ai_research_smoke
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
@@ -41,6 +44,7 @@ from auto_trader.intelligence.ai_committee import (
     AnthropicResearchCommittee,
     GeminiResearchCommittee,
     OpenAIResearchCommittee,
+    ResearchMemo,
     ShadowResearchCommittee,
     XAIResearchCommittee,
     normalize_committee_output,
@@ -57,6 +61,8 @@ from auto_trader.persistence.db import (
     consume_planned_maintenance_shutdown,
     clear_pending_exit,
     configure_db_path,
+    count_ai_research_chargeable_attempts,
+    count_ai_research_memos,
     count_entry_orders_since,
     get_latest_journal_entries,
     get_latest_ai_research_memos,
@@ -816,6 +822,42 @@ async def test_ai_research_memo_persistence_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "ai_chargeable.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        rows = [
+            ("anthropic", "ai_research_budget/v0", "skip1"),
+            ("anthropic", "ai_research_committee/v0", "paid1"),
+            ("anthropic", "ai_research_failure/v0", "paid2"),
+            ("shadow", "ai_research_committee/v0", "free1"),
+            ("openai", "ai_research_committee/v0", "paid3"),
+        ]
+        for provider, prompt_version, input_hash in rows:
+            await log_ai_research_memo(
+                signal_id=None,
+                symbol="POET",
+                provider=provider,
+                model_tag=f"{provider}/model",
+                prompt_version=prompt_version,
+                input_hash=input_hash,
+                verdict="watch",
+                confidence=None,
+                used_only_provided_data=True,
+                validation_passed=prompt_version == "ai_research_committee/v0",
+                memo={"committee": {"judge_summary": "audit"}},
+            )
+
+        assert await count_ai_research_memos(provider="anthropic", today_utc=True) == 3
+        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 2
+        assert await count_ai_research_chargeable_attempts(provider="openai", today_utc=True) == 1
+        assert await count_ai_research_chargeable_attempts(provider="shadow", today_utc=True) == 0
+        assert await count_ai_research_chargeable_attempts(today_utc=True) == 3
+
+
+@pytest.mark.asyncio
 async def test_shadow_research_committee_validates_advisory_memo():
     committee = ShadowResearchCommittee()
     intent = TradeIntent(
@@ -1245,7 +1287,7 @@ async def test_ai_research_preflight_count_failure_uses_no_provider_call(monkeyp
     async def fake_count(**kwargs):
         return None
 
-    monkeypatch.setattr("auto_trader.ai_research_preflight.count_ai_research_memos", fake_count)
+    monkeypatch.setattr("auto_trader.ai_research_preflight.count_ai_research_chargeable_attempts", fake_count)
     report_text, gates = await run_ai_research_preflight(settings=AnthropicSettings())
 
     assert "State: NOT_READY" in report_text
@@ -1331,6 +1373,176 @@ async def test_real_provider_budget_count_failure_skips_provider_call(monkeypatc
     intent = TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7)
 
     await supervisor._run_ai_research(intent, signal_id=12)
+
+
+@pytest.mark.asyncio
+async def test_real_provider_chargeable_budget_count_failure_skips_provider_call(monkeypatch):
+    class BudgetSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 5
+        openai_api_key = "openai-key"
+
+    class ExplodingCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+        async def research(self, intent, *, signal_id=None):
+            raise AssertionError("provider should not be called when chargeable budget count fails")
+
+    async def fake_audit_count(**kwargs):
+        return 0
+
+    async def fake_chargeable_count(**kwargs):
+        return None
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", fake_audit_count)
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts",
+        fake_chargeable_count,
+    )
+    supervisor = TradingSupervisor(
+        settings=BudgetSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+    supervisor.research_committee = ExplodingCommittee()
+    intent = TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7)
+
+    await supervisor._run_ai_research(intent, signal_id=12)
+
+
+@pytest.mark.asyncio
+async def test_ai_research_smoke_refuses_zero_budget(monkeypatch):
+    class SmokeSettings(DummySupervisorSettings):
+        ai_research_provider = "anthropic"
+        ai_research_model = "claude-opus-4-8"
+        ai_research_max_calls_per_day = 0
+        anthropic_api_key = "anthropic-key"
+
+    def exploding_factory(settings):
+        raise AssertionError("committee should not be constructed when budget is zero")
+
+    monkeypatch.setattr("auto_trader.ai_research_smoke.create_research_committee", exploding_factory)
+
+    result = await run_ai_research_smoke(settings=SmokeSettings(), symbol="POET", price=10.0)
+
+    assert result.ok is False
+    assert result.called_provider is False
+    assert "MAX_CALLS_PER_DAY" in result.reason
+
+
+@pytest.mark.asyncio
+async def test_ai_research_smoke_refuses_count_failure(monkeypatch):
+    class SmokeSettings(DummySupervisorSettings):
+        ai_research_provider = "anthropic"
+        ai_research_model = "claude-opus-4-8"
+        ai_research_max_calls_per_day = 1
+        anthropic_api_key = "anthropic-key"
+
+    async def fake_count(**kwargs):
+        return None
+
+    def exploding_factory(settings):
+        raise AssertionError("committee should not be constructed when count fails")
+
+    monkeypatch.setattr("auto_trader.ai_research_smoke.count_ai_research_chargeable_attempts", fake_count)
+    monkeypatch.setattr("auto_trader.ai_research_smoke.create_research_committee", exploding_factory)
+
+    result = await run_ai_research_smoke(settings=SmokeSettings(), symbol="POET", price=10.0)
+
+    assert result.ok is False
+    assert result.called_provider is False
+    assert result.reason == "chargeable budget count unavailable"
+
+
+@pytest.mark.asyncio
+async def test_ai_research_smoke_persists_one_chargeable_memo(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_smoke.db")
+
+        class SmokeSettings(DummySupervisorSettings):
+            db_path = str(Path(tmp) / "ai_smoke.db")
+            ai_research_provider = "anthropic"
+            ai_research_model = "claude-opus-4-8"
+            ai_research_max_calls_per_day = 1
+            anthropic_api_key = "anthropic-key"
+
+        class FakeCommittee:
+            provider = "anthropic"
+            model_tag = "anthropic/claude-opus-4-8"
+
+            async def research(self, intent, *, signal_id=None):
+                return ResearchMemo(
+                    symbol=intent.symbol,
+                    provider=self.provider,
+                    model_tag=self.model_tag,
+                    prompt_version="ai_research_committee/v0",
+                    input_hash="hash123456789",
+                    verdict="watch",
+                    confidence=0.8,
+                    used_only_provided_data=True,
+                    validation_passed=True,
+                    memo={
+                        "committee": {"judge_summary": "advisory only"},
+                        "normalization": {"markers": ["normalized_invalid_verdict"]},
+                    },
+                )
+
+        monkeypatch.setattr("auto_trader.ai_research_smoke.create_research_committee", lambda settings: FakeCommittee())
+
+        result = await run_ai_research_smoke(settings=SmokeSettings(), symbol="POET", price=10.0)
+        memos = await get_latest_ai_research_memos(limit=5)
+
+        assert result.ok is True
+        assert result.called_provider is True
+        assert result.memo_id is not None
+        assert result.used_before == 0
+        assert result.used_after == 1
+        assert result.remaining_after == 0
+        assert result.normalization_markers == ["normalized_invalid_verdict"]
+        assert len(memos) == 1
+        assert memos[0]["prompt_version"] == "ai_research_committee/v0"
+        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_research_smoke_failure_consumes_chargeable_budget(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_smoke_failure.db")
+
+        class SmokeSettings(DummySupervisorSettings):
+            db_path = str(Path(tmp) / "ai_smoke_failure.db")
+            ai_research_provider = "anthropic"
+            ai_research_model = "claude-opus-4-8"
+            ai_research_max_calls_per_day = 1
+            anthropic_api_key = "anthropic-key"
+
+        class FailingCommittee:
+            async def research(self, intent, *, signal_id=None):
+                raise RuntimeError("provider unavailable")
+
+        monkeypatch.setattr("auto_trader.ai_research_smoke.create_research_committee", lambda settings: FailingCommittee())
+
+        result = await run_ai_research_smoke(settings=SmokeSettings(), symbol="POET", price=10.0)
+
+        assert result.ok is False
+        assert result.called_provider is True
+        assert result.prompt_version == "ai_research_failure/v0"
+        assert result.used_before == 0
+        assert result.used_after == 1
+        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 1
+
+
+def test_ai_research_smoke_does_not_import_order_or_risk_stack():
+    source = inspect.getsource(ai_research_smoke)
+
+    assert "TradingSupervisor" not in source
+    assert "OrderManager" not in source
+    assert "RiskEngine" not in source
+    assert "AlpacaAdapter" not in source
 
 
 @pytest.mark.asyncio
