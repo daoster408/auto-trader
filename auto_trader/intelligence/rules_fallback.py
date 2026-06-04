@@ -19,6 +19,11 @@ from typing import Any
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.models import TradeIntent
 from auto_trader.intelligence.finnhub_client import FinnhubClient
+from auto_trader.intelligence.research_context import (
+    build_alpaca_research_context,
+    merge_research_context,
+    normalize_finnhub_research_context,
+)
 from auto_trader.utils.logging import get_logger
 
 log = get_logger("auto_trader.intelligence.rules_fallback")
@@ -34,6 +39,7 @@ class DiscoveryCandidate:
     change_pct: float
     spread_pct: float | None
     rationale: str
+    research_context: dict[str, Any] | None = None
 
 
 def _chunked(items: list[str], size: int) -> list[list[str]]:
@@ -141,6 +147,14 @@ def _candidate_from_snapshot(symbol: str, snapshot: dict[str, Any]) -> Discovery
         change_pct=change_pct,
         spread_pct=spread,
         rationale=rationale,
+        research_context=build_alpaca_research_context(
+            snapshot,
+            price=price,
+            change_pct=change_pct,
+            rel_volume=rel_volume,
+            spread_pct=spread,
+            dollar_volume=dollar_volume,
+        ),
     )
 
 
@@ -206,8 +220,15 @@ async def get_simple_rules_signals(
         features: dict[str, Any] = {
             "discovery": _alpaca_candidate_features(candidate),
         }
+        research_context = candidate.research_context or {}
         if finnhub_client is not None and finnhub_client.enabled:
             features["finnhub"] = await finnhub_client.enrich_symbol(candidate.symbol)
+            research_context = merge_research_context(
+                research_context,
+                normalize_finnhub_research_context(features["finnhub"]),
+            )
+        if research_context:
+            features["research_context"] = research_context
         signals.append(
             TradeIntent(
                 symbol=candidate.symbol,

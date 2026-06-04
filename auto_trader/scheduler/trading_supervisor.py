@@ -20,6 +20,7 @@ from auto_trader.intelligence.ai_committee import (
     research_committee_round,
 )
 from auto_trader.intelligence.finnhub_client import FinnhubClient
+from auto_trader.intelligence.research_context import build_risk_research_context, with_research_context
 from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
 from auto_trader.persistence.db import (
     append_journal_entry,
@@ -548,7 +549,18 @@ class TradingSupervisor:
         )
         if not signals:
             return None
-        intent = signals[0]
+        intent = with_research_context(
+            signals[0],
+            {
+                "risk": build_risk_research_context(
+                    account=account,
+                    clock=clock,
+                    positions=positions,
+                    today_new_entries=today_new_entries,
+                    max_new_positions_per_day=max_new_positions_per_day,
+                )
+            },
+        )
         signal_id = await log_signal(
             symbol=intent.symbol,
             thesis=intent.rationale,

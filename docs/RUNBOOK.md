@@ -175,6 +175,16 @@ Before leaving Finnhub enabled unattended:
 - Confirm supervisor ticks do not time out.
 - Watch API-budget logs; Finnhub calls are nonessential and should be disabled if free-tier limits or latency become noisy.
 
+### Optional FRED Macro Context
+
+FRED can help the AI research packet with macro regime context: interest rates, inflation, credit stress, unemployment, liquidity, and broad risk-on/risk-off backdrop. It is not ticker-specific market data and must not be treated as a standalone buy/sell signal.
+
+```bash
+FRED_API_KEY=...
+```
+
+Use FRED context as the `macro` lane in AI research packets after a cached daily fetcher is enabled. It should complement Alpaca quote/bar data and Finnhub company/news data, not replace them.
+
 ### Optional AI Research Preflight
 
 AI research is advisory only. It may write research memos for candidates, but it must not approve trades, size orders, override risk gates, or place orders.

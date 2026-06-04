@@ -897,7 +897,73 @@ async def test_shadow_research_committee_validates_advisory_memo():
     assert memo.used_only_provided_data is True
     assert memo.validation_passed is True
     assert memo.memo["input_packet"]["signal_id"] == 7
+    context = memo.memo["input_packet"]["verified_research_context"]
+    assert context["data_quality"]["uses_only_verified_packet_data"] is True
+    assert "fundamental" in context["data_quality"]["missing_sections"]
     assert memo.memo["committee"]["judge_summary"]
+
+
+def test_research_packet_surfaces_verified_context_lanes():
+    intent = TradeIntent(
+        symbol="POET",
+        side="long",
+        entry_price=14.2,
+        rationale="rules found momentum",
+        confidence=0.75,
+        features={
+            "research_context": {
+                "market": {"provider": "alpaca", "feed": "iex"},
+                "technical": {"rel_volume": 2.1, "change_pct": 0.04},
+                "risk": {"positions": {"open_count": 0}},
+                "macro": {"fred": {"enabled": False}},
+            },
+            "finnhub": {
+                "provider": "finnhub",
+                "enabled": True,
+                "profile": {"name": "POET Technologies", "industry": "Semiconductors"},
+                "news": [{"headline": "POET headline", "source": "Wire"}],
+            },
+        },
+    )
+
+    packet = build_research_packet(intent, signal_id=99)
+    context = packet["verified_research_context"]
+
+    assert context["market"]["provider"] == "alpaca"
+    assert context["technical"]["rel_volume"] == 2.1
+    assert context["fundamental"]["industry"] == "Semiconductors"
+    assert context["news"][0]["headline"] == "POET headline"
+    assert context["risk"]["positions"]["open_count"] == 0
+    assert "market" not in context["data_quality"]["missing_sections"]
+    assert "fundamental" not in context["data_quality"]["missing_sections"]
+
+
+def test_research_context_tolerates_malformed_provider_shapes():
+    intent = TradeIntent(
+        symbol="POET",
+        side="long",
+        entry_price=14.2,
+        features={
+            "research_context": {
+                "market": {"quote": "bad-shape"},
+                "risk": {"positions": {"symbols": ["POET"]}},
+            },
+            "finnhub": {
+                "provider": "finnhub",
+                "enabled": True,
+                "quote": "bad-shape",
+                "profile": ["bad-shape"],
+                "news": [{"headline": "valid headline"}, "bad item"],
+            },
+        },
+    )
+
+    packet = build_research_packet(intent, signal_id=100)
+    context = packet["verified_research_context"]
+
+    assert context["market"]["quote"] == "bad-shape"
+    assert context["news"] == [{"headline": "valid headline", "source": None, "published_at": None, "url": None}]
+    assert "fundamental" in context["data_quality"]["missing_sections"]
 
 
 def test_ai_committee_validator_rejects_unverified_data():
@@ -1978,6 +2044,10 @@ async def test_rules_signals_attach_finnhub_enrichment(monkeypatch):
                 change_pct=0.04,
                 spread_pct=0.002,
                 rationale="candidate rationale",
+                research_context={
+                    "market": {"provider": "alpaca", "feed": "iex"},
+                    "technical": {"rel_volume": 2.0, "change_pct": 0.04},
+                },
             )
         ]
 
@@ -1985,7 +2055,13 @@ async def test_rules_signals_attach_finnhub_enrichment(monkeypatch):
         enabled = True
 
         async def enrich_symbol(self, symbol):
-            return {"provider": "finnhub", "enabled": True, "quote": {"current": 14.2}}
+            return {
+                "provider": "finnhub",
+                "enabled": True,
+                "quote": {"current": 14.2},
+                "profile": {"name": "POET Technologies", "industry": "Semiconductors"},
+                "news": [{"headline": "POET headline", "source": "Wire"}],
+            }
 
     monkeypatch.setattr("auto_trader.intelligence.rules_fallback.discover_dynamic_candidates", fake_discover)
 
@@ -1994,6 +2070,9 @@ async def test_rules_signals_attach_finnhub_enrichment(monkeypatch):
     assert signals[0].symbol == "POET"
     assert signals[0].features["discovery"]["provider"] == "alpaca"
     assert signals[0].features["finnhub"]["quote"]["current"] == 14.2
+    assert signals[0].features["research_context"]["market"]["provider"] == "alpaca"
+    assert signals[0].features["research_context"]["fundamental"]["industry"] == "Semiconductors"
+    assert signals[0].features["research_context"]["news"][0]["headline"] == "POET headline"
 
 
 @pytest.mark.asyncio
@@ -3303,12 +3382,13 @@ async def test_supervisor_reconciles_and_dry_run_exit_signal(monkeypatch):
                 "account_status": "AccountStatus.ACTIVE",
                 "equity": 100.0,
                 "cash": 80.0,
+                "buying_power": 80.0,
                 "trading_blocked": False,
                 "account_blocked": False,
             }
 
         async def get_clock(self):
-            return {"is_open": True, "source": "alpaca"}
+            return {"is_open": True, "source": "alpaca", "next_close": "2026-06-04T20:00:00+00:00"}
 
         async def get_recent_orders(self, days=2):
             return [{"id": "order-1", "symbol": "AMPX"}]
@@ -3433,12 +3513,13 @@ async def test_supervisor_last_risk_sweep_forces_reconciliation(monkeypatch):
                 "account_status": "AccountStatus.ACTIVE",
                 "equity": 100.0,
                 "cash": 80.0,
+                "buying_power": 80.0,
                 "trading_blocked": False,
                 "account_blocked": False,
             }
 
         async def get_clock(self):
-            return {"is_open": True, "source": "alpaca"}
+            return {"is_open": True, "source": "alpaca", "next_close": "2026-06-04T20:00:00+00:00"}
 
         async def get_recent_orders(self, days=2):
             return [{"id": "recent-1", "symbol": "AMPX"}]
@@ -4858,12 +4939,13 @@ async def test_supervisor_auto_entry_logs_shadow_ai_research(monkeypatch):
                 "account_status": "AccountStatus.ACTIVE",
                 "equity": 100.0,
                 "cash": 80.0,
+                "buying_power": 80.0,
                 "trading_blocked": False,
                 "account_blocked": False,
             }
 
         async def get_clock(self):
-            return {"is_open": True, "source": "alpaca"}
+            return {"is_open": True, "source": "alpaca", "next_close": "2026-06-04T20:00:00+00:00"}
 
         async def get_recent_orders(self, days=2):
             return []
@@ -4875,7 +4957,11 @@ async def test_supervisor_auto_entry_logs_shadow_ai_research(monkeypatch):
             return []
 
     class FakeOrderManager:
+        def __init__(self):
+            self.intents = []
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            self.intents.append(intent)
             return {"order": {"id": "entry-1"}, "risk_decision": {"approved": True}}
 
     async def fake_reconcile(orders):
@@ -4909,11 +4995,12 @@ async def test_supervisor_auto_entry_logs_shadow_ai_research(monkeypatch):
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_ai_research_memo", fake_ai_memo)
     patch_empty_pending_exit_state(monkeypatch)
 
+    manager = FakeOrderManager()
     supervisor = TradingSupervisor(
         settings=EntrySettings(),
         state_machine=sm,
         adapter=FakeAdapter(),
-        order_manager=FakeOrderManager(),
+        order_manager=manager,
     )
 
     result = await supervisor.tick_once()
@@ -4922,6 +5009,16 @@ async def test_supervisor_auto_entry_logs_shadow_ai_research(monkeypatch):
     assert logged_memos[0]["symbol"] == "AMPX"
     assert logged_memos[0]["provider"] == "shadow"
     assert logged_memos[0]["validation_passed"] is True
+    risk_context = logged_memos[0]["memo"]["input_packet"]["verified_research_context"]["risk"]
+    assert risk_context["account"]["equity"] == 100.0
+    assert risk_context["account"]["cash"] == 80.0
+    assert risk_context["account"]["buying_power"] == 80.0
+    assert risk_context["market_clock"]["is_open"] is True
+    assert risk_context["market_clock"]["next_close"] == "2026-06-04T20:00:00+00:00"
+    assert risk_context["positions"]["open_count"] == 0
+    assert risk_context["entry_limits"]["today_new_entries"] == 0
+    assert risk_context["entry_limits"]["max_new_positions_per_day"] == 1
+    assert manager.intents[0].features["research_context"]["risk"] == risk_context
 
 
 @pytest.mark.asyncio

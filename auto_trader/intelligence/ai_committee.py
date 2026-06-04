@@ -15,6 +15,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from auto_trader.core.models import TradeIntent
+from auto_trader.intelligence.research_context import build_verified_research_context
 from auto_trader.utils.logging import get_logger
 
 log = get_logger("auto_trader.intelligence.ai_committee")
@@ -69,6 +70,7 @@ class ResearchRound:
 
 def build_research_packet(intent: TradeIntent, *, signal_id: int | None = None) -> dict[str, Any]:
     """Build the verified data packet handed to an AI/shadow committee."""
+    verified_context = build_verified_research_context(intent)
     return {
         "generated_at": datetime.now(UTC).isoformat() + "Z",
         "signal_id": signal_id,
@@ -79,6 +81,7 @@ def build_research_packet(intent: TradeIntent, *, signal_id: int | None = None) 
             "confidence": intent.confidence,
             "rationale": intent.rationale,
         },
+        "verified_research_context": verified_context,
         "features": intent.features,
         "rules": {
             "advisory_only": True,
