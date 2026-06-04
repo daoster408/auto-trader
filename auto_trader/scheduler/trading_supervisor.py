@@ -12,6 +12,7 @@ from auto_trader.core.state_machine import StateMachine
 from auto_trader.core.models import KillResult, SystemState
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.ai_committee import (
+    ResearchMemo,
     ShadowResearchCommittee,
     build_research_packet,
     create_research_committee,
@@ -20,6 +21,7 @@ from auto_trader.intelligence.ai_committee import (
     research_committee_round,
 )
 from auto_trader.intelligence.finnhub_client import FinnhubClient
+from auto_trader.intelligence.fred_client import FredClient
 from auto_trader.intelligence.research_context import build_risk_research_context, with_research_context
 from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
 from auto_trader.persistence.db import (
@@ -65,6 +67,20 @@ class SupervisorTickResult:
     exit_decisions: list[ExitDecision]
     entry_result: dict[str, Any] | None
     errors: list[str]
+
+
+@dataclass(frozen=True)
+class AIResearchRunResult:
+    symbol: str
+    verdict: str
+    validation_passed: bool
+    reason: str
+    memo: ResearchMemo | None = None
+    called_provider: bool = False
+
+    @property
+    def approved_for_entry(self) -> bool:
+        return self.validation_passed and self.verdict == "approve"
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -182,6 +198,7 @@ class TradingSupervisor:
         self._pending_exit_symbols: set[str] = set()
         self._last_risk_sweep_dates: set[str] = set()
         self.finnhub_client = FinnhubClient(getattr(settings, "finnhub_api_key", None))
+        self.fred_client = FredClient(getattr(settings, "fred_api_key", None))
         self.research_committee = (
             create_research_committee(settings)
             if bool(getattr(settings, "ai_research_enabled", True))
@@ -546,6 +563,7 @@ class TradingSupervisor:
             self.adapter,
             max_signals=1,
             finnhub_client=self.finnhub_client,
+            fred_client=self.fred_client,
         )
         if not signals:
             return None
@@ -569,8 +587,36 @@ class TradingSupervisor:
             model_tag="rules_fallback/v0",
             features=intent.features,
         )
-        if bool(getattr(self.settings, "ai_research_enabled", True)):
-            await self._run_ai_research(intent, signal_id=signal_id)
+        ai_research_enabled = bool(getattr(self.settings, "ai_research_enabled", True))
+        ai_gate_enabled = bool(getattr(self.settings, "ai_entry_gate_enabled", False))
+        ai_result: AIResearchRunResult | None = None
+        if ai_research_enabled:
+            ai_result = await self._run_ai_research(intent, signal_id=signal_id)
+        elif ai_gate_enabled:
+            ai_result = AIResearchRunResult(
+                symbol=intent.symbol.upper(),
+                verdict="watch",
+                validation_passed=False,
+                reason="ai_research_disabled",
+            )
+        if ai_gate_enabled:
+            if ai_result is None:
+                ai_result = AIResearchRunResult(
+                    symbol=intent.symbol.upper(),
+                    verdict="watch",
+                    validation_passed=False,
+                    reason="ai_research_not_run",
+                )
+            real_providers = real_research_providers(self.research_committee)
+            if ai_research_enabled and not real_providers:
+                ai_result = AIResearchRunResult(
+                    symbol=intent.symbol.upper(),
+                    verdict="watch",
+                    validation_passed=False,
+                    reason="real_ai_provider_required_for_entry_gate",
+                )
+            if not ai_result.approved_for_entry:
+                return await self._block_entry_for_ai_gate(intent, signal_id=signal_id, ai_result=ai_result)
         snapshot = type(
             "SupervisorSnapshot",
             (object,),
@@ -586,7 +632,39 @@ class TradingSupervisor:
             await self._notify(f"ENTRY RESULT: {intent.symbol} - {result.get('risk_decision')} - {result.get('order')}")
         return result
 
-    async def _run_ai_research(self, intent, *, signal_id: int | None) -> None:
+    async def _block_entry_for_ai_gate(
+        self,
+        intent,
+        *,
+        signal_id: int | None,
+        ai_result: AIResearchRunResult,
+    ) -> dict[str, Any]:
+        reason = f"AI entry gate blocked {intent.symbol.upper()}: {ai_result.reason}"
+        await append_journal_entry(
+            content=(
+                f"{reason}; verdict={ai_result.verdict}; "
+                f"validation_passed={ai_result.validation_passed}; signal_id={signal_id}"
+            )
+        )
+        log.info(
+            "ai_entry_gate_blocked",
+            symbol=intent.symbol.upper(),
+            verdict=ai_result.verdict,
+            validation_passed=ai_result.validation_passed,
+            reason=ai_result.reason,
+            signal_id=signal_id,
+        )
+        return {
+            "blocked": True,
+            "reason": reason,
+            "ai_gate": {
+                "verdict": ai_result.verdict,
+                "validation_passed": ai_result.validation_passed,
+                "reason": ai_result.reason,
+            },
+        }
+
+    async def _run_ai_research(self, intent, *, signal_id: int | None) -> AIResearchRunResult:
         provider = str(getattr(self.research_committee, "provider", "shadow"))
         packet = build_research_packet(intent, signal_id=signal_id)
         digest = packet_hash(packet)
@@ -597,7 +675,12 @@ class TradingSupervisor:
                 existing = await count_ai_research_memos(provider=provider_name, input_hash=digest)
                 if existing is None:
                     log.warning("ai_research_skipped_dedupe_count_failed", symbol=intent.symbol, provider=provider_name)
-                    return
+                    return AIResearchRunResult(
+                        symbol=intent.symbol.upper(),
+                        verdict="watch",
+                        validation_passed=False,
+                        reason="ai_research_dedupe_count_failed",
+                    )
                 if existing > 0:
                     log.info(
                         "ai_research_deduped",
@@ -605,14 +688,24 @@ class TradingSupervisor:
                         provider=provider_name,
                         input_hash=digest[:12],
                     )
-                    return
+                    return AIResearchRunResult(
+                        symbol=intent.symbol.upper(),
+                        verdict="watch",
+                        validation_passed=False,
+                        reason="ai_research_deduped_without_current_verdict",
+                    )
             attempts_needed = len(real_providers)
             budget_provider = real_providers[0] if attempts_needed == 1 else None
             daily_max = int(getattr(self.settings, "ai_research_max_calls_per_day", 0) or 0)
             daily_count = await count_ai_research_chargeable_attempts(provider=budget_provider, today_utc=True)
             if daily_count is None:
                 log.warning("ai_research_skipped_budget_count_failed", symbol=intent.symbol, provider=provider)
-                return
+                return AIResearchRunResult(
+                    symbol=intent.symbol.upper(),
+                    verdict="watch",
+                    validation_passed=False,
+                    reason="ai_research_budget_count_failed",
+                )
             remaining_calls = max(0, daily_max - daily_count)
             if daily_max <= 0 or remaining_calls < attempts_needed:
                 await log_ai_research_memo(
@@ -648,7 +741,13 @@ class TradingSupervisor:
                         },
                     },
                 )
-                return
+                return AIResearchRunResult(
+                    symbol=intent.symbol.upper(),
+                    verdict="watch",
+                    validation_passed=False,
+                    reason="ai_research_budget_exhausted",
+                    called_provider=False,
+                )
         try:
             research_round = await research_committee_round(self.research_committee, intent, signal_id=signal_id)
             member_memo_ids = []
@@ -690,6 +789,23 @@ class TradingSupervisor:
                     validation_passed=memo.validation_passed,
                     memo=memo.memo,
                 )
+                return AIResearchRunResult(
+                    symbol=memo.symbol,
+                    verdict=memo.verdict,
+                    validation_passed=memo.validation_passed,
+                    reason=f"ai_research_{memo.verdict}",
+                    memo=memo,
+                    called_provider=bool(real_providers),
+                )
+            memo = research_round.aggregate_memo
+            return AIResearchRunResult(
+                symbol=memo.symbol,
+                verdict=memo.verdict,
+                validation_passed=memo.validation_passed,
+                reason=f"ai_research_{memo.verdict}",
+                memo=memo,
+                called_provider=bool(real_providers),
+            )
         except Exception as e:
             await log_ai_research_memo(
                 signal_id=signal_id,
@@ -716,6 +832,13 @@ class TradingSupervisor:
                 },
             )
             log.warning("ai_research_failed", symbol=intent.symbol, provider=provider, error=str(e))
+            return AIResearchRunResult(
+                symbol=intent.symbol.upper(),
+                verdict="watch",
+                validation_passed=False,
+                reason="ai_research_provider_failed",
+                called_provider=bool(real_providers),
+            )
 
     async def tick_once(self) -> SupervisorTickResult:
         alerts: list[str] = []

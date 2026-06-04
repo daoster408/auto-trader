@@ -19,10 +19,12 @@ from typing import Any
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.models import TradeIntent
 from auto_trader.intelligence.finnhub_client import FinnhubClient
+from auto_trader.intelligence.fred_client import FredClient
 from auto_trader.intelligence.research_context import (
     build_alpaca_research_context,
     merge_research_context,
     normalize_finnhub_research_context,
+    normalize_fred_research_context,
 )
 from auto_trader.utils.logging import get_logger
 
@@ -212,6 +214,7 @@ async def get_simple_rules_signals(
     adapter: AlpacaAdapter,
     max_signals: int = 2,
     finnhub_client: FinnhubClient | None = None,
+    fred_client: FredClient | None = None,
 ) -> list[TradeIntent]:
     """Return TradeIntents from dynamic market discovery (no watchlist)."""
     candidates = await discover_dynamic_candidates(adapter, max_candidates=max(max_signals, 5))
@@ -226,6 +229,12 @@ async def get_simple_rules_signals(
             research_context = merge_research_context(
                 research_context,
                 normalize_finnhub_research_context(features["finnhub"]),
+            )
+        if fred_client is not None:
+            features["fred"] = await fred_client.macro_context()
+            research_context = merge_research_context(
+                research_context,
+                normalize_fred_research_context(features["fred"]),
             )
         if research_context:
             features["research_context"] = research_context

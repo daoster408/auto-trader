@@ -154,6 +154,28 @@ def normalize_finnhub_research_context(finnhub: dict[str, Any] | None) -> dict[s
     return context
 
 
+def normalize_fred_research_context(fred: dict[str, Any] | None) -> dict[str, Any]:
+    """Map FRED enrichment into the macro lane used by AI packets."""
+    if not isinstance(fred, dict) or not fred:
+        return {
+            "macro": {
+                "provider": "fred",
+                "enabled": False,
+                "error": "FRED macro context not provided",
+            }
+        }
+    return {
+        "macro": {
+            "provider": "fred",
+            "enabled": bool(fred.get("enabled")),
+            "fetched_at": _text(fred.get("fetched_at")),
+            "error": _text(fred.get("error")),
+            "series": fred.get("series") if isinstance(fred.get("series"), dict) else {},
+            "regime": fred.get("regime") if isinstance(fred.get("regime"), dict) else {},
+        }
+    }
+
+
 def build_risk_research_context(
     *,
     account: dict[str, Any] | None = None,
@@ -205,11 +227,15 @@ def build_verified_research_context(intent: TradeIntent) -> dict[str, Any]:
     features = intent.features or {}
     existing = features.get("research_context")
     context = dict(existing) if isinstance(existing, dict) else {}
-    context = merge_research_context(context, normalize_finnhub_research_context(features.get("finnhub")))
+    context = merge_research_context(
+        context,
+        normalize_finnhub_research_context(features.get("finnhub")),
+        normalize_fred_research_context(features.get("fred")),
+    )
 
     missing = []
     for key in ("market", "technical", "fundamental", "news", "macro", "risk"):
-        if not context.get(key):
+        if _section_missing(key, context.get(key)):
             missing.append(key)
     context["data_quality"] = {
         "uses_only_verified_packet_data": True,
@@ -226,3 +252,14 @@ def with_research_context(intent: TradeIntent, context: dict[str, Any]) -> Trade
         context,
     )
     return replace(intent, features=features)
+
+
+def _section_missing(key: str, value: Any) -> bool:
+    if not value:
+        return True
+    if key == "macro" and isinstance(value, dict):
+        if value.get("error") or value.get("enabled") is False:
+            return True
+        series = value.get("series")
+        return not isinstance(series, dict) or not series
+    return False

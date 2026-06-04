@@ -183,11 +183,13 @@ FRED can help the AI research packet with macro regime context: interest rates, 
 FRED_API_KEY=...
 ```
 
-Use FRED context as the `macro` lane in AI research packets after a cached daily fetcher is enabled. It should complement Alpaca quote/bar data and Finnhub company/news data, not replace them.
+FRED context is added to the `macro` lane in AI research packets through a cached daily Core Risk Pack: short/long Treasury yields, 10Y-2Y curve spread, high-yield credit spread, CPI, unemployment, VIX, and Fed balance sheet assets. Missing keys, API errors, and API-budget deferrals are recorded as macro context errors; they must not crash the supervisor or approve/block trades by themselves.
 
 ### Optional AI Research Preflight
 
 AI research is advisory only. It may write research memos for candidates, but it must not approve trades, size orders, override risk gates, or place orders.
+
+`AI_ENTRY_GATE_ENABLED=false` is the safe default. When enabled, real-provider AI research becomes a fail-closed entry filter before `RiskEngine`: only a valid `approve` can continue to RiskEngine and OrderManager. `watch`, `reject`, invalid output, budget exhaustion, provider failure, disabled AI research, or shadow-only research blocks the entry and records an audit journal note. AI still cannot size orders, submit orders, override RiskEngine, bypass `/kill`, bypass `HALTED`, bypass broker/account blocks, or override account loss/drawdown halts.
 
 Run the read-only activation preflight before enabling any paid provider:
 
@@ -228,6 +230,10 @@ AI_RESEARCH_MAX_CALLS_PER_DAY=3
 One committee round consumes one chargeable call per selected real provider, and preflight reports how many full rounds remain from the current daily budget. The v1 aggregate is deterministic: at least two valid provider approvals with confidence >= 0.65 and no valid reject can produce an AI advisory `approve`; any valid reject produces `reject`; everything else is `watch`. Invalid provider output, timeouts, and failures are audited but cannot force approval. RiskEngine remains the only execution and sizing authority.
 
 The default `AI_RESEARCH_MAX_CALLS_PER_DAY=0` intentionally reports `NOT_READY`, even when a key is present.
+
+### Future Risk Profiles / YOLO Mode
+
+Future risk profiles should be explicit, for example `conservative | aggressive | yolo`. `conservative` is the current default. `aggressive` and `yolo` must be introduced behind paper-first controls and audit labels. `yolo` must remain paper-only by default and must never bypass kill switch, HALTED state, broker/account blocks, daily/weekly/drawdown halts, duplicate-position guards, the AI entry gate when enabled, or RiskEngine.
 
 ### Account Risk Halt Rehearsal
 

@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     finnhub_api_key: str | None = Field(None, alias="FINNHUB_API_KEY")
     fred_api_key: str | None = Field(None, alias="FRED_API_KEY")
     ai_research_enabled: bool = Field(True, alias="AI_RESEARCH_ENABLED")
+    ai_entry_gate_enabled: bool = Field(False, alias="AI_ENTRY_GATE_ENABLED")
     ai_research_provider: Literal["shadow", "openai", "xai", "anthropic", "gemini"] = Field(
         "shadow",
         alias="AI_RESEARCH_PROVIDER",
