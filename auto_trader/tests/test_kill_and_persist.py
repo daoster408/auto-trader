@@ -1446,6 +1446,7 @@ def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
     assert "Full rounds remaining: 1" in text
     assert "Estimated cost per round: $0.3750" in text
     assert "- anthropic: model=claude-opus-4-8, key_present=true" in text
+    assert text.index("Providers:") < text.index("Gates:")
     assert "anthropic-secret" not in text
     assert "openai-secret" not in text
     assert "xai-secret" not in text

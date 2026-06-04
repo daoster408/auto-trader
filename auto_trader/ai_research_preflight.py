@@ -187,7 +187,6 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
         f"Estimated cost per memo: ${report.cost.estimated_cost_per_memo:.4f}",
         f"Estimated cost per round: ${report.estimated_cost_per_round:.4f}",
         f"Estimated worst-case daily cost: ${report.estimated_daily_cost:.4f}",
-        "Gates:",
     ]
     if len(report.providers) > 1:
         lines.append("Providers:")
@@ -198,6 +197,7 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
             )
             for row in report.providers
         )
+    lines.append("Gates:")
     lines.extend(f"- [{gate.status}] {gate.name}: {gate.detail}" for gate in report.gates)
     return "\n".join(lines)
 
