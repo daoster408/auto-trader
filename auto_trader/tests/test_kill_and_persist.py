@@ -25,6 +25,11 @@ from auto_trader.account_risk_validate import (
     validation_exit_code as account_risk_validation_exit_code,
 )
 from auto_trader.day3_validate import build_day3_validation_report, validation_exit_code
+from auto_trader.ai_research_preflight import (
+    build_ai_research_preflight_report,
+    render_ai_research_preflight,
+    run_ai_research_preflight,
+)
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
@@ -105,6 +110,11 @@ class DummySupervisorSettings(DummySettings):
     ai_research_model = ""
     ai_research_timeout_seconds = 8
     ai_research_max_calls_per_day = 0
+    ai_research_est_input_tokens = 15000
+    ai_research_est_output_tokens = 2000
+    ai_research_input_price_per_mtok = 5.0
+    ai_research_output_price_per_mtok = 25.0
+    db_path = "auto_trader.db"
 
 
 class DummyDay3Settings:
@@ -958,6 +968,128 @@ def test_ai_research_packet_hash_ignores_volatile_metadata():
     }
 
     assert packet_hash(base) == packet_hash(later)
+
+
+def test_ai_research_preflight_shadow_default_not_ready_and_no_secret():
+    class ShadowSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "shadow"
+        ai_research_model = ""
+        ai_research_max_calls_per_day = 0
+        anthropic_api_key = "super-secret"
+
+    report = build_ai_research_preflight_report(settings=ShadowSettings(), used_calls=0)
+    text = render_ai_research_preflight(report)
+
+    assert report.ready is False
+    assert "State: NOT_READY" in text
+    assert "Provider: shadow" in text
+    assert "super-secret" not in text
+    assert "Key present: false" in text
+
+
+def test_ai_research_preflight_missing_model_not_ready():
+    class MissingModelSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_model = ""
+        ai_research_max_calls_per_day = 1
+        anthropic_api_key = "anthropic-key"
+
+    report = build_ai_research_preflight_report(settings=MissingModelSettings(), used_calls=0)
+
+    assert report.ready is False
+    assert any(gate.name == "Explicit model" and gate.status == "FAIL" for gate in report.gates)
+
+
+def test_ai_research_preflight_missing_key_not_ready():
+    class MissingKeySettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_model = "claude-opus-4-8"
+        ai_research_max_calls_per_day = 1
+        anthropic_api_key = ""
+
+    report = build_ai_research_preflight_report(settings=MissingKeySettings(), used_calls=0)
+
+    assert report.ready is False
+    assert any(gate.name == "Provider key present" and gate.status == "FAIL" for gate in report.gates)
+
+
+def test_ai_research_preflight_zero_budget_not_ready():
+    class ZeroBudgetSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_model = "claude-opus-4-8"
+        ai_research_max_calls_per_day = 0
+        anthropic_api_key = "anthropic-key"
+
+    report = build_ai_research_preflight_report(settings=ZeroBudgetSettings(), used_calls=0)
+
+    assert report.ready is False
+    assert any(gate.name == "Daily call budget" and gate.status == "FAIL" for gate in report.gates)
+
+
+def test_ai_research_preflight_count_failure_fails_closed():
+    class CountFailureSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_model = "claude-opus-4-8"
+        ai_research_max_calls_per_day = 1
+        anthropic_api_key = "anthropic-key"
+
+    report = build_ai_research_preflight_report(settings=CountFailureSettings(), used_calls=None)
+    text = render_ai_research_preflight(report)
+
+    assert report.ready is False
+    assert "budget count unavailable" in text
+    assert any(gate.name == "Budget count available" and gate.status == "FAIL" for gate in report.gates)
+
+
+def test_ai_research_preflight_configured_anthropic_opus_estimate_no_secret():
+    class AnthropicSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_model = "claude-opus-4-8"
+        ai_research_max_calls_per_day = 5
+        ai_research_est_input_tokens = 15000
+        ai_research_est_output_tokens = 2000
+        ai_research_input_price_per_mtok = 5.0
+        ai_research_output_price_per_mtok = 25.0
+        anthropic_api_key = "super-secret"
+
+    report = build_ai_research_preflight_report(settings=AnthropicSettings(), used_calls=1)
+    text = render_ai_research_preflight(report)
+
+    assert report.ready is True
+    assert report.remaining_calls == 4
+    assert report.cost.estimated_cost_per_memo == pytest.approx(0.125)
+    assert report.estimated_daily_cost == pytest.approx(0.625)
+    assert "State: READY" in text
+    assert "Key present: true" in text
+    assert "super-secret" not in text
+    assert "Estimated cost per memo: $0.1250" in text
+    assert "Estimated worst-case daily cost: $0.6250" in text
+
+
+@pytest.mark.asyncio
+async def test_ai_research_preflight_count_failure_uses_no_provider_call(monkeypatch):
+    class AnthropicSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_model = "claude-opus-4-8"
+        ai_research_max_calls_per_day = 1
+        anthropic_api_key = "anthropic-key"
+
+    async def fake_count(**kwargs):
+        return None
+
+    monkeypatch.setattr("auto_trader.ai_research_preflight.count_ai_research_memos", fake_count)
+    report_text, gates = await run_ai_research_preflight(settings=AnthropicSettings())
+
+    assert "State: NOT_READY" in report_text
+    assert "budget count unavailable" in report_text
+    assert any(gate.name == "Budget count available" and gate.status == "FAIL" for gate in gates)
 
 
 def test_supervisor_does_not_instantiate_real_provider_when_ai_disabled():

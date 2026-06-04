@@ -175,6 +175,32 @@ Before leaving Finnhub enabled unattended:
 - Confirm supervisor ticks do not time out.
 - Watch API-budget logs; Finnhub calls are nonessential and should be disabled if free-tier limits or latency become noisy.
 
+### Optional AI Research Preflight
+
+AI research is advisory only. It may write research memos for candidates, but it must not approve trades, size orders, override risk gates, or place orders.
+
+Run the read-only activation preflight before enabling any paid provider:
+
+```bash
+scripts/ai_research_preflight.sh
+```
+
+The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit `AI_RESEARCH_MODEL`, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, calls remaining for the UTC day, and a bounded timeout. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
+
+For Claude/Anthropic testing, set pricing assumptions explicitly in `.env` before trusting the estimate:
+
+```bash
+AI_RESEARCH_PROVIDER=anthropic
+AI_RESEARCH_MODEL=claude-opus-4-8
+AI_RESEARCH_MAX_CALLS_PER_DAY=1
+AI_RESEARCH_EST_INPUT_TOKENS=15000
+AI_RESEARCH_EST_OUTPUT_TOKENS=2000
+AI_RESEARCH_INPUT_PRICE_PER_MTOK=5.0
+AI_RESEARCH_OUTPUT_PRICE_PER_MTOK=25.0
+```
+
+The default `AI_RESEARCH_MAX_CALLS_PER_DAY=0` intentionally reports `NOT_READY`, even when a key is present.
+
 ### Account Risk Halt Rehearsal
 
 Before a burn-in session or deploy window, validate both the account-risk threshold math and the real supervisor halt path:
