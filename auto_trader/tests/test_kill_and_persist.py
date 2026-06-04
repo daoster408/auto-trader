@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -2258,6 +2259,93 @@ def test_supervisor_exit_rule_blocks_max_hold():
 
     assert decision.should_exit is True
     assert decision.reason == "position max hold reached"
+
+
+def test_supervisor_last_risk_sweep_window_runs_once():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=sm,
+        adapter=object(),
+        order_manager=object(),
+    )
+    local_tz = ZoneInfo("America/Los_Angeles")
+    sweep_time = datetime(2026, 6, 3, 12, 55, tzinfo=local_tz)
+
+    assert supervisor._should_run_last_risk_sweep({"is_open": True, "source": "alpaca"}, sweep_time) is True
+
+    supervisor._mark_last_risk_sweep_complete(sweep_time)
+
+    assert supervisor._should_run_last_risk_sweep({"is_open": True, "source": "alpaca"}, sweep_time) is False
+    assert (
+        supervisor._should_run_last_risk_sweep(
+            {"is_open": True, "source": "alpaca"},
+            datetime(2026, 6, 4, 12, 54, tzinfo=local_tz),
+        )
+        is False
+    )
+    assert (
+        supervisor._should_run_last_risk_sweep(
+            {"is_open": False, "source": "alpaca"},
+            datetime(2026, 6, 4, 12, 55, tzinfo=local_tz),
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_last_risk_sweep_forces_reconciliation(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    reconcile_calls = 0
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return [{"id": "recent-1", "symbol": "AMPX"}]
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    async def fake_reconcile(orders):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        return len(orders)
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=object(),
+    )
+    supervisor._last_reconcile_at = datetime.now(UTC)
+    monkeypatch.setattr(supervisor, "_should_run_last_risk_sweep", lambda clock, local_now: True)
+
+    result = await supervisor.tick_once()
+
+    assert reconcile_calls == 1
+    assert result.reconciled_orders == 1
+    assert supervisor._last_risk_sweep_dates == {datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()}
 
 
 @pytest.mark.asyncio

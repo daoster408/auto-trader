@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -168,6 +168,7 @@ class TradingSupervisor:
         self._seen_alert_keys: set[str] = set()
         self._position_high_values: dict[str, float] = {}
         self._pending_exit_symbols: set[str] = set()
+        self._last_risk_sweep_dates: set[str] = set()
         self.finnhub_client = FinnhubClient(getattr(settings, "finnhub_api_key", None))
 
     async def _notify(self, message: str) -> None:
@@ -463,6 +464,23 @@ class TradingSupervisor:
             )
             raise
 
+    def _should_run_last_risk_sweep(self, clock: dict[str, Any] | None, local_now: datetime) -> bool:
+        if not bool(getattr(self.settings, "last_risk_sweep_enabled", True)):
+            return False
+        if not _regular_market_open(clock):
+            return False
+        local_date = local_now.date().isoformat()
+        if local_date in self._last_risk_sweep_dates:
+            return False
+        sweep_hour = int(getattr(self.settings, "last_risk_sweep_hour", 12))
+        sweep_minute = int(getattr(self.settings, "last_risk_sweep_minute", 55))
+        window_minutes = max(1, int(getattr(self.settings, "last_risk_sweep_window_minutes", 5)))
+        start = local_now.replace(hour=sweep_hour, minute=sweep_minute, second=0, microsecond=0)
+        return start <= local_now < start + timedelta(minutes=window_minutes)
+
+    def _mark_last_risk_sweep_complete(self, local_now: datetime) -> None:
+        self._last_risk_sweep_dates.add(local_now.date().isoformat())
+
     async def _maybe_submit_entry(
         self,
         *,
@@ -550,6 +568,9 @@ class TradingSupervisor:
         reconciled: int | None = None
         today_new_entries = 0
         max_new_positions_per_day = int(self.settings.max_new_positions_per_day)
+        timezone = ZoneInfo(getattr(self.settings, "report_timezone", "America/Los_Angeles"))
+        local_now = datetime.now(timezone)
+        last_risk_sweep_due = False
 
         try:
             account = await self.adapter.get_account_snapshot()
@@ -562,6 +583,7 @@ class TradingSupervisor:
             clock = await self.adapter.get_clock()
             if clock.get("source") == "error":
                 errors.append(f"clock unavailable: {clock.get('error', 'ERROR')}")
+            last_risk_sweep_due = self._should_run_last_risk_sweep(clock, local_now)
         except Exception as e:
             errors.append(f"clock unavailable: {e}")
 
@@ -570,6 +592,7 @@ class TradingSupervisor:
             due = self._last_reconcile_at is None or (
                 now - self._last_reconcile_at
             ).total_seconds() >= float(self.settings.reconcile_interval_seconds)
+            due = due or last_risk_sweep_due
             if due:
                 reconciled = await self.reconcile_once()
         except Exception as e:
@@ -582,8 +605,6 @@ class TradingSupervisor:
             errors.append(f"positions unavailable: {e}")
 
         try:
-            timezone = ZoneInfo(getattr(self.settings, "report_timezone", "America/Los_Angeles"))
-            local_now = datetime.now(timezone)
             local_day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
             today_new_entries = await count_entry_orders_since(local_day_start.astimezone(UTC).isoformat())
         except Exception as e:
@@ -649,6 +670,16 @@ class TradingSupervisor:
                 await self._execute_exit_if_enabled(decision, clock=clock)
             except Exception as e:
                 errors.append(f"exit execution failed for {decision.symbol}: {e}")
+
+        if last_risk_sweep_due and positions_snapshot_ok and not errors:
+            self._mark_last_risk_sweep_complete(local_now)
+            log.warning(
+                "last_risk_sweep_completed",
+                local_date=local_now.date().isoformat(),
+                positions=len(open_positions),
+                exit_signals=sum(1 for decision in exit_decisions if decision.should_exit),
+                reconciled_orders=reconciled,
+            )
 
         if len(errors) > alerted_error_count:
             alert = "SUPERVISOR WARNING: " + "; ".join(errors)
