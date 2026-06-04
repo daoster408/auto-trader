@@ -2359,6 +2359,85 @@ async def test_supervisor_auto_exit_closes_and_persists(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_supervisor_auto_exit_does_not_close_when_market_closed(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    notifications = []
+
+    class ExitSettings(DummySupervisorSettings):
+        auto_exit_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.close_calls = 0
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": False, "source": "alpaca", "next_open": "2026-06-04T13:30:00+00:00"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return [
+                {
+                    "symbol": "REPL",
+                    "qty": 1,
+                    "market_value": 89.0,
+                    "unrealized_pl": -11.0,
+                    "cost_basis": 100.0,
+                }
+            ]
+
+        async def close_position(self, symbol, reason):
+            self.close_calls += 1
+            raise AssertionError("close_position must not run outside regular market hours")
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        return None
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    adapter = FakeAdapter()
+    supervisor = TradingSupervisor(
+        settings=ExitSettings(),
+        state_machine=sm,
+        adapter=adapter,
+        order_manager=object(),
+        notifier=fake_notify,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.exit_decisions[0].should_exit is True
+    assert result.exit_decisions[0].reason == "position max loss reached"
+    assert adapter.close_calls == 0
+    assert not any("EXIT SUBMITTED: REPL" in message for message in notifications)
+
+
+@pytest.mark.asyncio
 async def test_supervisor_pending_exit_survives_position_snapshot_failure(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     notifications = []

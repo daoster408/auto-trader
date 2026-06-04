@@ -118,6 +118,10 @@ def _is_close_order_for_position(order: dict[str, Any], *, symbol: str, position
     return False
 
 
+def _regular_market_open(clock: dict[str, Any] | None) -> bool:
+    return bool(clock and clock.get("is_open") is True)
+
+
 def _is_open_entry_order(order: dict[str, Any]) -> bool:
     if _is_terminal_order_status(order.get("status")):
         return False
@@ -344,7 +348,12 @@ class TradingSupervisor:
                         f"EXIT PENDING CLEARED: prior close for {symbol} is {order.get('status')}; supervisor may retry.",
                     )
 
-    async def _execute_exit_if_enabled(self, decision: ExitDecision) -> dict[str, Any] | None:
+    async def _execute_exit_if_enabled(
+        self,
+        decision: ExitDecision,
+        *,
+        clock: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if not decision.should_exit:
             return None
         if self.sm.state.value == "HALTED":
@@ -357,6 +366,16 @@ class TradingSupervisor:
             await self._notify_once(
                 f"exit-dry-run-{decision.symbol}-{decision.reason}",
                 f"EXIT SIGNAL (dry run): {decision.symbol} - {decision.reason} - {decision.metrics}",
+            )
+            return None
+        if not _regular_market_open(clock):
+            log.info(
+                "exit_suppressed_market_closed",
+                symbol=decision.symbol,
+                reason=decision.reason,
+                market_open=None if clock is None else clock.get("is_open"),
+                clock_source=None if clock is None else clock.get("source"),
+                next_open=None if clock is None else clock.get("next_open"),
             )
             return None
         if decision.symbol in self._pending_exit_symbols:
@@ -627,7 +646,7 @@ class TradingSupervisor:
             decision = self.evaluate_exit_rules(position)
             exit_decisions.append(decision)
             try:
-                await self._execute_exit_if_enabled(decision)
+                await self._execute_exit_if_enabled(decision, clock=clock)
             except Exception as e:
                 errors.append(f"exit execution failed for {decision.symbol}: {e}")
 
