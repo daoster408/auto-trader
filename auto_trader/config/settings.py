@@ -52,11 +52,15 @@ class Settings(BaseSettings):
     # Optional LLM (populated later)
     finnhub_api_key: str | None = Field(None, alias="FINNHUB_API_KEY")
     ai_research_enabled: bool = Field(True, alias="AI_RESEARCH_ENABLED")
-    ai_research_provider: Literal["shadow", "openai"] = Field("shadow", alias="AI_RESEARCH_PROVIDER")
-    ai_research_model: str = Field("gpt-4.1-mini", alias="AI_RESEARCH_MODEL")
+    ai_research_provider: Literal["shadow", "openai", "xai", "anthropic", "gemini"] = Field(
+        "shadow",
+        alias="AI_RESEARCH_PROVIDER",
+    )
+    ai_research_model: str = Field("", alias="AI_RESEARCH_MODEL")
     openai_api_key: str | None = Field(None, alias="OPENAI_API_KEY")
     anthropic_api_key: str | None = Field(None, alias="ANTHROPIC_API_KEY")
     xai_api_key: str | None = Field(None, alias="XAI_API_KEY")
+    gemini_api_key: str | None = Field(None, alias="GEMINI_API_KEY")
 
     model_config = {
         "env_file": ".env",

@@ -11,6 +11,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from auto_trader.core.models import TradeIntent
@@ -20,6 +21,19 @@ log = get_logger("auto_trader.intelligence.ai_committee")
 
 PROMPT_VERSION = "ai_research_committee/v0"
 VALID_VERDICTS = {"approve", "reject", "watch"}
+COMMITTEE_INSTRUCTIONS = (
+    "You are an advisory trading research committee. Use only the provided JSON packet. "
+    "Do not invent market facts. Do not recommend order size. Return only valid JSON."
+)
+COMMITTEE_REQUIRED_FIELDS = [
+    "symbol",
+    "verdict",
+    "confidence",
+    "used_only_provided_data",
+    "bull_case",
+    "bear_case",
+    "judge_summary",
+]
 
 
 class ResearchCommittee(Protocol):
@@ -87,6 +101,32 @@ def validate_committee_output(symbol: str, output: dict[str, Any]) -> tuple[bool
     return not errors, errors
 
 
+def committee_json_schema(*, strict: bool = True) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "required": COMMITTEE_REQUIRED_FIELDS,
+        "properties": {
+            "symbol": {"type": "string"},
+            "verdict": {"type": "string", "enum": ["approve", "reject", "watch"]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "used_only_provided_data": {"type": "boolean"},
+            "bull_case": {"type": "string"},
+            "bear_case": {"type": "string"},
+            "judge_summary": {"type": "string"},
+        },
+    }
+    if strict:
+        schema["additionalProperties"] = False
+    return schema
+
+
+def committee_prompt(packet: dict[str, Any]) -> str:
+    return (
+        "Review this verified candidate packet and return the required JSON object.\n\n"
+        f"{json.dumps(packet, sort_keys=True, default=str)}"
+    )
+
+
 class ShadowResearchCommittee:
     """Zero-cost committee that writes structured memos from verified packet data."""
 
@@ -145,25 +185,25 @@ class ShadowResearchCommittee:
         )
 
 
-class OpenAIResearchCommittee:
-    """Optional OpenAI Responses API committee. Network/API failures raise to caller."""
-
-    provider = "openai"
+class HTTPResearchCommittee:
+    provider = "http"
 
     def __init__(self, api_key: str, *, model: str, timeout_seconds: float = 20.0) -> None:
+        if not api_key:
+            raise ValueError(f"{self.provider} research provider requires an API key")
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
 
     @property
     def model_tag(self) -> str:
-        return f"openai/{self.model}"
+        return f"{self.provider}/{self.model}"
 
     async def research(self, intent: TradeIntent, *, signal_id: int | None = None) -> ResearchMemo:
         packet = build_research_packet(intent, signal_id=signal_id)
         digest = packet_hash(packet)
-        raw = await asyncio.to_thread(self._call_openai, packet)
-        output = _extract_json_output(raw)
+        raw = await asyncio.to_thread(self._call_provider, packet)
+        output = self._extract_output(raw)
         validation_passed, validation_errors = validate_committee_output(intent.symbol, output)
         if validation_errors:
             output["validation_errors"] = validation_errors
@@ -180,80 +220,222 @@ class OpenAIResearchCommittee:
             memo={"input_packet": packet, "committee": output, "response_id": raw.get("id")},
         )
 
-    def _call_openai(self, packet: dict[str, Any]) -> dict[str, Any]:
-        schema = {
-            "type": "object",
-            "additionalProperties": False,
-            "required": [
-                "symbol",
-                "verdict",
-                "confidence",
-                "used_only_provided_data",
-                "bull_case",
-                "bear_case",
-                "judge_summary",
-            ],
-            "properties": {
-                "symbol": {"type": "string"},
-                "verdict": {"type": "string", "enum": ["approve", "reject", "watch"]},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "used_only_provided_data": {"type": "boolean"},
-                "bull_case": {"type": "string"},
-                "bear_case": {"type": "string"},
-                "judge_summary": {"type": "string"},
+    def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _extract_output(self, response: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _post_json(self, url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+        request = Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "auto-trader/0.1",
+                **headers,
             },
-        }
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError(str(exc).replace(self.api_key, "[REDACTED]")) from exc
+
+
+class OpenAIResearchCommittee(HTTPResearchCommittee):
+    """OpenAI Responses API committee. Network/API failures raise to caller."""
+
+    provider = "openai"
+
+    def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
         body = {
             "model": self.model,
-            "instructions": (
-                "You are an advisory trading research committee. Use only the provided JSON packet. "
-                "Do not invent market facts. Do not recommend order size. Return only structured JSON."
-            ),
-            "input": json.dumps(packet, sort_keys=True, default=str),
+            "instructions": COMMITTEE_INSTRUCTIONS,
+            "input": committee_prompt(packet),
             "text": {
                 "format": {
                     "type": "json_schema",
                     "name": "ai_research_memo",
-                    "schema": schema,
+                    "schema": committee_json_schema(strict=True),
                     "strict": True,
                 }
             },
         }
-        request = Request(
+        return self._post_json(
             "https://api.openai.com/v1/responses",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "auto-trader/0.1",
-            },
-            method="POST",
+            body,
+            {"Authorization": f"Bearer {self.api_key}"},
         )
-        with urlopen(request, timeout=self.timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
+
+    def _extract_output(self, response: dict[str, Any]) -> dict[str, Any]:
+        return _extract_openai_response_json(response)
+
+
+class XAIResearchCommittee(HTTPResearchCommittee):
+    """xAI/Grok OpenAI-compatible chat completions committee."""
+
+    provider = "xai"
+
+    def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": COMMITTEE_INSTRUCTIONS},
+                {"role": "user", "content": committee_prompt(packet)},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ai_research_memo",
+                    "schema": committee_json_schema(strict=True),
+                    "strict": True,
+                },
+            },
+        }
+        return self._post_json(
+            "https://api.x.ai/v1/chat/completions",
+            body,
+            {"Authorization": f"Bearer {self.api_key}"},
+        )
+
+    def _extract_output(self, response: dict[str, Any]) -> dict[str, Any]:
+        return _parse_json_text(response["choices"][0]["message"]["content"])
+
+
+class AnthropicResearchCommittee(HTTPResearchCommittee):
+    """Anthropic Messages API committee."""
+
+    provider = "anthropic"
+
+    def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
+        body = {
+            "model": self.model,
+            "max_tokens": 900,
+            "system": COMMITTEE_INSTRUCTIONS,
+            "messages": [{"role": "user", "content": committee_prompt(packet)}],
+        }
+        return self._post_json(
+            "https://api.anthropic.com/v1/messages",
+            body,
+            {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+        )
+
+    def _extract_output(self, response: dict[str, Any]) -> dict[str, Any]:
+        for item in response.get("content", []) or []:
+            text = item.get("text")
+            if isinstance(text, str):
+                return _parse_json_text(text)
+        raise ValueError("Anthropic response did not contain text JSON output")
+
+
+class GeminiResearchCommittee(HTTPResearchCommittee):
+    """Google Gemini generateContent committee."""
+
+    provider = "gemini"
+
+    def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
+        body = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": f"{COMMITTEE_INSTRUCTIONS}\n\n{committee_prompt(packet)}"}],
+                }
+            ],
+            "generationConfig": {
+                "response_mime_type": "application/json",
+                "response_schema": committee_json_schema(strict=False),
+            },
+        }
+        model = quote(self.model, safe="")
+        return self._post_json(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            body,
+            {"x-goog-api-key": self.api_key},
+        )
+
+    def _extract_output(self, response: dict[str, Any]) -> dict[str, Any]:
+        candidates = response.get("candidates") or []
+        if not candidates:
+            raise ValueError("Gemini response did not contain candidates")
+        parts = ((candidates[0].get("content") or {}).get("parts")) or []
+        for part in parts:
+            text = part.get("text")
+            if isinstance(text, str):
+                return _parse_json_text(text)
+        raise ValueError("Gemini response did not contain text JSON output")
 
 
 def create_research_committee(settings: Any) -> ResearchCommittee:
     provider = str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()
-    if provider == "openai" and getattr(settings, "openai_api_key", None):
+    model = str(getattr(settings, "ai_research_model", "") or _default_model(provider))
+    if provider == "shadow":
+        return ShadowResearchCommittee()
+    if provider == "openai":
         return OpenAIResearchCommittee(
-            str(getattr(settings, "openai_api_key")),
-            model=str(getattr(settings, "ai_research_model", "gpt-4.1-mini")),
+            _required_key(settings, "openai_api_key", provider),
+            model=model,
         )
-    return ShadowResearchCommittee()
+    if provider == "xai":
+        return XAIResearchCommittee(
+            _required_key(settings, "xai_api_key", provider),
+            model=model,
+        )
+    if provider == "anthropic":
+        return AnthropicResearchCommittee(
+            _required_key(settings, "anthropic_api_key", provider),
+            model=model,
+        )
+    if provider == "gemini":
+        return GeminiResearchCommittee(
+            _required_key(settings, "gemini_api_key", provider),
+            model=model,
+        )
+    raise ValueError(f"unsupported AI_RESEARCH_PROVIDER={provider}")
 
 
-def _extract_json_output(response: dict[str, Any]) -> dict[str, Any]:
+def _required_key(settings: Any, attr: str, provider: str) -> str:
+    value = str(getattr(settings, attr, "") or "").strip()
+    if not value:
+        raise ValueError(f"AI_RESEARCH_PROVIDER={provider} requires {attr.upper()}")
+    return value
+
+
+def _default_model(provider: str) -> str:
+    return {
+        "openai": "gpt-5.1",
+        "xai": "grok-4.3",
+        "anthropic": "claude-sonnet-4-20250514",
+        "gemini": "gemini-3.5-flash",
+    }.get(provider, "gpt-5.1")
+
+
+def _extract_openai_response_json(response: dict[str, Any]) -> dict[str, Any]:
     if isinstance(response.get("output_text"), str):
-        return json.loads(response["output_text"])
+        return _parse_json_text(response["output_text"])
     for item in response.get("output", []) or []:
         if item.get("type") != "message":
             continue
         for content in item.get("content", []) or []:
             text = content.get("text")
             if isinstance(text, str):
-                return json.loads(text)
+                return _parse_json_text(text)
     raise ValueError("OpenAI response did not contain JSON text output")
+
+
+def _parse_json_text(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = [line for line in stripped.splitlines() if not line.strip().startswith("```")]
+        stripped = "\n".join(lines).strip()
+    value = json.loads(stripped)
+    if not isinstance(value, dict):
+        raise ValueError("committee output must be a JSON object")
+    return value
 
 
 def _float(value: Any, default: float = 0.0) -> float:

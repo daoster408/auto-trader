@@ -33,7 +33,12 @@ from auto_trader.config.settings import Settings
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.ai_committee import (
+    AnthropicResearchCommittee,
+    GeminiResearchCommittee,
+    OpenAIResearchCommittee,
     ShadowResearchCommittee,
+    XAIResearchCommittee,
+    create_research_committee,
     validate_committee_output,
 )
 from auto_trader.intelligence.finnhub_client import FinnhubClient
@@ -836,6 +841,65 @@ def test_ai_committee_validator_rejects_unverified_data():
 
     assert valid is False
     assert "used_unverified_data" in errors
+
+
+def test_research_committee_factory_wires_real_providers_and_requires_keys():
+    class Base:
+        ai_research_model = ""
+        openai_api_key = "openai-key"
+        xai_api_key = "xai-key"
+        anthropic_api_key = "anthropic-key"
+        gemini_api_key = "gemini-key"
+
+    class OpenAISettings(Base):
+        ai_research_provider = "openai"
+
+    class XAISettings(Base):
+        ai_research_provider = "xai"
+
+    class AnthropicSettings(Base):
+        ai_research_provider = "anthropic"
+
+    class GeminiSettings(Base):
+        ai_research_provider = "gemini"
+
+    class MissingOpenAI(Base):
+        ai_research_provider = "openai"
+        openai_api_key = ""
+
+    assert isinstance(create_research_committee(OpenAISettings()), OpenAIResearchCommittee)
+    assert create_research_committee(OpenAISettings()).model == "gpt-5.1"
+    assert isinstance(create_research_committee(XAISettings()), XAIResearchCommittee)
+    assert create_research_committee(XAISettings()).model == "grok-4.3"
+    assert isinstance(create_research_committee(AnthropicSettings()), AnthropicResearchCommittee)
+    assert create_research_committee(AnthropicSettings()).model == "claude-sonnet-4-20250514"
+    assert isinstance(create_research_committee(GeminiSettings()), GeminiResearchCommittee)
+    assert create_research_committee(GeminiSettings()).model == "gemini-3.5-flash"
+    with pytest.raises(ValueError, match="requires OPENAI_API_KEY"):
+        create_research_committee(MissingOpenAI())
+
+
+def test_real_provider_extractors_parse_structured_json():
+    payload = {
+        "symbol": "POET",
+        "verdict": "watch",
+        "confidence": 0.5,
+        "used_only_provided_data": True,
+        "bull_case": "Provided packet shows constructive momentum.",
+        "bear_case": "Catalyst is unverified.",
+        "judge_summary": "Watch only.",
+    }
+    text = json.dumps(payload)
+
+    openai = OpenAIResearchCommittee("key", model="gpt-5.1")
+    xai = XAIResearchCommittee("key", model="grok-4.3")
+    anthropic = AnthropicResearchCommittee("key", model="claude-sonnet-4-20250514")
+    gemini = GeminiResearchCommittee("key", model="gemini-3.5-flash")
+
+    assert openai._extract_output({"output_text": text}) == payload
+    assert xai._extract_output({"choices": [{"message": {"content": text}}]}) == payload
+    assert anthropic._extract_output({"content": [{"type": "text", "text": text}]}) == payload
+    assert gemini._extract_output({"candidates": [{"content": {"parts": [{"text": text}]}}]}) == payload
 
 
 @pytest.mark.asyncio
