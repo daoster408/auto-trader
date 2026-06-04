@@ -32,6 +32,10 @@ from auto_trader.comms.telegram_bot import TelegramBot
 from auto_trader.config.settings import Settings
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
+from auto_trader.intelligence.ai_committee import (
+    ShadowResearchCommittee,
+    validate_committee_output,
+)
 from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.rules_fallback import DiscoveryCandidate, get_simple_rules_signals
 from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_shutdown, _should_emergency_halt_on_shutdown
@@ -43,6 +47,7 @@ from auto_trader.persistence.db import (
     configure_db_path,
     count_entry_orders_since,
     get_latest_journal_entries,
+    get_latest_ai_research_memos,
     get_latest_order_records,
     get_pending_exits,
     get_pending_exit_for_symbol,
@@ -53,6 +58,7 @@ from auto_trader.persistence.db import (
     get_runtime_config_values,
     init_db,
     log_risk_decision,
+    log_ai_research_memo,
     log_signal,
     load_system_state,
     record_runtime_capabilities,
@@ -88,6 +94,9 @@ class DummySupervisorSettings(DummySettings):
     position_trailing_stop_pct = 6.0
     position_max_hold_days = 10
     report_timezone = "America/Los_Angeles"
+    ai_research_enabled = False
+    ai_research_provider = "shadow"
+    ai_research_model = "gpt-4.1-mini"
 
 
 class DummyDay3Settings:
@@ -746,6 +755,87 @@ async def test_signal_log_persists_features_json():
         assert row[0] == "POET"
         assert row[1] == "rules_fallback"
         assert json.loads(row[2])["finnhub"]["quote"]["current"] == 14.2
+
+
+@pytest.mark.asyncio
+async def test_ai_research_memo_persistence_roundtrip():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "ai_research.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        signal_id = await log_signal(
+            symbol="POET",
+            thesis="rules found momentum",
+            confidence=0.72,
+            source="rules_fallback",
+            features={"discovery": {"score": 6.0}},
+        )
+        memo_id = await log_ai_research_memo(
+            signal_id=signal_id,
+            symbol="POET",
+            provider="shadow",
+            model_tag="shadow_ai_committee/v0",
+            prompt_version="ai_research_committee/v0",
+            input_hash="abc123",
+            verdict="watch",
+            confidence=0.66,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"committee": {"judge_summary": "advisory only"}},
+        )
+
+        memos = await get_latest_ai_research_memos(limit=5)
+
+        assert memo_id is not None
+        assert len(memos) == 1
+        assert memos[0]["symbol"] == "POET"
+        assert memos[0]["provider"] == "shadow"
+        assert memos[0]["verdict"] == "watch"
+        assert memos[0]["validation_passed"] is True
+        assert memos[0]["memo"]["committee"]["judge_summary"] == "advisory only"
+
+
+@pytest.mark.asyncio
+async def test_shadow_research_committee_validates_advisory_memo():
+    committee = ShadowResearchCommittee()
+    intent = TradeIntent(
+        symbol="POET",
+        side="long",
+        entry_price=14.2,
+        rationale="rules found momentum",
+        confidence=0.75,
+        features={
+            "discovery": {
+                "score": 5.5,
+                "rel_volume": 2.1,
+                "change_pct": 0.04,
+                "spread_pct": 0.002,
+            },
+            "finnhub": {"provider": "finnhub", "enabled": True},
+        },
+    )
+
+    memo = await committee.research(intent, signal_id=7)
+
+    assert memo.symbol == "POET"
+    assert memo.provider == "shadow"
+    assert memo.prompt_version == "ai_research_committee/v0"
+    assert memo.verdict == "approve"
+    assert memo.used_only_provided_data is True
+    assert memo.validation_passed is True
+    assert memo.memo["input_packet"]["signal_id"] == 7
+    assert memo.memo["committee"]["judge_summary"]
+
+
+def test_ai_committee_validator_rejects_unverified_data():
+    valid, errors = validate_committee_output(
+        "POET",
+        {"symbol": "POET", "verdict": "approve", "confidence": 0.7, "used_only_provided_data": False},
+    )
+
+    assert valid is False
+    assert "used_unverified_data" in errors
 
 
 @pytest.mark.asyncio
@@ -3712,6 +3802,90 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
 
     assert result.entry_result["order"]["id"] == "entry-1"
     assert manager.calls[0][0].symbol == "AMPX"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_auto_entry_logs_shadow_ai_research(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    logged_memos = []
+
+    class EntrySettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            return {"order": {"id": "entry-1"}, "risk_decision": {"approved": True}}
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        return None
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None):
+        return [
+            TradeIntent(
+                symbol="AMPX",
+                side="long",
+                entry_price=20.0,
+                confidence=0.8,
+                features={"discovery": {"score": 5.0, "rel_volume": 2.0, "change_pct": 0.03, "spread_pct": 0.002}},
+            )
+        ]
+
+    async def fake_ai_memo(**kwargs):
+        logged_memos.append(kwargs)
+        return 1
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_ai_research_memo", fake_ai_memo)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    supervisor = TradingSupervisor(
+        settings=EntrySettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.entry_result["order"]["id"] == "entry-1"
+    assert logged_memos[0]["symbol"] == "AMPX"
+    assert logged_memos[0]["provider"] == "shadow"
+    assert logged_memos[0]["validation_passed"] is True
 
 
 @pytest.mark.asyncio

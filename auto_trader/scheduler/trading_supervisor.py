@@ -11,6 +11,7 @@ from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.core.models import KillResult, SystemState
 from auto_trader.execution.order_manager import OrderManager
+from auto_trader.intelligence.ai_committee import create_research_committee
 from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
 from auto_trader.persistence.db import (
@@ -22,6 +23,7 @@ from auto_trader.persistence.db import (
     get_pending_exit_symbols,
     get_runtime_config_bool,
     get_runtime_config_int,
+    log_ai_research_memo,
     log_signal,
     reconcile_broker_orders,
     update_account_risk_state,
@@ -170,6 +172,7 @@ class TradingSupervisor:
         self._pending_exit_symbols: set[str] = set()
         self._last_risk_sweep_dates: set[str] = set()
         self.finnhub_client = FinnhubClient(getattr(settings, "finnhub_api_key", None))
+        self.research_committee = create_research_committee(settings)
 
     async def _notify(self, message: str) -> None:
         log.warning("supervisor_alert", message=message)
@@ -541,6 +544,24 @@ class TradingSupervisor:
             model_tag="rules_fallback/v0",
             features=intent.features,
         )
+        if bool(getattr(self.settings, "ai_research_enabled", True)):
+            try:
+                memo = await self.research_committee.research(intent, signal_id=signal_id)
+                await log_ai_research_memo(
+                    signal_id=signal_id,
+                    symbol=memo.symbol,
+                    provider=memo.provider,
+                    model_tag=memo.model_tag,
+                    prompt_version=memo.prompt_version,
+                    input_hash=memo.input_hash,
+                    verdict=memo.verdict,
+                    confidence=memo.confidence,
+                    used_only_provided_data=memo.used_only_provided_data,
+                    validation_passed=memo.validation_passed,
+                    memo=memo.memo,
+                )
+            except Exception as e:
+                log.warning("ai_research_shadow_failed", symbol=intent.symbol, error=str(e))
         snapshot = type(
             "SupervisorSnapshot",
             (object,),

@@ -236,6 +236,109 @@ async def log_signal(
             return None
 
 
+async def log_ai_research_memo(
+    *,
+    signal_id: int | None,
+    symbol: str,
+    provider: str,
+    model_tag: str,
+    prompt_version: str,
+    input_hash: str,
+    verdict: str,
+    confidence: float | None,
+    used_only_provided_data: bool,
+    validation_passed: bool,
+    memo: dict[str, Any],
+) -> int | None:
+    """Persist an AI/shadow committee research memo. Advisory only; never an order gate."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    INSERT INTO ai_research_memos (
+                        signal_id, symbol, provider, model_tag, prompt_version, input_hash,
+                        verdict, confidence, used_only_provided_data, validation_passed, memo_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        signal_id,
+                        str(symbol).upper(),
+                        str(provider),
+                        str(model_tag),
+                        str(prompt_version),
+                        str(input_hash),
+                        str(verdict),
+                        confidence,
+                        1 if used_only_provided_data else 0,
+                        1 if validation_passed else 0,
+                        json.dumps(memo, sort_keys=True),
+                    ),
+                )
+                await db.commit()
+                memo_id = int(cur.lastrowid) if cur.lastrowid is not None else None
+                log.info(
+                    "ai_research_memo_logged",
+                    symbol=symbol,
+                    provider=provider,
+                    verdict=verdict,
+                    validation_passed=validation_passed,
+                )
+                return memo_id
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("ai_research_memo_log_failed", symbol=symbol, error=str(e))
+            return None
+
+
+async def get_latest_ai_research_memos(limit: int = 10) -> list[dict[str, Any]]:
+    """Return latest AI/shadow committee memos for audit/status surfaces."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT id, created_at, signal_id, symbol, provider, model_tag,
+                           prompt_version, input_hash, verdict, confidence,
+                           used_only_provided_data, validation_passed, memo_json
+                    FROM ai_research_memos
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                )
+                rows = await cur.fetchall()
+                return [
+                    {
+                        "id": row["id"],
+                        "created_at": row["created_at"],
+                        "signal_id": row["signal_id"],
+                        "symbol": row["symbol"],
+                        "provider": row["provider"],
+                        "model_tag": row["model_tag"],
+                        "prompt_version": row["prompt_version"],
+                        "input_hash": row["input_hash"],
+                        "verdict": row["verdict"],
+                        "confidence": row["confidence"],
+                        "used_only_provided_data": bool(row["used_only_provided_data"]),
+                        "validation_passed": bool(row["validation_passed"]),
+                        "memo": json.loads(row["memo_json"] or "{}"),
+                    }
+                    for row in rows
+                ]
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("ai_research_memos_list_failed", error=str(e))
+            return []
+
+
 async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | None = None, rationale: str | None = None) -> bool:
     """Persist or refresh an order row from broker/manager normalized data."""
     client_order_id = str(order.get("client_order_id") or order.get("id") or order.get("broker_order_id") or "")

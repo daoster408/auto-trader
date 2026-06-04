@@ -41,6 +41,22 @@ CREATE TABLE IF NOT EXISTS signals (
     features_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS ai_research_memos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    signal_id INTEGER REFERENCES signals(id),
+    symbol TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model_tag TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    confidence REAL,
+    used_only_provided_data INTEGER NOT NULL CHECK (used_only_provided_data IN (0,1)),
+    validation_passed INTEGER NOT NULL CHECK (validation_passed IN (0,1)),
+    memo_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS orders (
     client_order_id TEXT PRIMARY KEY,
     broker_order_id TEXT,
