@@ -16,6 +16,8 @@ from auto_trader.intelligence.ai_committee import (
     build_research_packet,
     create_research_committee,
     packet_hash,
+    real_research_providers,
+    research_committee_round,
 )
 from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.rules_fallback import get_simple_rules_signals
@@ -577,20 +579,30 @@ class TradingSupervisor:
         packet = build_research_packet(intent, signal_id=signal_id)
         digest = packet_hash(packet)
         model_tag = str(getattr(self.research_committee, "model_tag", provider))
-        if provider != "shadow":
-            existing = await count_ai_research_memos(provider=provider, input_hash=digest)
-            if existing is None:
-                log.warning("ai_research_skipped_budget_count_failed", symbol=intent.symbol, provider=provider)
-                return
-            if existing > 0:
-                log.info("ai_research_deduped", symbol=intent.symbol, provider=provider, input_hash=digest[:12])
-                return
+        real_providers = real_research_providers(self.research_committee)
+        if real_providers:
+            for provider_name in real_providers:
+                existing = await count_ai_research_memos(provider=provider_name, input_hash=digest)
+                if existing is None:
+                    log.warning("ai_research_skipped_dedupe_count_failed", symbol=intent.symbol, provider=provider_name)
+                    return
+                if existing > 0:
+                    log.info(
+                        "ai_research_deduped",
+                        symbol=intent.symbol,
+                        provider=provider_name,
+                        input_hash=digest[:12],
+                    )
+                    return
+            attempts_needed = len(real_providers)
+            budget_provider = real_providers[0] if attempts_needed == 1 else None
             daily_max = int(getattr(self.settings, "ai_research_max_calls_per_day", 0) or 0)
-            daily_count = await count_ai_research_chargeable_attempts(provider=provider, today_utc=True)
+            daily_count = await count_ai_research_chargeable_attempts(provider=budget_provider, today_utc=True)
             if daily_count is None:
                 log.warning("ai_research_skipped_budget_count_failed", symbol=intent.symbol, provider=provider)
                 return
-            if daily_max <= 0 or daily_count >= daily_max:
+            remaining_calls = max(0, daily_max - daily_count)
+            if daily_max <= 0 or remaining_calls < attempts_needed:
                 await log_ai_research_memo(
                     signal_id=signal_id,
                     symbol=intent.symbol,
@@ -615,25 +627,57 @@ class TradingSupervisor:
                                 "or not explicitly enabled."
                             ),
                         },
-                        "budget": {"daily_max": daily_max, "daily_count": daily_count},
+                        "budget": {
+                            "daily_max": daily_max,
+                            "daily_count": daily_count,
+                            "remaining_calls": remaining_calls,
+                            "attempts_needed": attempts_needed,
+                            "providers": real_providers,
+                        },
                     },
                 )
                 return
         try:
-            memo = await self.research_committee.research(intent, signal_id=signal_id)
-            await log_ai_research_memo(
-                signal_id=signal_id,
-                symbol=memo.symbol,
-                provider=memo.provider,
-                model_tag=memo.model_tag,
-                prompt_version=memo.prompt_version,
-                input_hash=memo.input_hash,
-                verdict=memo.verdict,
-                confidence=memo.confidence,
-                used_only_provided_data=memo.used_only_provided_data,
-                validation_passed=memo.validation_passed,
-                memo=memo.memo,
-            )
+            research_round = await research_committee_round(self.research_committee, intent, signal_id=signal_id)
+            member_memo_ids = []
+            for memo in research_round.member_memos:
+                memo_id = await log_ai_research_memo(
+                    signal_id=signal_id,
+                    symbol=memo.symbol,
+                    provider=memo.provider,
+                    model_tag=memo.model_tag,
+                    prompt_version=memo.prompt_version,
+                    input_hash=memo.input_hash,
+                    verdict=memo.verdict,
+                    confidence=memo.confidence,
+                    used_only_provided_data=memo.used_only_provided_data,
+                    validation_passed=memo.validation_passed,
+                    memo=memo.memo,
+                )
+                member_memo_ids.append(
+                    {
+                        "provider": memo.provider,
+                        "prompt_version": memo.prompt_version,
+                        "input_hash": memo.input_hash,
+                        "memo_id": memo_id,
+                    }
+                )
+            if research_round.aggregate_memo not in research_round.member_memos:
+                research_round.aggregate_memo.memo["provider_memo_ids"] = member_memo_ids
+                memo = research_round.aggregate_memo
+                await log_ai_research_memo(
+                    signal_id=signal_id,
+                    symbol=memo.symbol,
+                    provider=memo.provider,
+                    model_tag=memo.model_tag,
+                    prompt_version=memo.prompt_version,
+                    input_hash=memo.input_hash,
+                    verdict=memo.verdict,
+                    confidence=memo.confidence,
+                    used_only_provided_data=memo.used_only_provided_data,
+                    validation_passed=memo.validation_passed,
+                    memo=memo.memo,
+                )
         except Exception as e:
             await log_ai_research_memo(
                 signal_id=signal_id,

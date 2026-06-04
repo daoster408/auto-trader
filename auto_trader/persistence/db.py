@@ -384,10 +384,10 @@ async def count_ai_research_chargeable_attempts(
 ) -> int | None:
     """Count real-provider AI attempts that should consume paid-call budget."""
     conditions: list[str] = [
-        "provider != ?",
+        "provider NOT IN (?, ?)",
         f"prompt_version IN ({','.join('?' for _ in CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS)})",
     ]
-    params: list[Any] = ["shadow", *CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS]
+    params: list[Any] = ["shadow", "multi", *CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS]
     if provider is not None:
         conditions.append("provider = ?")
         params.append(str(provider))

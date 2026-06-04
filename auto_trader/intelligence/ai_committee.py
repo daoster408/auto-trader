@@ -20,7 +20,10 @@ from auto_trader.utils.logging import get_logger
 log = get_logger("auto_trader.intelligence.ai_committee")
 
 PROMPT_VERSION = "ai_research_committee/v0"
+AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v0"
 VALID_VERDICTS = {"approve", "reject", "watch"}
+REAL_PROVIDERS = ("openai", "xai", "anthropic", "gemini")
+MIN_APPROVE_CONFIDENCE = 0.65
 COMMITTEE_INSTRUCTIONS = (
     "You are an advisory trading research committee. Use only the provided JSON packet. "
     "Do not invent market facts. Do not recommend order size. Return only valid JSON. "
@@ -56,6 +59,12 @@ class ResearchMemo:
     used_only_provided_data: bool
     validation_passed: bool
     memo: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ResearchRound:
+    member_memos: list[ResearchMemo]
+    aggregate_memo: ResearchMemo
 
 
 def build_research_packet(intent: TradeIntent, *, signal_id: int | None = None) -> dict[str, Any]:
@@ -486,8 +495,217 @@ class GeminiResearchCommittee(HTTPResearchCommittee):
         raise ValueError("Gemini response did not contain text JSON output")
 
 
+class MultiProviderResearchCommittee:
+    """Independent-provider advisory committee with deterministic quorum."""
+
+    provider = "multi"
+
+    def __init__(self, members: list[ResearchCommittee]) -> None:
+        if len(members) < 2:
+            raise ValueError("multi-provider research committee requires at least two providers")
+        self.members = members
+
+    @property
+    def provider_names(self) -> list[str]:
+        return [str(getattr(member, "provider", "unknown")) for member in self.members]
+
+    @property
+    def model_tag(self) -> str:
+        return "multi/" + "+".join(str(getattr(member, "model_tag", "unknown")) for member in self.members)
+
+    async def research_round(self, intent: TradeIntent, *, signal_id: int | None = None) -> ResearchRound:
+        packet = build_research_packet(intent, signal_id=signal_id)
+        digest = packet_hash(packet)
+        member_memos = []
+        for member in self.members:
+            member_memos.append(
+                await self._safe_member_research(member, intent, signal_id=signal_id, digest=digest)
+            )
+        aggregate = aggregate_research_memos(intent.symbol, member_memos, packet=packet, input_hash=digest)
+        return ResearchRound(member_memos=list(member_memos), aggregate_memo=aggregate)
+
+    async def research(self, intent: TradeIntent, *, signal_id: int | None = None) -> ResearchMemo:
+        return (await self.research_round(intent, signal_id=signal_id)).aggregate_memo
+
+    async def _safe_member_research(
+        self,
+        member: ResearchCommittee,
+        intent: TradeIntent,
+        *,
+        signal_id: int | None,
+        digest: str,
+    ) -> ResearchMemo:
+        try:
+            return await member.research(intent, signal_id=signal_id)
+        except Exception as exc:
+            provider = str(getattr(member, "provider", "unknown"))
+            model_tag = str(getattr(member, "model_tag", provider))
+            return ResearchMemo(
+                symbol=intent.symbol.upper(),
+                provider=provider,
+                model_tag=model_tag,
+                prompt_version="ai_research_failure/v0",
+                input_hash=digest,
+                verdict="watch",
+                confidence=None,
+                used_only_provided_data=True,
+                validation_passed=False,
+                memo={
+                    "input_packet": build_research_packet(intent, signal_id=signal_id),
+                    "committee": {
+                        "symbol": intent.symbol.upper(),
+                        "verdict": "watch",
+                        "confidence": None,
+                        "used_only_provided_data": True,
+                        "validation_errors": ["ai_research_provider_failed"],
+                        "judge_summary": (
+                            "Provider failed during multi-provider advisory research; "
+                            "deterministic RiskEngine remains authoritative."
+                        ),
+                    },
+                    "error": str(exc),
+                },
+            )
+
+
+def aggregate_research_memos(
+    symbol: str,
+    member_memos: list[ResearchMemo],
+    *,
+    packet: dict[str, Any],
+    input_hash: str,
+) -> ResearchMemo:
+    """Aggregate independent provider memos into an auditable advisory verdict."""
+    valid_memos = [memo for memo in member_memos if memo.validation_passed]
+    valid_rejects = [memo for memo in valid_memos if memo.verdict == "reject"]
+    valid_approves = [
+        memo
+        for memo in valid_memos
+        if memo.verdict == "approve" and memo.confidence is not None and memo.confidence >= MIN_APPROVE_CONFIDENCE
+    ]
+
+    if valid_rejects:
+        verdict = "reject"
+        reason = "valid provider reject overrides approve quorum"
+    elif len(valid_approves) >= 2:
+        verdict = "approve"
+        reason = "at least two valid providers approved and no valid provider rejected"
+    else:
+        verdict = "watch"
+        reason = "approve quorum not met"
+
+    confidences = [memo.confidence for memo in valid_memos if memo.confidence is not None]
+    confidence = round(sum(confidences) / len(confidences), 4) if confidences else 0.0
+    votes = [_memo_vote_summary(memo) for memo in member_memos]
+    output = {
+        "symbol": symbol.upper(),
+        "verdict": verdict,
+        "confidence": confidence,
+        "used_only_provided_data": True,
+        "bull_case": _bounded_text(
+            "; ".join(
+                _committee_text(memo, "bull_case")
+                for memo in valid_approves
+                if _committee_text(memo, "bull_case")
+            )
+            or "No valid approve quorum was established from provider memos."
+        ),
+        "bear_case": _bounded_text(
+            "; ".join(
+                _committee_text(memo, "bear_case")
+                for memo in member_memos
+                if _committee_text(memo, "bear_case")
+            )
+            or "Provider failures, invalid memos, or watch votes keep the advisory result conservative."
+        ),
+        "judge_summary": _bounded_text(
+            f"Multi-provider advisory result is {verdict}: {reason}. "
+            "RiskEngine remains the only order and sizing authority."
+        ),
+    }
+    validation_passed, validation_errors = validate_committee_output(symbol, output)
+    if validation_errors:
+        output["validation_errors"] = validation_errors
+    aggregate_hash = hashlib.sha256(
+        (
+            input_hash
+            + ":"
+            + AGGREGATE_PROMPT_VERSION
+            + ":"
+            + ",".join(memo.provider for memo in member_memos)
+        ).encode("utf-8")
+    ).hexdigest()
+    return ResearchMemo(
+        symbol=symbol.upper(),
+        provider="multi",
+        model_tag="multi/" + "+".join(memo.model_tag for memo in member_memos),
+        prompt_version=AGGREGATE_PROMPT_VERSION,
+        input_hash=aggregate_hash,
+        verdict=verdict,
+        confidence=confidence,
+        used_only_provided_data=True,
+        validation_passed=validation_passed,
+        memo={
+            "input_packet": packet,
+            "committee": output,
+            "quorum": {
+                "rule": "approve requires at least two valid approve votes with confidence >= 0.65 and no valid reject",
+                "reason": reason,
+                "valid_provider_count": len(valid_memos),
+                "approve_count": len(valid_approves),
+                "reject_count": len(valid_rejects),
+                "provider_count": len(member_memos),
+            },
+            "provider_votes": votes,
+        },
+    )
+
+
+async def research_committee_round(
+    committee: ResearchCommittee,
+    intent: TradeIntent,
+    *,
+    signal_id: int | None = None,
+) -> ResearchRound:
+    if hasattr(committee, "research_round"):
+        return await committee.research_round(intent, signal_id=signal_id)  # type: ignore[attr-defined]
+    memo = await committee.research(intent, signal_id=signal_id)
+    return ResearchRound(member_memos=[memo], aggregate_memo=memo)
+
+
 def create_research_committee(settings: Any) -> ResearchCommittee:
-    provider = str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()
+    providers = selected_research_providers(settings)
+    if len(providers) > 1:
+        return MultiProviderResearchCommittee([_create_single_research_committee(settings, provider) for provider in providers])
+    provider = providers[0]
+    return _create_single_research_committee(settings, provider)
+
+
+def selected_research_providers(settings: Any) -> list[str]:
+    raw_providers = str(getattr(settings, "ai_research_providers", "") or "").strip()
+    if raw_providers:
+        providers = [provider.strip().lower() for provider in raw_providers.split(",") if provider.strip()]
+    else:
+        providers = [str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()]
+    providers = list(dict.fromkeys(providers))
+    if not providers:
+        return ["shadow"]
+    if len(providers) > 1 and "shadow" in providers:
+        raise ValueError("AI_RESEARCH_PROVIDERS cannot mix shadow with real providers")
+    unsupported = [provider for provider in providers if provider != "shadow" and provider not in REAL_PROVIDERS]
+    if unsupported:
+        raise ValueError(f"unsupported AI_RESEARCH_PROVIDERS={','.join(unsupported)}")
+    return providers
+
+
+def real_research_providers(committee: ResearchCommittee) -> list[str]:
+    if isinstance(committee, MultiProviderResearchCommittee):
+        return [provider for provider in committee.provider_names if provider != "shadow"]
+    provider = str(getattr(committee, "provider", "shadow"))
+    return [] if provider == "shadow" else [provider]
+
+
+def _create_single_research_committee(settings: Any, provider: str) -> ResearchCommittee:
     if provider == "shadow":
         return ShadowResearchCommittee()
     model = _required_model(settings, provider)
@@ -527,10 +745,41 @@ def _required_key(settings: Any, attr: str, provider: str) -> str:
 
 
 def _required_model(settings: Any, provider: str) -> str:
-    value = str(getattr(settings, "ai_research_model", "") or "").strip()
+    value = model_for_provider(settings, provider)
     if not value:
-        raise ValueError(f"AI_RESEARCH_PROVIDER={provider} requires AI_RESEARCH_MODEL")
+        provider_attr = f"ai_research_{provider}_model"
+        raise ValueError(f"AI_RESEARCH_PROVIDER={provider} requires {provider_attr.upper()} or AI_RESEARCH_MODEL")
     return value
+
+
+def model_for_provider(settings: Any, provider: str) -> str:
+    provider_attr = f"ai_research_{provider}_model"
+    value = str(getattr(settings, provider_attr, "") or "").strip()
+    if value:
+        return value
+    return str(getattr(settings, "ai_research_model", "") or "").strip()
+
+
+def _memo_vote_summary(memo: ResearchMemo) -> dict[str, Any]:
+    committee = memo.memo.get("committee") if isinstance(memo.memo, dict) else {}
+    validation_errors = committee.get("validation_errors", []) if isinstance(committee, dict) else []
+    return {
+        "provider": memo.provider,
+        "model_tag": memo.model_tag,
+        "prompt_version": memo.prompt_version,
+        "input_hash": memo.input_hash,
+        "verdict": memo.verdict,
+        "confidence": memo.confidence,
+        "validation_passed": memo.validation_passed,
+        "used_only_provided_data": memo.used_only_provided_data,
+        "validation_errors": validation_errors,
+    }
+
+
+def _committee_text(memo: ResearchMemo, field: str) -> str:
+    committee = memo.memo.get("committee") if isinstance(memo.memo, dict) else {}
+    value = committee.get(field) if isinstance(committee, dict) else None
+    return _stringify_points(value)
 
 
 def _extract_openai_response_json(response: dict[str, Any]) -> dict[str, Any]:

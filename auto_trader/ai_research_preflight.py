@@ -8,6 +8,7 @@ from typing import Any
 
 from auto_trader.account_risk_validate import ValidationGate, validation_exit_code
 from auto_trader.config.settings import get_settings
+from auto_trader.intelligence.ai_committee import model_for_provider, selected_research_providers
 from auto_trader.persistence.db import configure_db_path, count_ai_research_chargeable_attempts, init_db
 from auto_trader.utils.logging import setup_logging
 
@@ -35,14 +36,24 @@ class CostAssumptions:
 
 
 @dataclass(frozen=True)
+class ProviderReadiness:
+    provider: str
+    model: str
+    key_present: bool
+    real_provider: bool
+
+
+@dataclass(frozen=True)
 class AIResearchPreflightReport:
     ready: bool
     provider: str
     model: str
     key_present: bool
+    providers: list[ProviderReadiness]
     max_calls: int
     used_calls: int | None
     remaining_calls: int | None
+    attempts_per_round: int
     timeout_seconds: float
     cost: CostAssumptions
     gates: list[ValidationGate]
@@ -50,6 +61,16 @@ class AIResearchPreflightReport:
     @property
     def estimated_daily_cost(self) -> float:
         return self.cost.estimated_cost_per_memo * max(0, self.max_calls)
+
+    @property
+    def estimated_cost_per_round(self) -> float:
+        return self.cost.estimated_cost_per_memo * max(1, self.attempts_per_round)
+
+    @property
+    def remaining_rounds(self) -> int | None:
+        if self.remaining_calls is None:
+            return None
+        return self.remaining_calls // max(1, self.attempts_per_round)
 
 
 def _provider_key_present(settings: Any, provider: str) -> bool:
@@ -79,20 +100,36 @@ def build_ai_research_preflight_report(
     cost: CostAssumptions | None = None,
 ) -> AIResearchPreflightReport:
     """Build a zero-network readiness report for paid AI research."""
-    provider = str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()
+    providers = selected_research_providers(settings)
+    provider = providers[0] if len(providers) == 1 else "multi"
     enabled = bool(getattr(settings, "ai_research_enabled", True))
-    model = str(getattr(settings, "ai_research_model", "") or "").strip()
+    provider_reports = [
+        ProviderReadiness(
+            provider=name,
+            model=model_for_provider(settings, name),
+            key_present=False if name == "shadow" else _provider_key_present(settings, name),
+            real_provider=name in _PROVIDER_KEY_ATTRS,
+        )
+        for name in providers
+    ]
+    model = (
+        provider_reports[0].model
+        if len(provider_reports) == 1
+        else ",".join(f"{row.provider}:{row.model or 'n/a'}" for row in provider_reports)
+    )
     max_calls = int(getattr(settings, "ai_research_max_calls_per_day", 0) or 0)
     timeout_seconds = float(getattr(settings, "ai_research_timeout_seconds", 8.0) or 8.0)
-    real_provider = provider in _PROVIDER_KEY_ATTRS
-    key_present = _provider_key_present(settings, provider)
+    real_provider = all(row.real_provider for row in provider_reports)
+    key_present = all(row.key_present for row in provider_reports)
+    all_models_present = all(row.model for row in provider_reports)
+    attempts_per_round = len([row for row in provider_reports if row.real_provider])
     remaining_calls = max(0, max_calls - used_calls) if used_calls is not None else None
     cost = cost or _cost_assumptions_from_settings(settings)
 
     gates = [
         _gate("AI enabled", enabled, f"AI_RESEARCH_ENABLED={str(enabled).lower()}"),
         _gate("Real provider selected", real_provider, f"AI_RESEARCH_PROVIDER={provider}"),
-        _gate("Explicit model", bool(model), "AI_RESEARCH_MODEL is set" if model else "AI_RESEARCH_MODEL is blank"),
+        _gate("Explicit model", all_models_present, "all provider models are set" if all_models_present else model),
         _gate("Provider key present", key_present, "key_present=true" if key_present else "key_present=false"),
         _gate("Daily call budget", max_calls > 0, f"AI_RESEARCH_MAX_CALLS_PER_DAY={max_calls}"),
         _gate(
@@ -102,7 +139,7 @@ def build_ai_research_preflight_report(
         ),
         _gate(
             "Calls remaining",
-            remaining_calls is not None and remaining_calls > 0,
+            remaining_calls is not None and remaining_calls >= max(1, attempts_per_round),
             f"remaining_calls={remaining_calls}" if remaining_calls is not None else "budget count unavailable",
         ),
         _gate("Timeout bounded", 1.0 <= timeout_seconds <= 15.0, f"timeout_seconds={timeout_seconds:g}"),
@@ -113,9 +150,11 @@ def build_ai_research_preflight_report(
         provider=provider,
         model=model,
         key_present=key_present,
+        providers=provider_reports,
         max_calls=max_calls,
         used_calls=used_calls,
         remaining_calls=remaining_calls,
+        attempts_per_round=attempts_per_round,
         timeout_seconds=timeout_seconds,
         cost=cost,
         gates=gates,
@@ -126,6 +165,7 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
     state = "READY" if report.ready else "NOT_READY"
     used = "unavailable" if report.used_calls is None else str(report.used_calls)
     remaining = "unavailable" if report.remaining_calls is None else str(report.remaining_calls)
+    rounds = "unavailable" if report.remaining_rounds is None else str(report.remaining_rounds)
     model = report.model or "n/a"
     lines = [
         "AI RESEARCH PREFLIGHT",
@@ -134,6 +174,8 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
         f"Model: {model}",
         f"Key present: {str(report.key_present).lower()}",
         f"Chargeable daily calls: used {used} / max {report.max_calls}; remaining {remaining}",
+        f"Chargeable calls per round: {report.attempts_per_round}",
+        f"Full rounds remaining: {rounds}",
         f"Timeout: {report.timeout_seconds:g}s",
         (
             "Cost assumptions: "
@@ -143,9 +185,19 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
             f"output_price_per_mtok=${report.cost.output_price_per_mtok:.2f}"
         ),
         f"Estimated cost per memo: ${report.cost.estimated_cost_per_memo:.4f}",
+        f"Estimated cost per round: ${report.estimated_cost_per_round:.4f}",
         f"Estimated worst-case daily cost: ${report.estimated_daily_cost:.4f}",
         "Gates:",
     ]
+    if len(report.providers) > 1:
+        lines.append("Providers:")
+        lines.extend(
+            (
+                f"- {row.provider}: model={row.model or 'n/a'}, "
+                f"key_present={str(row.key_present).lower()}"
+            )
+            for row in report.providers
+        )
     lines.extend(f"- [{gate.status}] {gate.name}: {gate.detail}" for gate in report.gates)
     return "\n".join(lines)
 
@@ -154,8 +206,9 @@ async def run_ai_research_preflight(settings: Any | None = None) -> tuple[str, l
     settings = settings or get_settings()
     configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
     await init_db()
-    provider = str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()
-    used_calls = await count_ai_research_chargeable_attempts(provider=provider, today_utc=True)
+    providers = selected_research_providers(settings)
+    budget_provider = providers[0] if len(providers) == 1 and providers[0] != "shadow" else None
+    used_calls = await count_ai_research_chargeable_attempts(provider=budget_provider, today_utc=True)
     report = build_ai_research_preflight_report(settings=settings, used_calls=used_calls)
     return render_ai_research_preflight(report), report.gates
 

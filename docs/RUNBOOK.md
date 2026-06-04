@@ -191,7 +191,7 @@ On Oracle, run it as the service user so it can read the locked `/opt/auto-trade
 sudo -u auto-trader AUTO_TRADER_ENV_FILE=/opt/auto-trader/.env /opt/auto-trader/scripts/ai_research_preflight.sh
 ```
 
-The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit `AI_RESEARCH_MODEL`, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, calls remaining for the UTC day, and a bounded timeout. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
+The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit model, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, enough calls remaining for the UTC day, and a bounded timeout. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
 
 For Claude/Anthropic testing, set pricing assumptions explicitly in `.env` before trusting the estimate:
 
@@ -204,6 +204,18 @@ AI_RESEARCH_EST_OUTPUT_TOKENS=2000
 AI_RESEARCH_INPUT_PRICE_PER_MTOK=5.0
 AI_RESEARCH_OUTPUT_PRICE_PER_MTOK=25.0
 ```
+
+For the multi-provider advisory committee, keep single-provider mode parked and set the provider list plus provider-specific models:
+
+```bash
+AI_RESEARCH_PROVIDERS=anthropic,openai,xai
+AI_RESEARCH_ANTHROPIC_MODEL=claude-opus-4-8
+AI_RESEARCH_OPENAI_MODEL=<chosen-openai-model>
+AI_RESEARCH_XAI_MODEL=<chosen-grok-model>
+AI_RESEARCH_MAX_CALLS_PER_DAY=3
+```
+
+One committee round consumes one chargeable call per selected real provider, and preflight reports how many full rounds remain from the current daily budget. The v1 aggregate is deterministic: at least two valid provider approvals with confidence >= 0.65 and no valid reject can produce an AI advisory `approve`; any valid reject produces `reject`; everything else is `watch`. Invalid provider output, timeouts, and failures are audited but cannot force approval. RiskEngine remains the only execution and sizing authority.
 
 The default `AI_RESEARCH_MAX_CALLS_PER_DAY=0` intentionally reports `NOT_READY`, even when a key is present.
 

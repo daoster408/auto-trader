@@ -33,6 +33,7 @@ from auto_trader.ai_research_preflight import (
 )
 import auto_trader.ai_research_smoke as ai_research_smoke
 from auto_trader.ai_research_smoke import run_ai_research_smoke
+from auto_trader.ai_research_smoke import render_ai_research_smoke
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
@@ -43,10 +44,13 @@ from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.ai_committee import (
     AnthropicResearchCommittee,
     GeminiResearchCommittee,
+    MultiProviderResearchCommittee,
     OpenAIResearchCommittee,
     ResearchMemo,
     ShadowResearchCommittee,
     XAIResearchCommittee,
+    aggregate_research_memos,
+    build_research_packet,
     normalize_committee_output,
     packet_hash,
     create_research_committee,
@@ -114,7 +118,12 @@ class DummySupervisorSettings(DummySettings):
     report_timezone = "America/Los_Angeles"
     ai_research_enabled = False
     ai_research_provider = "shadow"
+    ai_research_providers = ""
     ai_research_model = ""
+    ai_research_openai_model = ""
+    ai_research_xai_model = ""
+    ai_research_anthropic_model = ""
+    ai_research_gemini_model = ""
     ai_research_timeout_seconds = 8
     ai_research_max_calls_per_day = 0
     ai_research_est_input_tokens = 15000
@@ -833,6 +842,7 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
             ("anthropic", "ai_research_committee/v0", "paid1"),
             ("anthropic", "ai_research_failure/v0", "paid2"),
             ("shadow", "ai_research_committee/v0", "free1"),
+            ("multi", "ai_research_failure/v0", "aggregate1"),
             ("openai", "ai_research_committee/v0", "paid3"),
         ]
         for provider, prompt_version, input_hash in rows:
@@ -854,6 +864,7 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
         assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 2
         assert await count_ai_research_chargeable_attempts(provider="openai", today_utc=True) == 1
         assert await count_ai_research_chargeable_attempts(provider="shadow", today_utc=True) == 0
+        assert await count_ai_research_chargeable_attempts(provider="multi", today_utc=True) == 0
         assert await count_ai_research_chargeable_attempts(today_utc=True) == 3
 
 
@@ -952,8 +963,138 @@ def test_research_committee_factory_wires_real_providers_and_requires_keys():
     assert create_research_committee(GeminiSettings()).model == "explicit-model"
     with pytest.raises(ValueError, match="requires OPENAI_API_KEY"):
         create_research_committee(MissingOpenAI())
-    with pytest.raises(ValueError, match="requires AI_RESEARCH_MODEL"):
+    with pytest.raises(ValueError, match="requires AI_RESEARCH_OPENAI_MODEL or AI_RESEARCH_MODEL"):
         create_research_committee(MissingModel())
+
+
+def test_research_committee_factory_wires_multi_provider_models():
+    class MultiSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_providers = "anthropic,openai,xai"
+        ai_research_model = ""
+        ai_research_anthropic_model = "claude-opus-4-8"
+        ai_research_openai_model = "gpt-5.5"
+        ai_research_xai_model = "grok-4.3"
+        anthropic_api_key = "anthropic-key"
+        openai_api_key = "openai-key"
+        xai_api_key = "xai-key"
+
+    committee = create_research_committee(MultiSettings())
+
+    assert isinstance(committee, MultiProviderResearchCommittee)
+    assert committee.provider_names == ["anthropic", "openai", "xai"]
+    assert [member.model for member in committee.members] == ["claude-opus-4-8", "gpt-5.5", "grok-4.3"]
+
+
+def _provider_memo(provider: str, verdict: str, *, confidence: float = 0.7, valid: bool = True) -> ResearchMemo:
+    return ResearchMemo(
+        symbol="POET",
+        provider=provider,
+        model_tag=f"{provider}/model",
+        prompt_version="ai_research_committee/v0" if valid else "ai_research_failure/v0",
+        input_hash="hash123",
+        verdict=verdict,
+        confidence=confidence if valid else None,
+        used_only_provided_data=True,
+        validation_passed=valid,
+        memo={
+            "committee": {
+                "symbol": "POET",
+                "verdict": verdict,
+                "confidence": confidence if valid else None,
+                "used_only_provided_data": True,
+                "bull_case": f"{provider} bull",
+                "bear_case": f"{provider} bear",
+                "judge_summary": f"{provider} summary",
+                "validation_errors": [] if valid else ["ai_research_provider_failed"],
+            }
+        },
+    )
+
+
+def test_multi_provider_aggregate_approves_only_two_valid_approves_no_reject():
+    packet = build_research_packet(TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7))
+    aggregate = aggregate_research_memos(
+        "POET",
+        [
+            _provider_memo("anthropic", "approve", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.68),
+            _provider_memo("xai", "watch", valid=False),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.provider == "multi"
+    assert aggregate.prompt_version == "ai_research_aggregate/v0"
+    assert aggregate.verdict == "approve"
+    assert aggregate.validation_passed is True
+    assert aggregate.memo["quorum"]["approve_count"] == 2
+
+
+def test_multi_provider_aggregate_reject_overrides_approve_quorum():
+    packet = build_research_packet(TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7))
+    aggregate = aggregate_research_memos(
+        "POET",
+        [
+            _provider_memo("anthropic", "approve", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.68),
+            _provider_memo("xai", "reject", confidence=0.7),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "reject"
+    assert aggregate.memo["quorum"]["reject_count"] == 1
+
+
+def test_multi_provider_aggregate_invalid_output_cannot_force_approve():
+    packet = build_research_packet(TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7))
+    aggregate = aggregate_research_memos(
+        "POET",
+        [
+            _provider_memo("anthropic", "approve", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.9, valid=False),
+            _provider_memo("xai", "watch", confidence=0.7),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "watch"
+    assert aggregate.memo["quorum"]["approve_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_multi_provider_research_round_runs_members_sequentially():
+    events = []
+
+    class FakeMember:
+        def __init__(self, provider: str) -> None:
+            self.provider = provider
+            self.model_tag = f"{provider}/model"
+
+        async def research(self, intent, *, signal_id=None):
+            events.append(f"start:{self.provider}")
+            events.append(f"end:{self.provider}")
+            return _provider_memo(self.provider, "watch", confidence=0.7)
+
+    committee = MultiProviderResearchCommittee(
+        [FakeMember("anthropic"), FakeMember("openai"), FakeMember("xai")]
+    )
+    intent = TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7)
+
+    await committee.research_round(intent)
+
+    assert events == [
+        "start:anthropic",
+        "end:anthropic",
+        "start:openai",
+        "end:openai",
+        "start:xai",
+        "end:xai",
+    ]
 
 
 def test_real_provider_extractors_parse_structured_json():
@@ -1275,6 +1416,41 @@ def test_ai_research_preflight_configured_anthropic_opus_estimate_no_secret():
     assert "Estimated worst-case daily cost: $0.6250" in text
 
 
+def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
+    class CommitteeSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_providers = "anthropic,openai,xai"
+        ai_research_anthropic_model = "claude-opus-4-8"
+        ai_research_openai_model = "gpt-5.5"
+        ai_research_xai_model = "grok-4.3"
+        ai_research_max_calls_per_day = 6
+        ai_research_est_input_tokens = 15000
+        ai_research_est_output_tokens = 2000
+        ai_research_input_price_per_mtok = 5.0
+        ai_research_output_price_per_mtok = 25.0
+        anthropic_api_key = "anthropic-secret"
+        openai_api_key = "openai-secret"
+        xai_api_key = "xai-secret"
+
+    report = build_ai_research_preflight_report(settings=CommitteeSettings(), used_calls=3)
+    text = render_ai_research_preflight(report)
+
+    assert report.ready is True
+    assert report.provider == "multi"
+    assert report.attempts_per_round == 3
+    assert report.remaining_calls == 3
+    assert report.remaining_rounds == 1
+    assert report.estimated_cost_per_round == pytest.approx(0.375)
+    assert "Provider: multi" in text
+    assert "Chargeable calls per round: 3" in text
+    assert "Full rounds remaining: 1" in text
+    assert "Estimated cost per round: $0.3750" in text
+    assert "- anthropic: model=claude-opus-4-8, key_present=true" in text
+    assert "anthropic-secret" not in text
+    assert "openai-secret" not in text
+    assert "xai-secret" not in text
+
+
 @pytest.mark.asyncio
 async def test_ai_research_preflight_count_failure_uses_no_provider_call(monkeypatch):
     class AnthropicSettings(DummySupervisorSettings):
@@ -1341,6 +1517,105 @@ async def test_real_provider_budget_zero_skips_and_persists_audit_row():
         assert memos[0]["prompt_version"] == "ai_research_budget/v0"
         assert memos[0]["validation_passed"] is False
         assert memos[0]["memo"]["budget"]["daily_max"] == 0
+
+
+@pytest.mark.asyncio
+async def test_multi_provider_supervisor_requires_budget_for_full_round():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_multi_budget.db")
+        await init_db()
+
+        class BudgetSettings(DummySupervisorSettings):
+            ai_research_enabled = True
+            ai_research_providers = "anthropic,openai,xai"
+            ai_research_anthropic_model = "claude-opus-4-8"
+            ai_research_openai_model = "gpt-5.5"
+            ai_research_xai_model = "grok-4.3"
+            ai_research_max_calls_per_day = 2
+            anthropic_api_key = "anthropic-key"
+            openai_api_key = "openai-key"
+            xai_api_key = "xai-key"
+
+        class ExplodingMember:
+            def __init__(self, provider: str) -> None:
+                self.provider = provider
+                self.model_tag = f"{provider}/model"
+
+            async def research(self, intent, *, signal_id=None):
+                raise AssertionError("provider should not be called without enough budget for the full round")
+
+        supervisor = TradingSupervisor(
+            settings=BudgetSettings(),
+            state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+            adapter=object(),
+            order_manager=object(),
+        )
+        supervisor.research_committee = MultiProviderResearchCommittee(
+            [ExplodingMember("anthropic"), ExplodingMember("openai"), ExplodingMember("xai")]
+        )
+        intent = TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7)
+
+        await supervisor._run_ai_research(intent, signal_id=12)
+        memos = await get_latest_ai_research_memos(limit=5)
+
+        assert len(memos) == 1
+        assert memos[0]["provider"] == "multi"
+        assert memos[0]["prompt_version"] == "ai_research_budget/v0"
+        assert memos[0]["memo"]["budget"]["attempts_needed"] == 3
+
+
+@pytest.mark.asyncio
+async def test_multi_provider_supervisor_logs_members_and_aggregate():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_multi_supervisor.db")
+        await init_db()
+
+        class BudgetSettings(DummySupervisorSettings):
+            ai_research_enabled = True
+            ai_research_providers = "anthropic,openai,xai"
+            ai_research_anthropic_model = "claude-opus-4-8"
+            ai_research_openai_model = "gpt-5.5"
+            ai_research_xai_model = "grok-4.3"
+            ai_research_max_calls_per_day = 3
+            anthropic_api_key = "anthropic-key"
+            openai_api_key = "openai-key"
+            xai_api_key = "xai-key"
+
+        class FakeMember:
+            def __init__(self, provider: str, verdict: str) -> None:
+                self.provider = provider
+                self.model_tag = f"{provider}/model"
+                self.verdict = verdict
+
+            async def research(self, intent, *, signal_id=None):
+                return _provider_memo(self.provider, self.verdict, confidence=0.7)
+
+        supervisor = TradingSupervisor(
+            settings=BudgetSettings(),
+            state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+            adapter=object(),
+            order_manager=object(),
+        )
+        supervisor.research_committee = MultiProviderResearchCommittee(
+            [
+                FakeMember("anthropic", "approve"),
+                FakeMember("openai", "approve"),
+                FakeMember("xai", "watch"),
+            ]
+        )
+        intent = TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7)
+
+        await supervisor._run_ai_research(intent, signal_id=12)
+        memos = await get_latest_ai_research_memos(limit=10)
+
+        assert len(memos) == 4
+        assert {memo["provider"] for memo in memos} == {"anthropic", "openai", "xai", "multi"}
+        aggregate = next(memo for memo in memos if memo["provider"] == "multi")
+        assert aggregate["prompt_version"] == "ai_research_aggregate/v0"
+        assert aggregate["verdict"] == "approve"
+        assert len(aggregate["memo"]["provider_memo_ids"]) == 3
+        assert {row["provider"] for row in aggregate["memo"]["provider_memo_ids"]} == {"anthropic", "openai", "xai"}
+        assert await count_ai_research_chargeable_attempts(today_utc=True) == 3
 
 
 @pytest.mark.asyncio
@@ -1506,6 +1781,59 @@ async def test_ai_research_smoke_persists_one_chargeable_memo(monkeypatch):
         assert len(memos) == 1
         assert memos[0]["prompt_version"] == "ai_research_committee/v0"
         assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_research_smoke_multi_provider_persists_members_and_aggregate(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "ai_smoke_multi.db")
+
+        class SmokeSettings(DummySupervisorSettings):
+            db_path = str(Path(tmp) / "ai_smoke_multi.db")
+            ai_research_providers = "anthropic,openai,xai"
+            ai_research_anthropic_model = "claude-opus-4-8"
+            ai_research_openai_model = "gpt-5.5"
+            ai_research_xai_model = "grok-4.3"
+            ai_research_max_calls_per_day = 3
+            anthropic_api_key = "anthropic-key"
+            openai_api_key = "openai-key"
+            xai_api_key = "xai-key"
+
+        class FakeMember:
+            def __init__(self, provider: str, verdict: str) -> None:
+                self.provider = provider
+                self.model_tag = f"{provider}/model"
+                self.verdict = verdict
+
+            async def research(self, intent, *, signal_id=None):
+                return _provider_memo(self.provider, self.verdict, confidence=0.7)
+
+        committee = MultiProviderResearchCommittee(
+            [
+                FakeMember("anthropic", "approve"),
+                FakeMember("openai", "approve"),
+                FakeMember("xai", "watch"),
+            ]
+        )
+        monkeypatch.setattr("auto_trader.ai_research_smoke.create_research_committee", lambda settings: committee)
+
+        result = await run_ai_research_smoke(settings=SmokeSettings(), symbol="POET", price=10.0)
+        text = render_ai_research_smoke(result)
+        memos = await get_latest_ai_research_memos(limit=10)
+
+        assert result.ok is True
+        assert result.provider == "multi"
+        assert result.verdict == "approve"
+        assert result.attempts_needed == 3
+        assert result.used_before == 0
+        assert result.used_after == 3
+        assert len(result.provider_results) == 3
+        assert "Estimated cost per round: $0.3750" in text
+        assert {memo["provider"] for memo in memos} == {"anthropic", "openai", "xai", "multi"}
+        aggregate = next(memo for memo in memos if memo["provider"] == "multi")
+        assert len(aggregate["memo"]["provider_memo_ids"]) == 3
+        assert await count_ai_research_chargeable_attempts(today_utc=True) == 3
+        assert await count_ai_research_chargeable_attempts(provider="multi", today_utc=True) == 0
 
 
 @pytest.mark.asyncio

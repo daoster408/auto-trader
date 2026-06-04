@@ -9,7 +9,12 @@ from typing import Any
 from auto_trader.ai_research_preflight import _cost_assumptions_from_settings
 from auto_trader.config.settings import get_settings
 from auto_trader.core.models import TradeIntent
-from auto_trader.intelligence.ai_committee import create_research_committee
+from auto_trader.intelligence.ai_committee import (
+    create_research_committee,
+    real_research_providers,
+    research_committee_round,
+    selected_research_providers,
+)
 from auto_trader.persistence.db import (
     configure_db_path,
     count_ai_research_chargeable_attempts,
@@ -36,14 +41,20 @@ class AIResearchSmokeResult:
     used_after: int | None
     max_calls: int
     estimated_cost: float
+    attempts_needed: int
     reason: str
     normalization_markers: list[str]
+    provider_results: list[dict[str, Any]]
 
     @property
     def remaining_after(self) -> int | None:
         if self.used_after is None:
             return None
         return max(0, self.max_calls - self.used_after)
+
+    @property
+    def estimated_cost_per_round(self) -> float:
+        return self.estimated_cost * max(1, self.attempts_needed)
 
 
 def render_ai_research_smoke(result: AIResearchSmokeResult) -> str:
@@ -52,25 +63,36 @@ def render_ai_research_smoke(result: AIResearchSmokeResult) -> str:
     used_after = "unavailable" if result.used_after is None else str(result.used_after)
     remaining_after = "unavailable" if result.remaining_after is None else str(result.remaining_after)
     markers = ", ".join(result.normalization_markers) if result.normalization_markers else "none"
-    return "\n".join(
-        [
-            "AI RESEARCH SMOKE",
-            f"State: {state}",
-            f"Reason: {result.reason}",
-            f"Provider: {result.provider}",
-            f"Model: {result.model or 'n/a'}",
-            f"Symbol: {result.symbol}",
-            f"Prompt version: {result.prompt_version or 'n/a'}",
-            f"Validation passed: {result.validation_passed}",
-            f"Verdict: {result.verdict or 'n/a'}",
-            f"Confidence: {result.confidence}",
-            f"Input hash: {result.input_hash_prefix or 'n/a'}",
-            f"Memo id: {result.memo_id}",
-            f"Chargeable calls: before {used_before} / max {result.max_calls}; after {used_after}; remaining {remaining_after}",
-            f"Estimated cost for this call: ${result.estimated_cost:.4f}",
-            f"Normalization markers: {markers}",
-        ]
-    )
+    lines = [
+        "AI RESEARCH SMOKE",
+        f"State: {state}",
+        f"Reason: {result.reason}",
+        f"Provider: {result.provider}",
+        f"Model: {result.model or 'n/a'}",
+        f"Symbol: {result.symbol}",
+        f"Prompt version: {result.prompt_version or 'n/a'}",
+        f"Validation passed: {result.validation_passed}",
+        f"Verdict: {result.verdict or 'n/a'}",
+        f"Confidence: {result.confidence}",
+        f"Input hash: {result.input_hash_prefix or 'n/a'}",
+        f"Memo id: {result.memo_id}",
+        f"Chargeable calls: before {used_before} / max {result.max_calls}; after {used_after}; remaining {remaining_after}",
+        f"Chargeable calls needed: {result.attempts_needed}",
+        f"Estimated cost per provider call: ${result.estimated_cost:.4f}",
+        f"Estimated cost per round: ${result.estimated_cost_per_round:.4f}",
+        f"Normalization markers: {markers}",
+    ]
+    if result.provider_results:
+        lines.append("Provider results:")
+        lines.extend(
+            (
+                f"- {row.get('provider')}: validation={row.get('validation_passed')}, "
+                f"verdict={row.get('verdict')}, confidence={row.get('confidence')}, "
+                f"memo_id={row.get('memo_id')}"
+            )
+            for row in result.provider_results
+        )
+    return "\n".join(lines)
 
 
 async def run_ai_research_smoke(
@@ -85,21 +107,32 @@ async def run_ai_research_smoke(
     configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
     await init_db()
 
-    provider = str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()
+    configured_providers = selected_research_providers(settings)
+    provider = configured_providers[0] if len(configured_providers) == 1 else "multi"
     model = str(getattr(settings, "ai_research_model", "") or "").strip()
     max_calls = int(getattr(settings, "ai_research_max_calls_per_day", 0) or 0)
     cost = _cost_assumptions_from_settings(settings).estimated_cost_per_memo
     symbol = symbol.upper()
 
-    if provider == "shadow":
-        return _not_run(provider, model, symbol, max_calls, cost, "real provider is required")
+    if configured_providers == ["shadow"]:
+        return _not_run(provider, model, symbol, max_calls, cost, 0, "real provider is required")
     if max_calls <= 0:
-        return _not_run(provider, model, symbol, max_calls, cost, "AI_RESEARCH_MAX_CALLS_PER_DAY must be positive")
+        return _not_run(
+            provider,
+            model,
+            symbol,
+            max_calls,
+            cost,
+            len(configured_providers),
+            "AI_RESEARCH_MAX_CALLS_PER_DAY must be positive",
+        )
 
-    used_before = await count_ai_research_chargeable_attempts(provider=provider, today_utc=True)
+    attempts_needed = len(configured_providers)
+    budget_provider = configured_providers[0] if attempts_needed == 1 else None
+    used_before = await count_ai_research_chargeable_attempts(provider=budget_provider, today_utc=True)
     if used_before is None:
-        return _not_run(provider, model, symbol, max_calls, cost, "chargeable budget count unavailable")
-    if used_before >= max_calls:
+        return _not_run(provider, model, symbol, max_calls, cost, attempts_needed, "chargeable budget count unavailable")
+    if max(0, max_calls - used_before) < attempts_needed:
         return AIResearchSmokeResult(
             ok=False,
             called_provider=False,
@@ -116,11 +149,18 @@ async def run_ai_research_smoke(
             used_after=used_before,
             max_calls=max_calls,
             estimated_cost=cost,
+            attempts_needed=attempts_needed,
             reason="chargeable budget exhausted",
             normalization_markers=[],
+            provider_results=[],
         )
 
-    committee = create_research_committee(settings)
+    try:
+        committee = create_research_committee(settings)
+    except Exception as exc:
+        return _not_run(provider, model, symbol, max_calls, cost, attempts_needed, f"committee unavailable: {exc}")
+    real_providers = real_research_providers(committee)
+    attempts_needed = len(real_providers)
     intent = TradeIntent(
         symbol=symbol,
         side="long",
@@ -137,21 +177,52 @@ async def run_ai_research_smoke(
     )
 
     try:
-        memo = await committee.research(intent, signal_id=None)
-        memo_id = await log_ai_research_memo(
-            signal_id=None,
-            symbol=memo.symbol,
-            provider=memo.provider,
-            model_tag=memo.model_tag,
-            prompt_version=memo.prompt_version,
-            input_hash=memo.input_hash,
-            verdict=memo.verdict,
-            confidence=memo.confidence,
-            used_only_provided_data=memo.used_only_provided_data,
-            validation_passed=memo.validation_passed,
-            memo=memo.memo,
-        )
-        used_after = await count_ai_research_chargeable_attempts(provider=provider, today_utc=True)
+        research_round = await research_committee_round(committee, intent, signal_id=None)
+        memo_ids: dict[tuple[str, str], int] = {}
+        provider_memo_ids = []
+        for memo in research_round.member_memos:
+            memo_id = await log_ai_research_memo(
+                signal_id=None,
+                symbol=memo.symbol,
+                provider=memo.provider,
+                model_tag=memo.model_tag,
+                prompt_version=memo.prompt_version,
+                input_hash=memo.input_hash,
+                verdict=memo.verdict,
+                confidence=memo.confidence,
+                used_only_provided_data=memo.used_only_provided_data,
+                validation_passed=memo.validation_passed,
+                memo=memo.memo,
+            )
+            memo_ids[(memo.provider, memo.prompt_version)] = memo_id
+            provider_memo_ids.append(
+                {
+                    "provider": memo.provider,
+                    "prompt_version": memo.prompt_version,
+                    "input_hash": memo.input_hash,
+                    "memo_id": memo_id,
+                }
+            )
+        memo = research_round.aggregate_memo
+        if memo not in research_round.member_memos:
+            memo.memo["provider_memo_ids"] = provider_memo_ids
+            memo_id = await log_ai_research_memo(
+                signal_id=None,
+                symbol=memo.symbol,
+                provider=memo.provider,
+                model_tag=memo.model_tag,
+                prompt_version=memo.prompt_version,
+                input_hash=memo.input_hash,
+                verdict=memo.verdict,
+                confidence=memo.confidence,
+                used_only_provided_data=memo.used_only_provided_data,
+                validation_passed=memo.validation_passed,
+                memo=memo.memo,
+            )
+            memo_ids[(memo.provider, memo.prompt_version)] = memo_id
+        else:
+            memo_id = memo_ids[(memo.provider, memo.prompt_version)]
+        used_after = await count_ai_research_chargeable_attempts(provider=budget_provider, today_utc=True)
         normalization = memo.memo.get("normalization") if isinstance(memo.memo, dict) else {}
         markers = normalization.get("markers", []) if isinstance(normalization, dict) else []
         return AIResearchSmokeResult(
@@ -167,11 +238,22 @@ async def run_ai_research_smoke(
             input_hash_prefix=memo.input_hash[:12],
             memo_id=memo_id,
             used_before=used_before,
-            used_after=used_after if used_after is not None else used_before + 1,
+            used_after=used_after if used_after is not None else used_before + attempts_needed,
             max_calls=max_calls,
             estimated_cost=cost,
+            attempts_needed=attempts_needed,
             reason="provider memo completed",
             normalization_markers=[str(marker) for marker in markers],
+            provider_results=[
+                {
+                    "provider": member.provider,
+                    "validation_passed": member.validation_passed,
+                    "verdict": member.verdict,
+                    "confidence": member.confidence,
+                    "memo_id": memo_ids.get((member.provider, member.prompt_version)),
+                }
+                for member in research_round.member_memos
+            ],
         )
     except Exception as exc:
         failure_hash = "unavailable"
@@ -215,8 +297,10 @@ async def run_ai_research_smoke(
             used_after=used_after if used_after is not None else used_before + 1,
             max_calls=max_calls,
             estimated_cost=cost,
+            attempts_needed=1,
             reason=f"provider failed: {exc}",
             normalization_markers=[],
+            provider_results=[],
         )
 
 
@@ -226,6 +310,7 @@ def _not_run(
     symbol: str,
     max_calls: int,
     estimated_cost: float,
+    attempts_needed: int,
     reason: str,
 ) -> AIResearchSmokeResult:
     return AIResearchSmokeResult(
@@ -244,8 +329,10 @@ def _not_run(
         used_after=None,
         max_calls=max_calls,
         estimated_cost=estimated_cost,
+        attempts_needed=attempts_needed,
         reason=reason,
         normalization_markers=[],
+        provider_results=[],
     )
 
 

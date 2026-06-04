@@ -56,7 +56,12 @@ class Settings(BaseSettings):
         "shadow",
         alias="AI_RESEARCH_PROVIDER",
     )
+    ai_research_providers: str = Field("", alias="AI_RESEARCH_PROVIDERS")
     ai_research_model: str = Field("", alias="AI_RESEARCH_MODEL")
+    ai_research_openai_model: str = Field("", alias="AI_RESEARCH_OPENAI_MODEL")
+    ai_research_xai_model: str = Field("", alias="AI_RESEARCH_XAI_MODEL")
+    ai_research_anthropic_model: str = Field("", alias="AI_RESEARCH_ANTHROPIC_MODEL")
+    ai_research_gemini_model: str = Field("", alias="AI_RESEARCH_GEMINI_MODEL")
     ai_research_timeout_seconds: float = Field(8.0, ge=1.0, le=15.0, alias="AI_RESEARCH_TIMEOUT_SECONDS")
     ai_research_max_calls_per_day: int = Field(0, ge=0, alias="AI_RESEARCH_MAX_CALLS_PER_DAY")
     ai_research_est_input_tokens: int = Field(15000, ge=0, alias="AI_RESEARCH_EST_INPUT_TOKENS")
