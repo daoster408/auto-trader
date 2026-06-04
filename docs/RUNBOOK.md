@@ -212,6 +212,14 @@ On Oracle, run it as the service user so it can read the locked `/opt/auto-trade
 sudo -u auto-trader AUTO_TRADER_ENV_FILE=/opt/auto-trader/.env /opt/auto-trader/scripts/ai_research_preflight.sh
 ```
 
+From the laptop, use the Oracle readiness wrapper before market open:
+
+```bash
+ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_ai_ready.sh
+```
+
+This checks SSH, the Oracle service state, whether Finnhub/FRED key slots are set, and the read-only AI research preflight. It does not call paid AI providers.
+
 The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit model, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, enough calls remaining for the UTC day, and a bounded timeout. It also prints the effective `AI entry gate enabled` state after runtime config is applied. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
 
 After preflight is `READY`, run a no-order rehearsal against the real current candidate packet:
