@@ -1480,9 +1480,27 @@ def test_ai_research_preflight_configured_anthropic_opus_estimate_no_secret():
     assert report.estimated_daily_cost == pytest.approx(0.625)
     assert "State: READY" in text
     assert "Key present: true" in text
+    assert "AI entry gate enabled: false" in text
     assert "super-secret" not in text
     assert "Estimated cost per memo: $0.1250" in text
     assert "Estimated worst-case daily cost: $0.6250" in text
+
+
+def test_ai_research_preflight_renders_ai_entry_gate_enabled():
+    class AnthropicSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_model = "claude-opus-4-8"
+        ai_research_max_calls_per_day = 5
+        anthropic_api_key = "anthropic-key"
+
+    report = build_ai_research_preflight_report(settings=AnthropicSettings(), used_calls=0)
+    text = render_ai_research_preflight(report)
+
+    assert report.ready is True
+    assert report.ai_entry_gate_enabled is True
+    assert "AI entry gate enabled: true" in text
 
 
 def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
@@ -3030,6 +3048,7 @@ def test_telegram_status_surfaces_runtime_auto_entry_disabled():
     )
 
     assert "Runtime auto-entry: False" in status
+    assert "Runtime AI entry gate: False" in status
     assert "New entries: disabled by runtime config" in status
 
 
@@ -3121,6 +3140,42 @@ async def test_telegram_config_handler_sets_auto_entry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_telegram_config_handler_sets_ai_entry_gate(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+    journal = []
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    async def fake_journal(**kwargs):
+        journal.append(kwargs["content"])
+        return 1
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["ai_gate", "on"]))
+
+    assert stored == {"ai_entry_gate_enabled": "true"}
+    assert update.message.replies == [
+        "Runtime AI entry gate set to True. Gate is fail-closed; only valid real-provider approve can continue to RiskEngine."
+    ]
+    assert journal == ["Runtime config updated: ai_entry_gate_enabled=True."]
+
+
+@pytest.mark.asyncio
 async def test_telegram_config_handler_sets_max_entries(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     stored = {}
@@ -3162,7 +3217,7 @@ async def test_telegram_config_handler_shows_runtime_config(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
 
     async def fake_values():
-        return {"auto_entry_enabled": "true", "max_new_positions_per_day": "3"}
+        return {"auto_entry_enabled": "true", "ai_entry_gate_enabled": "true", "max_new_positions_per_day": "3"}
 
     async def fake_bool(key, *, default):
         return True
@@ -3191,6 +3246,7 @@ async def test_telegram_config_handler_shows_runtime_config(monkeypatch):
 
     assert "RUNTIME CONFIG" in update.message.replies[0]
     assert "auto_entry_enabled: True (runtime)" in update.message.replies[0]
+    assert "ai_entry_gate_enabled: True (runtime)" in update.message.replies[0]
     assert "max_new_positions_per_day: 3 (runtime)" in update.message.replies[0]
 
 
@@ -5254,6 +5310,87 @@ async def test_ai_entry_gate_reject_blocks_before_order_manager(monkeypatch):
     assert result["blocked"] is True
     assert result["ai_gate"]["verdict"] == "reject"
     assert manager.calls == []
+    assert "AI entry gate blocked POET" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_runtime_config_enables_gate(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = False
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 1
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            raise AssertionError("OrderManager should not be called when runtime AI gate rejects")
+
+    class RejectingCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+        async def research(self, intent, *, signal_id=None):
+            return _provider_memo("openai", "reject", confidence=0.8)
+
+    journal_entries = []
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+        return [TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.8)]
+
+    async def fake_bool(key, *, default):
+        if key == "auto_entry_enabled":
+            return True
+        if key == "ai_entry_gate_enabled":
+            return True
+        return default
+
+    async def fake_count(**kwargs):
+        return 0
+
+    async def fake_log_signal(**kwargs):
+        return 52
+
+    async def fake_log_ai(**kwargs):
+        return 61
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_ai_research_memo", fake_log_ai)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    supervisor.research_committee = RejectingCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["blocked"] is True
+    assert result["ai_gate"]["verdict"] == "reject"
     assert "AI entry gate blocked POET" in journal_entries[0]
 
 

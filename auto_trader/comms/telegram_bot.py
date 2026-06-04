@@ -354,6 +354,12 @@ class TelegramBot:
         auto_entry_enabled = str(
             runtime_config.get("auto_entry_enabled", str(getattr(self.risk.settings, "auto_entry_enabled", False)))
         ).lower() in {"1", "true", "yes", "on", "enabled"}
+        ai_entry_gate_enabled = str(
+            runtime_config.get(
+                "ai_entry_gate_enabled",
+                str(getattr(self.risk.settings, "ai_entry_gate_enabled", False)),
+            )
+        ).lower() in {"1", "true", "yes", "on", "enabled"}
         equity = float(account.get("equity") or health.get("equity") or 0.0)
         snap = self.sm.get_snapshot(
             equity=equity,
@@ -377,6 +383,7 @@ class TelegramBot:
             f"State: {snap.state.value}",
             f"State allows trading: {self.sm.can_trade()}",
             f"Runtime auto-entry: {auto_entry_enabled}",
+            f"Runtime AI entry gate: {ai_entry_gate_enabled}",
             f"New entries: {_entry_status(self.sm.can_trade(), auto_entry_enabled, positions, max_positions, today_new_entries, errors, account_tradable)}",
             f"Today new entries: {today_new_entries if today_new_entries is not None else 'unknown'} / {max_positions}",
             f"Alpaca: {account.get('status') or health.get('status')}",
@@ -413,13 +420,20 @@ class TelegramBot:
         )
         auto_entry_source = "runtime" if "auto_entry_enabled" in values else "env default"
         max_positions_source = "runtime" if "max_new_positions_per_day" in values else "env default"
+        ai_entry_gate = await get_runtime_config_bool(
+            "ai_entry_gate_enabled",
+            default=bool(getattr(self.risk.settings, "ai_entry_gate_enabled", False)),
+        )
+        ai_entry_gate_source = "runtime" if "ai_entry_gate_enabled" in values else "env default"
         return "\n".join(
             [
                 "RUNTIME CONFIG",
                 f"auto_entry_enabled: {auto_entry} ({auto_entry_source})",
+                f"ai_entry_gate_enabled: {ai_entry_gate} ({ai_entry_gate_source})",
                 f"auto_exit_enabled: {bool(getattr(self.risk.settings, 'auto_exit_enabled', False))} (env)",
                 f"max_new_positions_per_day: {max_new_positions} ({max_positions_source})",
                 "Use: /config auto_entry on | /config auto_entry off",
+                "     /config ai_gate on | /config ai_gate off",
                 f"     /config max_entries 1-{self._max_runtime_entries_allowed()}",
             ]
         )
@@ -563,6 +577,7 @@ class TelegramBot:
         if len(args) != 2:
             await update.message.reply_text(
                 "Use: /config auto_entry on | /config auto_entry off; "
+                "/config ai_gate on | /config ai_gate off; "
                 f"/config max_entries 1-{self._max_runtime_entries_allowed()}"
             )
             return
@@ -582,6 +597,24 @@ class TelegramBot:
             await update.message.reply_text(f"Runtime auto-entry set to {enabled}.{state_note}")
             log.warning(
                 "runtime_auto_entry_updated",
+                enabled=enabled,
+                user=update.effective_user.username if update.effective_user else "unknown",
+            )
+            return
+        if key in {"ai_gate", "ai_entry_gate", "ai_entry_gate_enabled", "entry_gate"}:
+            if raw_value not in {"on", "off", "true", "false", "1", "0", "enabled", "disabled"}:
+                await update.message.reply_text("Use: /config ai_gate on | /config ai_gate off")
+                return
+            enabled = raw_value in {"on", "true", "1", "enabled"}
+            persisted = await set_runtime_config_value("ai_entry_gate_enabled", "true" if enabled else "false")
+            if not persisted:
+                await update.message.reply_text("Runtime config update failed. AI entry gate unchanged.")
+                return
+            await append_journal_entry(content=f"Runtime config updated: ai_entry_gate_enabled={enabled}.")
+            note = " Gate is fail-closed; only valid real-provider approve can continue to RiskEngine." if enabled else ""
+            await update.message.reply_text(f"Runtime AI entry gate set to {enabled}.{note}")
+            log.warning(
+                "runtime_ai_entry_gate_updated",
                 enabled=enabled,
                 user=update.effective_user.username if update.effective_user else "unknown",
             )
@@ -610,6 +643,7 @@ class TelegramBot:
             return
         await update.message.reply_text(
             "Use: /config auto_entry on | /config auto_entry off; "
+            "/config ai_gate on | /config ai_gate off; "
             f"/config max_entries 1-{self._max_runtime_entries_allowed()}"
         )
 

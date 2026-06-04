@@ -588,7 +588,10 @@ class TradingSupervisor:
             features=intent.features,
         )
         ai_research_enabled = bool(getattr(self.settings, "ai_research_enabled", True))
-        ai_gate_enabled = bool(getattr(self.settings, "ai_entry_gate_enabled", False))
+        ai_gate_enabled = await get_runtime_config_bool(
+            "ai_entry_gate_enabled",
+            default=bool(getattr(self.settings, "ai_entry_gate_enabled", False)),
+        )
         ai_result: AIResearchRunResult | None = None
         if ai_research_enabled:
             ai_result = await self._run_ai_research(intent, signal_id=signal_id)

@@ -9,7 +9,12 @@ from typing import Any
 from auto_trader.account_risk_validate import ValidationGate, validation_exit_code
 from auto_trader.config.settings import get_settings
 from auto_trader.intelligence.ai_committee import model_for_provider, selected_research_providers
-from auto_trader.persistence.db import configure_db_path, count_ai_research_chargeable_attempts, init_db
+from auto_trader.persistence.db import (
+    configure_db_path,
+    count_ai_research_chargeable_attempts,
+    get_runtime_config_bool,
+    init_db,
+)
 from auto_trader.utils.logging import setup_logging
 
 
@@ -49,6 +54,7 @@ class AIResearchPreflightReport:
     provider: str
     model: str
     key_present: bool
+    ai_entry_gate_enabled: bool
     providers: list[ProviderReadiness]
     max_calls: int
     used_calls: int | None
@@ -98,11 +104,17 @@ def build_ai_research_preflight_report(
     settings: Any,
     used_calls: int | None,
     cost: CostAssumptions | None = None,
+    ai_entry_gate_enabled: bool | None = None,
 ) -> AIResearchPreflightReport:
     """Build a zero-network readiness report for paid AI research."""
     providers = selected_research_providers(settings)
     provider = providers[0] if len(providers) == 1 else "multi"
     enabled = bool(getattr(settings, "ai_research_enabled", True))
+    effective_ai_entry_gate_enabled = (
+        bool(getattr(settings, "ai_entry_gate_enabled", False))
+        if ai_entry_gate_enabled is None
+        else bool(ai_entry_gate_enabled)
+    )
     provider_reports = [
         ProviderReadiness(
             provider=name,
@@ -150,6 +162,7 @@ def build_ai_research_preflight_report(
         provider=provider,
         model=model,
         key_present=key_present,
+        ai_entry_gate_enabled=effective_ai_entry_gate_enabled,
         providers=provider_reports,
         max_calls=max_calls,
         used_calls=used_calls,
@@ -173,6 +186,7 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
         f"Provider: {report.provider}",
         f"Model: {model}",
         f"Key present: {str(report.key_present).lower()}",
+        f"AI entry gate enabled: {str(report.ai_entry_gate_enabled).lower()}",
         f"Chargeable daily calls: used {used} / max {report.max_calls}; remaining {remaining}",
         f"Chargeable calls per round: {report.attempts_per_round}",
         f"Full rounds remaining: {rounds}",
@@ -209,7 +223,15 @@ async def run_ai_research_preflight(settings: Any | None = None) -> tuple[str, l
     providers = selected_research_providers(settings)
     budget_provider = providers[0] if len(providers) == 1 and providers[0] != "shadow" else None
     used_calls = await count_ai_research_chargeable_attempts(provider=budget_provider, today_utc=True)
-    report = build_ai_research_preflight_report(settings=settings, used_calls=used_calls)
+    ai_entry_gate_enabled = await get_runtime_config_bool(
+        "ai_entry_gate_enabled",
+        default=bool(getattr(settings, "ai_entry_gate_enabled", False)),
+    )
+    report = build_ai_research_preflight_report(
+        settings=settings,
+        used_calls=used_calls,
+        ai_entry_gate_enabled=ai_entry_gate_enabled,
+    )
     return render_ai_research_preflight(report), report.gates
 
 

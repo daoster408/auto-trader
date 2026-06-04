@@ -191,6 +191,15 @@ AI research is advisory only. It may write research memos for candidates, but it
 
 `AI_ENTRY_GATE_ENABLED=false` is the safe default. When enabled, real-provider AI research becomes a fail-closed entry filter before `RiskEngine`: only a valid `approve` can continue to RiskEngine and OrderManager. `watch`, `reject`, invalid output, budget exhaustion, provider failure, disabled AI research, or shadow-only research blocks the entry and records an audit journal note. AI still cannot size orders, submit orders, override RiskEngine, bypass `/kill`, bypass `HALTED`, bypass broker/account blocks, or override account loss/drawdown halts.
 
+The gate can also be toggled at runtime from Telegram without a deploy:
+
+```text
+/config ai_gate on
+/config ai_gate off
+```
+
+Use `/config` to confirm whether `ai_entry_gate_enabled` is coming from runtime config or the env default. Runtime `ai_gate on` only changes the pre-RiskEngine filter; it does not enable paid AI by itself, change models, change budget, submit orders, or bypass any halt.
+
 Run the read-only activation preflight before enabling any paid provider:
 
 ```bash
@@ -203,7 +212,7 @@ On Oracle, run it as the service user so it can read the locked `/opt/auto-trade
 sudo -u auto-trader AUTO_TRADER_ENV_FILE=/opt/auto-trader/.env /opt/auto-trader/scripts/ai_research_preflight.sh
 ```
 
-The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit model, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, enough calls remaining for the UTC day, and a bounded timeout. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
+The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit model, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, enough calls remaining for the UTC day, and a bounded timeout. It also prints the effective `AI entry gate enabled` state after runtime config is applied. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
 
 For Claude/Anthropic testing, set pricing assumptions explicitly in `.env` before trusting the estimate:
 
