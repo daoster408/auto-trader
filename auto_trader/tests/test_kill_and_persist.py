@@ -76,6 +76,7 @@ from auto_trader.persistence.db import (
     count_entry_orders_since,
     get_latest_journal_entries,
     get_latest_ai_research_memos,
+    get_latest_entry_order_for_symbol,
     get_latest_order_records,
     get_pending_exits,
     get_pending_exit_for_symbol,
@@ -2905,6 +2906,54 @@ async def test_entry_order_count_uses_persisted_orders():
 
 
 @pytest.mark.asyncio
+async def test_latest_entry_order_for_symbol_can_ignore_later_reentry():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "orders.db")
+        await init_db()
+
+        await upsert_order_record(
+            {
+                "id": "entry-before-close",
+                "symbol": "AMPX",
+                "side": "buy",
+                "qty": 0.832986,
+                "order_type": "market",
+                "status": "filled",
+                "filled_qty": 0.832986,
+                "avg_fill_price": 24.13,
+                "submitted_at": "2026-06-02T21:02:25+00:00",
+                "filled_at": "2026-06-02T21:02:26+00:00",
+            }
+        )
+        await upsert_order_record(
+            {
+                "id": "entry-after-close",
+                "symbol": "AMPX",
+                "side": "buy",
+                "qty": 1,
+                "order_type": "market",
+                "status": "filled",
+                "filled_qty": 1,
+                "avg_fill_price": 10.00,
+                "submitted_at": "2026-06-03T14:50:00+00:00",
+                "filled_at": "2026-06-03T14:50:01+00:00",
+            }
+        )
+
+        latest_before_close = await get_latest_entry_order_for_symbol(
+            "AMPX",
+            before_utc_iso="2026-06-03T14:37:19+00:00",
+        )
+        latest_unbounded = await get_latest_entry_order_for_symbol("AMPX")
+
+        assert latest_before_close is not None
+        assert latest_before_close["broker_order_id"] == "entry-before-close"
+        assert latest_before_close["avg_fill_price"] == 24.13
+        assert latest_unbounded is not None
+        assert latest_unbounded["broker_order_id"] == "entry-after-close"
+
+
+@pytest.mark.asyncio
 async def test_entry_order_count_failure_raises():
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "directory-not-db"
@@ -5148,7 +5197,12 @@ async def test_supervisor_clears_filled_pending_exit_from_reconciliation(monkeyp
     notifications = []
     journal_entries = []
     pending_symbols = {"AMPX"}
-    pending = {"symbol": "AMPX", "broker_order_id": "filled-close", "client_order_id": "filled-close"}
+    pending = {
+        "symbol": "AMPX",
+        "broker_order_id": "filled-close",
+        "client_order_id": "filled-close",
+        "reason": "position max loss reached",
+    }
 
     class FakeAdapter:
         paper = True
@@ -5176,6 +5230,10 @@ async def test_supervisor_clears_filled_pending_exit_from_reconciliation(monkeyp
                     "side": "sell",
                     "qty": 0.832986,
                     "status": "filled",
+                    "filled_qty": 0.832986,
+                    "avg_fill_price": 22.70,
+                    "submitted_at": "2026-06-03T14:37:19+00:00",
+                    "filled_at": "2026-06-03T14:40:23+00:00",
                 }
             ]
 
@@ -5198,6 +5256,18 @@ async def test_supervisor_clears_filled_pending_exit_from_reconciliation(monkeyp
         pending_symbols.discard(symbol)
         return True
 
+    async def fake_latest_entry(symbol, *, before_utc_iso=None):
+        assert before_utc_iso == "2026-06-03T14:37:19+00:00"
+        return {
+            "symbol": symbol,
+            "side": "long",
+            "qty": 0.832986,
+            "status": "filled",
+            "avg_fill_price": 24.13,
+            "submitted_at": "2026-06-02T21:02:25+00:00",
+            "filled_at": "2026-06-02T21:02:26+00:00",
+        }
+
     async def fake_journal_entry(**kwargs):
         journal_entries.append(kwargs["content"])
         return len(journal_entries)
@@ -5209,6 +5279,7 @@ async def test_supervisor_clears_filled_pending_exit_from_reconciliation(monkeyp
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_symbols", fake_pending_symbols)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal_entry)
 
@@ -5227,8 +5298,118 @@ async def test_supervisor_clears_filled_pending_exit_from_reconciliation(monkeyp
     assert result.exit_decisions == []
     assert pending_symbols == set()
     assert supervisor._pending_exit_symbols == set()
-    assert any("EXIT COMPLETED: close order for AMPX is filled" in message for message in notifications)
+    exit_alert = next(message for message in notifications if "PAPER EXIT FILLED: AMPX" in message)
+    assert "Reason: position max loss reached" in exit_alert
+    assert "Entry: $24.13" in exit_alert
+    assert "Exit: $22.70" in exit_alert
+    assert "P/L: -$1.19 (-5.93%)" in exit_alert
+    assert "Held: 17h 37m" in exit_alert
+    assert "Order ID: filled-c" in exit_alert
     assert any("Auto-exit completed for AMPX" in entry for entry in journal_entries)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_filled_exit_alert_does_not_invent_missing_held_time(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    notifications = []
+    pending_symbols = {"AMPX"}
+    pending = {
+        "symbol": "AMPX",
+        "broker_order_id": "filled-close",
+        "client_order_id": "filled-close",
+        "reason": "position max loss reached",
+    }
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return [
+                {
+                    "id": "filled-close",
+                    "client_order_id": "filled-close",
+                    "broker_order_id": "filled-close",
+                    "symbol": "AMPX",
+                    "side": "sell",
+                    "qty": 0.832986,
+                    "status": "filled",
+                    "filled_qty": 0.832986,
+                    "avg_fill_price": 22.70,
+                }
+            ]
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    async def fake_reconcile(orders):
+        return len(orders)
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_pending_symbols():
+        return set(pending_symbols)
+
+    async def fake_pending_lookup(symbol):
+        return pending if symbol == "AMPX" and symbol in pending_symbols else None
+
+    async def fake_pending_clear(symbol):
+        pending_symbols.discard(symbol)
+        return True
+
+    async def fake_latest_entry(symbol, *, before_utc_iso=None):
+        assert before_utc_iso is None
+        return {
+            "symbol": symbol,
+            "side": "long",
+            "qty": 0.832986,
+            "status": "filled",
+            "avg_fill_price": 24.13,
+            "submitted_at": "2026-06-02T21:02:25+00:00",
+            "filled_at": "2026-06-02T21:02:26+00:00",
+        }
+
+    async def fake_journal_entry(**kwargs):
+        return 1
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_symbols", fake_pending_symbols)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal_entry)
+
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=object(),
+        notifier=fake_notify,
+    )
+    supervisor._pending_exit_symbols.add("AMPX")
+
+    result = await supervisor.tick_once()
+
+    assert result.positions == []
+    exit_alert = next(message for message in notifications if "PAPER EXIT FILLED: AMPX" in message)
+    assert "Held: unavailable" in exit_alert
 
 
 @pytest.mark.asyncio
@@ -5451,7 +5632,25 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
 
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             self.calls.append((intent, snapshot))
-            return {"order": {"id": "entry-1"}, "risk_decision": {"approved": True}}
+            return {
+                "intent": {"symbol": intent.symbol, "side": intent.side},
+                "order": {
+                    "id": "entry-1",
+                    "broker_order_id": "entry-1",
+                    "symbol": intent.symbol,
+                    "side": "long",
+                    "qty": 1.25,
+                    "order_type": "market",
+                    "status": "pending_new",
+                    "paper": True,
+                },
+                "risk_decision": {
+                    "approved": True,
+                    "reason": "Passed v1 risk gates",
+                    "trace_id": "trace1234",
+                    "risk_decision_id": 42,
+                },
+            }
 
     async def fake_reconcile(orders):
         return 0
@@ -5472,17 +5671,25 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
     patch_empty_pending_exit_state(monkeypatch)
 
     manager = FakeOrderManager()
+    async def fake_notify(message):
+        notifications.append(message)
+
+    notifications = []
     supervisor = TradingSupervisor(
         settings=EntrySettings(),
         state_machine=sm,
         adapter=FakeAdapter(),
         order_manager=manager,
+        notifier=fake_notify,
     )
 
     result = await supervisor.tick_once()
 
     assert result.entry_result["order"]["id"] == "entry-1"
     assert manager.calls[0][0].symbol == "AMPX"
+    assert any("PAPER ENTRY SUBMITTED: AMPX" in message for message in notifications)
+    assert any("Risk: approved, Passed v1 risk gates" in message for message in notifications)
+    assert not any("{'approved':" in message or "{'id':" in message for message in notifications)
 
 
 @pytest.mark.asyncio

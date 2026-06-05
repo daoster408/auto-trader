@@ -121,6 +121,161 @@ def _format_position_line(position: dict[str, Any]) -> str:
     return f"{symbol}: qty {qty:.6f}, value ${market_value:,.2f}, P/L ${unrealized:,.2f} ({pnl_pct:.2f}%)"
 
 
+def _short_order_id(order: dict[str, Any] | None) -> str:
+    if not order:
+        return "unknown"
+    raw = order.get("broker_order_id") or order.get("id") or order.get("client_order_id") or ""
+    return str(raw)[:8] or "unknown"
+
+
+def _format_money(value: float | None) -> str:
+    if value is None:
+        return "unavailable"
+    if value < 0:
+        return f"-${abs(value):,.2f}"
+    sign = "+" if value > 0 else ""
+    return f"{sign}${value:,.2f}"
+
+
+def _format_price(value: float | None) -> str:
+    if value is None:
+        return "unavailable"
+    return f"${value:,.2f}"
+
+
+def _format_pct(value: float | None) -> str:
+    if value is None:
+        return "unavailable"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f}%"
+
+
+def _format_duration(start: datetime | None, end: datetime | None) -> str:
+    if start is None or end is None:
+        return "unavailable"
+    seconds = max(0, int((end - start).total_seconds()))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _paper_live_label(order: dict[str, Any] | None, *, adapter: AlpacaAdapter | None = None) -> str:
+    if order and "paper" in order:
+        return "PAPER" if bool(order.get("paper")) else "LIVE"
+    if adapter is not None and hasattr(adapter, "paper"):
+        return "PAPER" if bool(getattr(adapter, "paper")) else "LIVE"
+    return "PAPER"
+
+
+def _entry_order_action(order: dict[str, Any]) -> str:
+    side = str(order.get("side") or "long").lower()
+    if side == "long":
+        return "market buy"
+    return f"market {side}"
+
+
+def _format_entry_notification(result: dict[str, Any], *, adapter: AlpacaAdapter | None = None) -> str:
+    order = result.get("order") or {}
+    risk = result.get("risk_decision") or {}
+    symbol = str(order.get("symbol") or (result.get("intent") or {}).get("symbol") or "?").upper()
+    label = _paper_live_label(order, adapter=adapter)
+    qty = _float(order.get("qty"))
+    status = order.get("status") or "unknown"
+    reason = risk.get("reason") or "risk decision unavailable"
+    trace = risk.get("trace_id") or "unknown"
+    decision_id = risk.get("risk_decision_id") or "unknown"
+    risk_status = "approved" if bool(risk.get("approved")) else "not approved"
+    return "\n".join(
+        [
+            f"{label} ENTRY SUBMITTED: {symbol}",
+            f"Qty: {qty:.6f}",
+            f"Order: {_entry_order_action(order)}",
+            f"Status: {status}",
+            f"Risk: {risk_status}, {reason}",
+            f"Trace: {trace}",
+            f"Risk decision: {decision_id}",
+            f"Order ID: {_short_order_id(order)}",
+        ]
+    )
+
+
+def _format_exit_signal_notification(decision: ExitDecision) -> str:
+    qty = _float(decision.metrics.get("qty"))
+    pnl = _float(decision.metrics.get("unrealized_pl"))
+    pnl_pct = _float(decision.metrics.get("pnl_pct"))
+    return "\n".join(
+        [
+            f"EXIT SIGNAL (dry run): {decision.symbol}",
+            f"Reason: {decision.reason}",
+            f"Qty: {qty:.6f}",
+            f"Open P/L: {_format_money(pnl)} ({_format_pct(pnl_pct)})",
+        ]
+    )
+
+
+def _format_exit_submitted_notification(
+    decision: ExitDecision,
+    order: dict[str, Any],
+    *,
+    adapter: AlpacaAdapter | None = None,
+) -> str:
+    label = _paper_live_label(order, adapter=adapter)
+    qty = _float(order.get("qty") or decision.metrics.get("qty"))
+    status = order.get("status") or "unknown"
+    return "\n".join(
+        [
+            f"{label} EXIT SUBMITTED: {decision.symbol}",
+            f"Reason: {decision.reason}",
+            f"Qty: {qty:.6f}",
+            "Order: market close",
+            f"Status: {status}",
+            f"Order ID: {_short_order_id(order)}",
+        ]
+    )
+
+
+def _format_exit_completed_notification(
+    *,
+    symbol: str,
+    reason: str | None,
+    close_order: dict[str, Any],
+    entry_order: dict[str, Any] | None,
+    adapter: AlpacaAdapter | None = None,
+) -> str:
+    label = _paper_live_label(close_order, adapter=adapter)
+    qty = _float(close_order.get("filled_qty") or close_order.get("qty"))
+    entry_price = _float((entry_order or {}).get("avg_fill_price"), default=None)
+    exit_price = _float(close_order.get("avg_fill_price"), default=None)
+    pnl: float | None = None
+    pnl_pct: float | None = None
+    if entry_price is not None and entry_price > 0 and exit_price is not None and qty > 0:
+        close_side = str(close_order.get("side") or "sell").lower()
+        if close_side in {"buy", "buy_to_cover"}:
+            pnl = (entry_price - exit_price) * qty
+        else:
+            pnl = (exit_price - entry_price) * qty
+        pnl_pct = (pnl / (entry_price * qty) * 100.0) if qty else None
+    entry_time = _parse_dt((entry_order or {}).get("filled_at") or (entry_order or {}).get("submitted_at"))
+    exit_time = _parse_dt(close_order.get("filled_at") or close_order.get("submitted_at"))
+    return "\n".join(
+        [
+            f"{label} EXIT FILLED: {symbol}",
+            f"Reason: {reason or 'unknown'}",
+            f"Qty: {qty:.6f}",
+            f"Entry: {_format_price(entry_price)}",
+            f"Exit: {_format_price(exit_price)}",
+            f"P/L: {_format_money(pnl)} ({_format_pct(pnl_pct)})",
+            f"Held: {_format_duration(entry_time, exit_time)}",
+            f"Order ID: {_short_order_id(close_order)}",
+        ]
+    )
+
+
 def _is_terminal_order_status(status: Any) -> bool:
     return str(status or "").lower() in {"canceled", "cancelled", "filled", "rejected", "expired"}
 
@@ -367,6 +522,16 @@ class TradingSupervisor:
             if await clear_pending_exit(symbol):
                 self._pending_exit_symbols.discard(symbol)
                 if filled:
+                    try:
+                        entry_lookup_before = order.get("submitted_at") or order.get("filled_at")
+                        entry_order = await get_latest_entry_order_for_symbol(
+                            symbol,
+                            before_utc_iso=entry_lookup_before,
+                        )
+                    except Exception as e:
+                        entry_order = None
+                        log.warning("exit_entry_lookup_failed_for_notification", symbol=symbol, error=str(e))
+                    reason = pending.get("reason")
                     await append_journal_entry(
                         content=(
                             f"Auto-exit completed for {symbol}: matched close order "
@@ -375,7 +540,13 @@ class TradingSupervisor:
                     )
                     await self._notify_once(
                         f"exit-completed-{symbol}-{order.get('broker_order_id') or order.get('id')}",
-                        f"EXIT COMPLETED: close order for {symbol} is filled; pending marker cleared.",
+                        _format_exit_completed_notification(
+                            symbol=symbol,
+                            reason=reason,
+                            close_order=order,
+                            entry_order=entry_order,
+                            adapter=self.adapter,
+                        ),
                     )
                 else:
                     await self._notify_once(
@@ -400,7 +571,7 @@ class TradingSupervisor:
         if not self.settings.auto_exit_enabled:
             await self._notify_once(
                 f"exit-dry-run-{decision.symbol}-{decision.reason}",
-                f"EXIT SIGNAL (dry run): {decision.symbol} - {decision.reason} - {decision.metrics}",
+                _format_exit_signal_notification(decision),
             )
             return None
         if not _regular_market_open(clock):
@@ -488,7 +659,7 @@ class TradingSupervisor:
                     f"metrics {decision.metrics}."
                 )
             )
-            await self._notify(f"EXIT SUBMITTED: {decision.symbol} - {decision.reason} - order {order.get('id')}")
+            await self._notify(_format_exit_submitted_notification(decision, order, adapter=self.adapter))
             return order
         except Exception as e:
             self._pending_exit_symbols.discard(decision.symbol)
@@ -632,7 +803,7 @@ class TradingSupervisor:
         )()
         result = await self.order_manager.submit_trade_intent(intent, snapshot, signal_id=signal_id)
         if result.get("order"):
-            await self._notify(f"ENTRY RESULT: {intent.symbol} - {result.get('risk_decision')} - {result.get('order')}")
+            await self._notify(_format_entry_notification(result, adapter=self.adapter))
         return result
 
     async def _block_entry_for_ai_gate(

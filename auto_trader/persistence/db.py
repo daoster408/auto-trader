@@ -1043,15 +1043,27 @@ async def get_latest_order_records(limit: int = 5) -> list[dict[str, Any]]:
             raise
 
 
-async def get_latest_entry_order_for_symbol(symbol: str) -> dict[str, Any] | None:
-    """Return the latest durable buy/long entry order for a symbol."""
+async def get_latest_entry_order_for_symbol(symbol: str, *, before_utc_iso: str | None = None) -> dict[str, Any] | None:
+    """Return the latest durable buy/long entry order for a symbol.
+
+    If before_utc_iso is provided, ignore entries submitted/filled after that
+    timestamp. This keeps exit outcome alerts from pairing a close with a later
+    re-entry for the same symbol.
+    """
     async with _DB_LOCK:
         try:
             await init_db()
             db = await _get_conn()
             try:
+                before_clause = ""
+                params: tuple[Any, ...]
+                if before_utc_iso:
+                    before_clause = "AND COALESCE(submitted_at, filled_at, '') <= ?"
+                    params = (symbol.upper(), before_utc_iso)
+                else:
+                    params = (symbol.upper(),)
                 cur = await db.execute(
-                    """
+                    f"""
                     SELECT
                         client_order_id,
                         broker_order_id,
@@ -1069,10 +1081,11 @@ async def get_latest_entry_order_for_symbol(symbol: str) -> dict[str, Any] | Non
                     WHERE upper(symbol) = ?
                       AND lower(side) IN ('long', 'buy')
                       AND lower(status) NOT IN ('canceled', 'cancelled', 'rejected', 'expired')
+                      {before_clause}
                     ORDER BY COALESCE(submitted_at, filled_at, '') DESC, rowid DESC
                     LIMIT 1
                     """,
-                    (symbol.upper(),),
+                    params,
                 )
                 row = await cur.fetchone()
                 return dict(row) if row else None
