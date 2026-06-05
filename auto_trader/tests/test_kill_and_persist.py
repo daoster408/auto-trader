@@ -38,6 +38,7 @@ import auto_trader.ai_entry_gate_rehearsal as ai_entry_gate_rehearsal
 from auto_trader.ai_entry_gate_rehearsal import run_ai_entry_gate_rehearsal, render_ai_entry_gate_rehearsal
 from auto_trader.ai_research_smoke import run_ai_research_smoke
 from auto_trader.ai_research_smoke import render_ai_research_smoke
+from auto_trader.friday_recovery_check import build_friday_recovery_report, recovery_exit_code
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
@@ -2642,6 +2643,126 @@ def test_oracle_safe_restart_dry_run_arms_marker_before_restart():
     assert arm_index < restart_index
     assert "auto_trader.maintenance request-shutdown" in output
     assert "systemctl restart 'auto-trader'" in output
+
+
+def test_friday_recovery_check_waits_on_halted_queued_flatten():
+    report, gates = build_friday_recovery_report(
+        settings=DummyDay3Settings(),
+        system_state=SystemState.HALTED,
+        system_meta={"halt_reason": "signal_15"},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": False},
+        positions=[
+            {"symbol": "M", "qty": 0.853598, "market_value": 19.44, "unrealized_pl": -0.49},
+            {"symbol": "SPCE", "qty": 4.15677, "market_value": 20.16, "unrealized_pl": 0.23},
+            {"symbol": "TECS", "qty": 3.086001, "market_value": 20.61, "unrealized_pl": 0.68},
+        ],
+        open_orders=[
+            {"symbol": "TECS", "side": "sell", "qty": 3.086001, "status": "accepted", "broker_order_id": "tecs-close"},
+            {"symbol": "SPCE", "side": "sell", "qty": 4.15677, "status": "accepted", "broker_order_id": "spce-close"},
+            {"symbol": "M", "side": "sell", "qty": 0.853598, "status": "accepted", "broker_order_id": "m-close"},
+        ],
+        pending_exits=[],
+    )
+
+    assert "Recovery state: WAITING_QUEUED_FLATTEN" in report
+    assert "Resume allowed: NO" in report
+    assert "queued close order(s) visible for: M, SPCE, TECS" in report
+    assert recovery_exit_code(gates, report) == 1
+
+
+def test_friday_recovery_check_ready_to_resume_when_flat_and_clear():
+    report, gates = build_friday_recovery_report(
+        settings=DummyDay3Settings(),
+        system_state=SystemState.HALTED,
+        system_meta={"halt_reason": "signal_15"},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+    )
+
+    assert "Recovery state: READY_TO_RESUME" in report
+    assert "Resume allowed: YES" in report
+    assert "[PASS] queued flatten coverage: no open positions require queued closes" in report
+    assert recovery_exit_code(gates, report) == 0
+
+
+def test_friday_recovery_check_waits_for_market_open_even_when_flat():
+    report, gates = build_friday_recovery_report(
+        settings=DummyDay3Settings(),
+        system_state=SystemState.HALTED,
+        system_meta={"halt_reason": "signal_15"},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": False},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+    )
+
+    assert "Recovery state: WAITING_MARKET_OPEN" in report
+    assert "Resume allowed: NO" in report
+    assert recovery_exit_code(gates, report) == 1
+
+
+def test_friday_recovery_check_fails_open_position_without_close_order():
+    report, gates = build_friday_recovery_report(
+        settings=DummyDay3Settings(),
+        system_state=SystemState.HALTED,
+        system_meta={"halt_reason": "signal_15"},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[{"symbol": "M", "qty": 0.853598, "market_value": 19.44, "unrealized_pl": -0.49}],
+        open_orders=[],
+        pending_exits=[],
+    )
+
+    assert "Recovery state: FAIL" in report
+    assert "open position(s) without queued close order: M" in report
+    assert recovery_exit_code(gates, report) == 2
+
+
+def test_friday_recovery_check_rejects_inactive_account_status_substring():
+    report, gates = build_friday_recovery_report(
+        settings=DummyDay3Settings(),
+        system_state=SystemState.HALTED,
+        system_meta={"halt_reason": "signal_15"},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.INACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+    )
+
+    assert "Recovery state: FAIL" in report
+    assert "[FAIL] broker account tradable" in report
+    assert recovery_exit_code(gates, report) == 2
 
 
 @pytest.mark.asyncio

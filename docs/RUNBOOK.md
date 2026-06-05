@@ -226,6 +226,33 @@ ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_ai_rea
 
 This checks SSH, the Oracle service state, whether Finnhub/FRED key slots are set, and the read-only AI research preflight. It does not call paid AI providers.
 
+### Friday HALTED Recovery Check
+
+After the 2026-06-04 unmarked Oracle restart, the expected paper recovery posture is:
+
+- persisted state remains `HALTED`;
+- `M`, `SPCE`, and `TECS` may still be open before regular market open;
+- accepted sell market orders should remain queued at the broker;
+- no cancel, resume, or paid AI rehearsal should run until regular-hours flattening is verified.
+
+Use the read-only Oracle recovery wrapper before and after market open:
+
+```bash
+ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_friday_recovery_check.sh
+```
+
+The wrapper checks the Oracle service and runs the remote `scripts/friday_recovery_check.sh` as the `auto-trader` service user. The recovery check reads persisted state, paper/live mode, account status, market clock, positions, open broker orders, and pending exits. It does not submit orders, cancel orders, reconcile broker orders, resume the bot, or call paid AI providers.
+
+Expected outputs:
+
+- `WAITING_QUEUED_FLATTEN` means open positions still have queued close orders; keep waiting and do not resume.
+- `WAITING_OPEN_ORDERS_CLEAR` means positions are flat but open orders remain; keep waiting and do not resume.
+- `WAITING_MARKET_OPEN` means positions and orders are clear but regular market hours are not open; keep waiting and do not resume.
+- `READY_TO_RESUME` means persisted state is `HALTED`, paper/account checks passed, positions are flat, open orders are gone, and no pending exits remain.
+- `FAIL` means operator attention is required before resume.
+
+Resume is allowed only after `READY_TO_RESUME`. After intentional resume and a clean `/status`, run AI readiness/rehearsal separately; do not enable `AI_ENTRY_GATE_ENABLED` until the no-order rehearsal path is clean.
+
 The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit model, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, enough calls remaining for the UTC day, and a bounded timeout. It also prints the effective `AI entry gate enabled` state after runtime config is applied. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
 
 After preflight is `READY`, run a no-order rehearsal against the real current candidate packet:
