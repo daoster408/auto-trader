@@ -1,10 +1,13 @@
 """Deterministic prefilter for paid AI entry-gate calls."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from auto_trader.core.models import TradeIntent
+from auto_trader.core.risk_profile import get_risk_profile
 from auto_trader.intelligence.research_context import build_verified_research_context
 
 
@@ -40,6 +43,7 @@ def evaluate_paid_ai_prefilter(
     intent: TradeIntent,
     *,
     settings: Any,
+    risk_profile: str | None = None,
 ) -> PaidAIPrefilterResult:
     """Return a deterministic paid-call prefilter decision.
 
@@ -72,15 +76,39 @@ def evaluate_paid_ai_prefilter(
     inverse_or_leveraged = symbol in INVERSE_OR_LEVERAGED_SYMBOLS
     inverse_overlap = sorted(set(position_symbols).intersection(INVERSE_OR_LEVERAGED_SYMBOLS))
 
-    min_rel_volume = float(getattr(settings, "ai_paid_prefilter_min_rel_volume", 1.0) or 1.0)
-    strong_rel_volume = float(getattr(settings, "ai_paid_prefilter_strong_rel_volume", 2.5) or 2.5)
-    high_buffer = abs(float(getattr(settings, "ai_paid_prefilter_high_buffer_pct", 0.002) or 0.002))
+    profile = get_risk_profile(
+        risk_profile or getattr(settings, "risk_profile", "conservative"),
+        paper=bool(getattr(settings, "alpaca_paper", True)),
+    )
+    profile_prefilter = profile.paid_ai_prefilter
+    conservative_prefilter = get_risk_profile("conservative", paper=True).paid_ai_prefilter
+    min_rel_volume = _profile_or_env_float(
+        settings,
+        "ai_paid_prefilter_min_rel_volume",
+        conservative_prefilter.min_rel_volume,
+        profile_prefilter.min_rel_volume,
+    )
+    strong_rel_volume = _profile_or_env_float(
+        settings,
+        "ai_paid_prefilter_strong_rel_volume",
+        conservative_prefilter.strong_rel_volume,
+        profile_prefilter.strong_rel_volume,
+    )
+    high_buffer = abs(
+        _profile_or_env_float(
+            settings,
+            "ai_paid_prefilter_high_buffer_pct",
+            conservative_prefilter.high_buffer_pct,
+            profile_prefilter.high_buffer_pct,
+        )
+    )
 
     reasons: list[str] = []
     if rel_volume is not None and rel_volume < min_rel_volume:
         reasons.append("low_relative_volume")
     if (
-        bool(getattr(settings, "ai_paid_prefilter_block_inverse_overlap", True))
+        bool(getattr(settings, "ai_paid_prefilter_block_inverse_overlap", profile_prefilter.block_inverse_overlap))
+        and profile_prefilter.block_inverse_overlap
         and inverse_or_leveraged
         and inverse_overlap
     ):
@@ -109,6 +137,7 @@ def evaluate_paid_ai_prefilter(
         "inverse_or_leveraged": inverse_or_leveraged,
         "inverse_overlap": inverse_overlap,
         "position_symbols": position_symbols,
+        "risk_profile": profile.name,
     }
     return PaidAIPrefilterResult(symbol=symbol, blocked=bool(reasons), reasons=reasons, evidence=evidence)
 
@@ -124,3 +153,40 @@ def _float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _profile_or_env_float(settings: Any, attr: str, default_value: float, profile_value: float) -> float:
+    setting_value = _float(getattr(settings, attr, default_value))
+    if setting_value is None:
+        return profile_value
+    if _setting_explicitly_set(settings, attr) or setting_value != default_value:
+        return setting_value
+    return profile_value
+
+
+def _setting_explicitly_set(settings: Any, attr: str) -> bool:
+    alias = _settings_alias(settings, attr)
+    if not alias:
+        return False
+    if alias in os.environ:
+        return True
+    env_file = Path(os.getenv("AUTO_TRADER_ENV_FILE", ".env"))
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    prefix = f"{alias}="
+    return any(line.strip().startswith(prefix) for line in lines if line.strip() and not line.strip().startswith("#"))
+
+
+def _settings_alias(settings: Any, attr: str) -> str | None:
+    model_fields = getattr(settings.__class__, "model_fields", {})
+    field = model_fields.get(attr) if isinstance(model_fields, dict) else None
+    alias = getattr(field, "alias", None)
+    if alias:
+        return str(alias)
+    return {
+        "ai_paid_prefilter_min_rel_volume": "AI_PAID_PREFILTER_MIN_REL_VOLUME",
+        "ai_paid_prefilter_strong_rel_volume": "AI_PAID_PREFILTER_STRONG_REL_VOLUME",
+        "ai_paid_prefilter_high_buffer_pct": "AI_PAID_PREFILTER_HIGH_BUFFER_PCT",
+    }.get(attr)

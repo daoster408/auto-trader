@@ -41,6 +41,7 @@ from auto_trader.ai_research_smoke import render_ai_research_smoke
 from auto_trader.friday_recovery_check import build_friday_recovery_report, recovery_exit_code
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
 from auto_trader.core.risk_engine import RiskEngine
+from auto_trader.core.risk_profile import get_risk_profile
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.comms.telegram_bot import TelegramBot
 from auto_trader.config.settings import Settings
@@ -63,6 +64,8 @@ from auto_trader.intelligence.ai_committee import (
 )
 from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.fred_client import CORE_RISK_SERIES, FredClient
+from auto_trader.intelligence.ai_paid_prefilter import evaluate_paid_ai_prefilter
+import auto_trader.intelligence.rules_fallback as rules_fallback
 from auto_trader.intelligence.rules_fallback import DiscoveryCandidate, get_simple_rules_signals
 from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_shutdown, _should_emergency_halt_on_shutdown
 from auto_trader.scheduler.trading_supervisor import TradingSupervisor
@@ -103,6 +106,8 @@ from auto_trader.persistence.db import (
 
 
 class DummySettings:
+    alpaca_paper = True
+    risk_profile = "conservative"
     risk_per_trade_pct = 0.5
     max_new_positions_per_day = 1
     max_gross_exposure_pct = 25.0
@@ -2887,6 +2892,49 @@ def test_risk_engine_sizes_fractional_quantity_under_early_cap():
     assert decision.sized_quantity * intent.entry_price <= DummySnapshot.equity * 0.05
 
 
+def test_risk_profile_controls_paper_sizing_and_live_risky_downgrades():
+    intent = TradeIntent(symbol="AMPX", side="long", entry_price=10.0)
+
+    class AggressiveSettings(DummySettings):
+        risk_profile = "aggressive"
+        alpaca_paper = True
+
+    class AggressiveLiveSettings(DummySettings):
+        risk_profile = "aggressive"
+        alpaca_paper = False
+
+    class RiskyPaperSettings(DummySettings):
+        risk_profile = "risky"
+        alpaca_paper = True
+
+    class RiskyLiveSettings(DummySettings):
+        risk_profile = "risky"
+        alpaca_paper = False
+
+    aggressive = RiskEngine(StateMachine(initial_state=SystemState.ACTIVE), AggressiveSettings())
+    aggressive_live = RiskEngine(StateMachine(initial_state=SystemState.ACTIVE), AggressiveLiveSettings())
+    risky_paper = RiskEngine(StateMachine(initial_state=SystemState.ACTIVE), RiskyPaperSettings())
+    risky_live = RiskEngine(StateMachine(initial_state=SystemState.ACTIVE), RiskyLiveSettings())
+
+    aggressive_decision = aggressive.evaluate(intent, DummySnapshot())
+    aggressive_live_decision = aggressive_live.evaluate(intent, DummySnapshot())
+    risky_paper_decision = risky_paper.evaluate(intent, DummySnapshot())
+    risky_live_decision = risky_live.evaluate(intent, DummySnapshot())
+
+    assert aggressive_decision.approved is True
+    assert aggressive_decision.sized_quantity == pytest.approx(0.75)
+    assert aggressive_decision.risk_metrics["risk_profile"] == "aggressive"
+    assert aggressive_live_decision.approved is True
+    assert aggressive_live_decision.sized_quantity == pytest.approx(0.5)
+    assert aggressive_live_decision.risk_metrics["risk_profile"] == "conservative"
+    assert risky_paper_decision.approved is True
+    assert risky_paper_decision.sized_quantity == pytest.approx(1.0)
+    assert risky_paper_decision.risk_metrics["risk_profile"] == "risky"
+    assert risky_live_decision.approved is True
+    assert risky_live_decision.sized_quantity == pytest.approx(0.5)
+    assert risky_live_decision.risk_metrics["risk_profile"] == "conservative"
+
+
 def test_risk_engine_blocks_duplicate_open_position():
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     risk = RiskEngine(sm, DummySettings())
@@ -2935,6 +2983,31 @@ def test_risk_engine_blocks_missing_durable_daily_entry_count():
 
     assert decision.approved is False
     assert decision.reason == "Durable daily entry count unavailable"
+
+
+def test_risky_discovery_profile_widens_candidate_filters():
+    now = datetime.now(UTC).isoformat()
+    snapshot = {
+        "latestTrade": {"p": 1.5, "t": now},
+        "latestQuote": {"bp": 1.495, "ap": 1.505, "t": now},
+        "dailyBar": {"o": 1.48, "c": 1.5, "v": 400_000},
+        "prevDailyBar": {"c": 1.47, "v": 300_000},
+    }
+
+    conservative_candidate = rules_fallback._candidate_from_snapshot(
+        "TEST",
+        snapshot,
+        discovery_profile=get_risk_profile("conservative", paper=True).discovery,
+    )
+    risky_candidate = rules_fallback._candidate_from_snapshot(
+        "TEST",
+        snapshot,
+        discovery_profile=get_risk_profile("risky", paper=True).discovery,
+    )
+
+    assert conservative_candidate is None
+    assert risky_candidate is not None
+    assert risky_candidate.symbol == "TEST"
 
 
 @pytest.mark.asyncio
@@ -3753,11 +3826,152 @@ async def test_telegram_config_handler_sets_max_entries(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_telegram_config_handler_sets_paper_risk_profile(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+    journal = []
+
+    class PaperAdapter:
+        paper = True
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    async def fake_journal(**kwargs):
+        journal.append(kwargs["content"])
+        return 1
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=PaperAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["risk_profile", "risky"]))
+
+    assert stored == {"risk_profile": "risky"}
+    assert "Runtime risk profile set to risky." in update.message.replies[0]
+    assert "Risky is paper-only" in update.message.replies[0]
+    assert journal == ["Runtime config updated: risk_profile=risky."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_clamps_entries_when_profile_tightens(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+
+    class PaperAdapter:
+        paper = True
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    async def fake_values():
+        return {"risk_profile": "risky", "max_new_positions_per_day": "8"}
+
+    async def fake_journal(**kwargs):
+        return 1
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=PaperAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["risk_profile", "conservative"]))
+
+    assert stored == {"risk_profile": "conservative", "max_new_positions_per_day": "3"}
+    assert "Existing max entries clamped to 3." in update.message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_rejects_live_risky_profile(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+
+    class LiveAdapter:
+        paper = False
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=LiveAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["risk_profile", "risky"]))
+
+    assert stored == {}
+    assert update.message.replies == ["Experiment risk profiles are paper-only. Live mode stays conservative."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_rejects_live_aggressive_profile(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+
+    class LiveAdapter:
+        paper = False
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=LiveAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["risk_profile", "aggressive"]))
+
+    assert stored == {}
+    assert update.message.replies == ["Experiment risk profiles are paper-only. Live mode stays conservative."]
+
+
+@pytest.mark.asyncio
 async def test_telegram_config_handler_shows_runtime_config(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
 
     async def fake_values():
-        return {"auto_entry_enabled": "true", "ai_entry_gate_enabled": "true", "max_new_positions_per_day": "3"}
+        return {
+            "auto_entry_enabled": "true",
+            "ai_entry_gate_enabled": "true",
+            "risk_profile": "aggressive",
+            "max_new_positions_per_day": "3",
+        }
 
     async def fake_bool(key, *, default):
         return True
@@ -3787,6 +4001,7 @@ async def test_telegram_config_handler_shows_runtime_config(monkeypatch):
     assert "RUNTIME CONFIG" in update.message.replies[0]
     assert "auto_entry_enabled: True (runtime)" in update.message.replies[0]
     assert "ai_entry_gate_enabled: True (runtime)" in update.message.replies[0]
+    assert "risk_profile: aggressive (runtime)" in update.message.replies[0]
     assert "max_new_positions_per_day: 3 (runtime)" in update.message.replies[0]
 
 
@@ -6195,6 +6410,42 @@ async def test_ai_paid_prefilter_blocks_low_volume_before_paid_provider(monkeypa
     assert "ai_paid_prefilter_blocked" in journal_entries[0]
 
 
+def test_ai_paid_prefilter_explicit_env_override_wins_in_aggressive(monkeypatch):
+    class AggressiveSettings(DummySupervisorSettings):
+        alpaca_paper = True
+        risk_profile = "aggressive"
+        ai_paid_prefilter_enabled = True
+        ai_paid_prefilter_min_rel_volume = 1.0
+        ai_paid_prefilter_strong_rel_volume = 2.5
+        ai_paid_prefilter_high_buffer_pct = 0.002
+        ai_paid_prefilter_block_inverse_overlap = True
+
+    monkeypatch.setenv("AI_PAID_PREFILTER_MIN_REL_VOLUME", "1.0")
+    intent = TradeIntent(
+        symbol="POET",
+        side="long",
+        entry_price=10.0,
+        features={
+            "research_context": {
+                "technical": {
+                    "rel_volume": 0.9,
+                    "distance_from_high_pct": -0.02,
+                    "spread_pct": 0.001,
+                },
+                "news": [{"headline": "POET announces customer win"}],
+                "fundamental": {"name": "POET Technologies"},
+            }
+        },
+    )
+
+    result = evaluate_paid_ai_prefilter(intent, settings=AggressiveSettings(), risk_profile="aggressive")
+
+    assert result.blocked is True
+    assert result.evidence["risk_profile"] == "aggressive"
+    assert result.evidence["min_rel_volume"] == 1.0
+    assert result.reasons == ["low_relative_volume"]
+
+
 @pytest.mark.asyncio
 async def test_ai_paid_prefilter_allows_strong_candidate_to_paid_provider(monkeypatch):
     class GateSettings(DummySupervisorSettings):
@@ -7113,15 +7364,17 @@ async def test_supervisor_auto_entry_uses_runtime_entry_cap(monkeypatch):
     async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
         return [TradeIntent(symbol="POET", side="long", entry_price=20.0)]
 
-    async def fake_runtime_config_int(key, *, default, minimum=None, maximum=None):
-        return 3
+    async def fake_runtime_config_value(key):
+        if key == "max_new_positions_per_day":
+            return "8"
+        return None
 
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
     patch_empty_pending_exit_state(monkeypatch)
-    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_int", fake_runtime_config_int)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_value", fake_runtime_config_value)
 
     manager = FakeOrderManager()
     supervisor = TradingSupervisor(

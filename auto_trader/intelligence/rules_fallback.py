@@ -12,12 +12,14 @@ Discovery flow:
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.models import TradeIntent
+from auto_trader.core.risk_profile import DiscoveryProfile, get_risk_profile
 from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.fred_client import FredClient
 from auto_trader.intelligence.research_context import (
@@ -97,7 +99,12 @@ def _is_fresh(snapshot: dict[str, Any], max_age_minutes: int = 20) -> bool:
     return any(ts is not None and ts >= fresh_after for ts in timestamps)
 
 
-def _candidate_from_snapshot(symbol: str, snapshot: dict[str, Any]) -> DiscoveryCandidate | None:
+def _candidate_from_snapshot(
+    symbol: str,
+    snapshot: dict[str, Any],
+    *,
+    discovery_profile: DiscoveryProfile,
+) -> DiscoveryCandidate | None:
     price = _latest_price(snapshot)
     daily = _bar(snapshot, "dailyBar")
     prev = _bar(snapshot, "prevDailyBar")
@@ -118,16 +125,16 @@ def _candidate_from_snapshot(symbol: str, snapshot: dict[str, Any]) -> Discovery
     intraday_pct = ((price - open_price) / open_price) if open_price > 0 else 0.0
     rel_volume = volume / prev_volume if prev_volume > 0 else 1.0
 
-    # Conservative filters: enough liquidity, not a penny stock, not already parabolic.
-    if not 3.0 <= price <= 120.0:
+    # Profile filters widen the paper experiment funnel without creating order authority.
+    if not discovery_profile.min_price <= price <= discovery_profile.max_price:
         return None
-    if dollar_volume < 2_000_000:
+    if dollar_volume < discovery_profile.min_dollar_volume:
         return None
-    if spread is None or spread > 0.006:
+    if spread is None or spread > discovery_profile.max_spread_pct:
         return None
-    if change_pct <= 0.008 or change_pct > 0.12:
+    if change_pct <= discovery_profile.min_change_pct or change_pct > discovery_profile.max_change_pct:
         return None
-    if intraday_pct < -0.02:
+    if intraday_pct < discovery_profile.min_intraday_pct:
         return None
 
     # Score favors early attention + constructive move, while avoiding pure gap mania.
@@ -178,8 +185,14 @@ async def discover_dynamic_candidates(
     max_assets: int = 750,
     batch_size: int = 100,
     max_candidates: int = 10,
+    risk_profile: str = "conservative",
+    paper: bool = True,
 ) -> list[DiscoveryCandidate]:
     """Discover ranked candidates from the broad Alpaca tradable universe."""
+    profile = get_risk_profile(risk_profile, paper=paper)
+    discovery_profile = profile.discovery
+    max_assets = max(max_assets, discovery_profile.max_assets)
+    max_candidates = max(max_candidates, discovery_profile.max_candidates)
     assets = await adapter.get_tradable_assets()
     symbols = [a["symbol"] for a in assets if a.get("fractionable")]
 
@@ -193,7 +206,11 @@ async def discover_dynamic_candidates(
             snapshots = await adapter.get_stock_snapshots(chunk)
             successful_batches += 1
             for symbol, snapshot in snapshots.items():
-                candidate = _candidate_from_snapshot(symbol.upper(), snapshot)
+                candidate = _candidate_from_snapshot(
+                    symbol.upper(),
+                    snapshot,
+                    discovery_profile=discovery_profile,
+                )
                 if candidate:
                     candidates.append(candidate)
         except Exception as e:
@@ -206,7 +223,13 @@ async def discover_dynamic_candidates(
         raise RuntimeError("all snapshot batches failed; refusing to treat data outage as no candidates")
 
     ranked = sorted(candidates, key=lambda c: c.score, reverse=True)[:max_candidates]
-    log.info("dynamic_candidates_ranked", scanned=len(symbols), candidates=len(candidates), returned=len(ranked))
+    log.info(
+        "dynamic_candidates_ranked",
+        scanned=len(symbols),
+        candidates=len(candidates),
+        returned=len(ranked),
+        risk_profile=profile.name,
+    )
     return ranked
 
 
@@ -215,13 +238,25 @@ async def get_simple_rules_signals(
     max_signals: int = 2,
     finnhub_client: FinnhubClient | None = None,
     fred_client: FredClient | None = None,
+    risk_profile: str = "conservative",
+    paper: bool = True,
 ) -> list[TradeIntent]:
     """Return TradeIntents from dynamic market discovery (no watchlist)."""
-    candidates = await discover_dynamic_candidates(adapter, max_candidates=max(max_signals, 5))
+    profile = get_risk_profile(risk_profile, paper=paper)
+    discover_kwargs: dict[str, Any] = {"max_candidates": max(max_signals, 5)}
+    parameters = inspect.signature(discover_dynamic_candidates).parameters
+    supports_profile = "risk_profile" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+    if supports_profile:
+        discover_kwargs["risk_profile"] = profile.name
+        discover_kwargs["paper"] = paper
+    candidates = await discover_dynamic_candidates(adapter, **discover_kwargs)
     signals: list[TradeIntent] = []
     for candidate in candidates[:max_signals]:
         features: dict[str, Any] = {
             "discovery": _alpaca_candidate_features(candidate),
+            "risk_profile": profile.name,
         }
         research_context = candidate.research_context or {}
         if finnhub_client is not None and finnhub_client.enabled:

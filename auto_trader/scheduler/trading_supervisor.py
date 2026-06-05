@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.core.models import KillResult, SystemState
+from auto_trader.core.risk_profile import get_risk_profile
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.ai_committee import (
     ResearchMemo,
@@ -42,6 +44,7 @@ from auto_trader.persistence.db import (
     get_pending_exit_symbols,
     get_runtime_config_bool,
     get_runtime_config_int,
+    get_runtime_config_value,
     log_ai_research_memo,
     log_signal,
     reconcile_broker_orders,
@@ -54,6 +57,71 @@ from auto_trader.utils.logging import get_logger
 NotifyFn = Callable[[str], Awaitable[None]]
 
 log = get_logger("auto_trader.scheduler.trading_supervisor")
+
+
+async def _runtime_risk_profile(settings: Any, *, paper: bool) -> str:
+    try:
+        runtime_value = await get_runtime_config_value("risk_profile")
+    except Exception as e:
+        log.warning("runtime_risk_profile_unavailable", error=str(e))
+        runtime_value = None
+    return get_risk_profile(runtime_value or getattr(settings, "risk_profile", "conservative"), paper=paper).name
+
+
+async def _runtime_entry_cap(settings: Any, *, paper: bool, risk_profile: str) -> int:
+    maximum = _max_runtime_entries_allowed(settings, paper=paper, risk_profile=risk_profile)
+    default = int(getattr(settings, "max_new_positions_per_day", 1) or 1)
+    default = min(max(default, 1), maximum)
+    try:
+        raw_value = await get_runtime_config_value("max_new_positions_per_day")
+    except Exception as e:
+        log.warning("runtime_entry_cap_unavailable", error=str(e))
+        return default
+    if raw_value is None:
+        return default
+    try:
+        configured = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        log.warning("runtime_entry_cap_invalid", value=raw_value, default=default)
+        return default
+    return min(max(configured, 1), maximum)
+
+
+def _max_runtime_entries_allowed(settings: Any, *, paper: bool, risk_profile: str) -> int:
+    profile = get_risk_profile(risk_profile, paper=paper)
+    if paper:
+        return profile.max_runtime_entries_paper
+    return int(getattr(settings, "max_new_positions_per_day", 1) or 1)
+
+
+async def _get_profiled_rules_signals(
+    adapter: AlpacaAdapter,
+    *,
+    max_signals: int,
+    finnhub_client: FinnhubClient | None,
+    fred_client: FredClient | None,
+    risk_profile: str,
+    paper: bool,
+):
+    parameters = inspect.signature(get_simple_rules_signals).parameters
+    supports_profile = "risk_profile" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+    if supports_profile:
+        return await get_simple_rules_signals(
+            adapter,
+            max_signals=max_signals,
+            finnhub_client=finnhub_client,
+            fred_client=fred_client,
+            risk_profile=risk_profile,
+            paper=paper,
+        )
+    return await get_simple_rules_signals(
+        adapter,
+        max_signals=max_signals,
+        finnhub_client=finnhub_client,
+        fred_client=fred_client,
+    )
 
 
 @dataclass(frozen=True)
@@ -701,6 +769,7 @@ class TradingSupervisor:
         positions: list[dict[str, Any]],
         today_new_entries: int,
         max_new_positions_per_day: int,
+        risk_profile: str = "conservative",
     ) -> dict[str, Any] | None:
         auto_entry_enabled = await get_runtime_config_bool(
             "auto_entry_enabled",
@@ -737,11 +806,13 @@ class TradingSupervisor:
             )
             return None
 
-        signals = await get_simple_rules_signals(
+        signals = await _get_profiled_rules_signals(
             self.adapter,
             max_signals=1,
             finnhub_client=self.finnhub_client,
             fred_client=self.fred_client,
+            risk_profile=risk_profile,
+            paper=bool(getattr(self.adapter, "paper", False)),
         )
         if not signals:
             return None
@@ -754,6 +825,7 @@ class TradingSupervisor:
                     positions=positions,
                     today_new_entries=today_new_entries,
                     max_new_positions_per_day=max_new_positions_per_day,
+                    risk_profile=risk_profile,
                 )
             },
         )
@@ -774,7 +846,7 @@ class TradingSupervisor:
         real_providers = real_research_providers(self.research_committee)
         paid_research_allowed = ai_gate_enabled or not real_providers
         if ai_research_enabled and paid_research_allowed:
-            ai_result = await self._run_ai_research(intent, signal_id=signal_id)
+            ai_result = await self._run_ai_research(intent, signal_id=signal_id, risk_profile=risk_profile)
         elif ai_research_enabled and real_providers:
             log.info(
                 "paid_ai_research_skipped_gate_disabled",
@@ -814,6 +886,7 @@ class TradingSupervisor:
                 "open_positions": positions,
                 "today_new_entries": today_new_entries,
                 "max_new_positions_per_day": max_new_positions_per_day,
+                "risk_profile": risk_profile,
             },
         )()
         result = await self.order_manager.submit_trade_intent(intent, snapshot, signal_id=signal_id)
@@ -853,7 +926,13 @@ class TradingSupervisor:
             },
         }
 
-    async def _run_ai_research(self, intent, *, signal_id: int | None) -> AIResearchRunResult:
+    async def _run_ai_research(
+        self,
+        intent,
+        *,
+        signal_id: int | None,
+        risk_profile: str = "conservative",
+    ) -> AIResearchRunResult:
         provider = str(getattr(self.research_committee, "provider", "shadow"))
         packet = build_research_packet(intent, signal_id=signal_id)
         digest = packet_hash(packet)
@@ -898,7 +977,7 @@ class TradingSupervisor:
                         reason=f"ai_research_cached_{cached_verdict}",
                         called_provider=False,
                     )
-            prefilter = evaluate_paid_ai_prefilter(intent, settings=self.settings)
+            prefilter = evaluate_paid_ai_prefilter(intent, settings=self.settings, risk_profile=risk_profile)
             if prefilter.blocked:
                 prefilter_already_logged = False
                 if len(real_providers) == 1:
@@ -1170,6 +1249,10 @@ class TradingSupervisor:
         reconciled: int | None = None
         today_new_entries = 0
         max_new_positions_per_day = int(self.settings.max_new_positions_per_day)
+        risk_profile = get_risk_profile(
+            getattr(self.settings, "risk_profile", "conservative"),
+            paper=bool(getattr(self.adapter, "paper", False)),
+        ).name
         timezone = ZoneInfo(getattr(self.settings, "report_timezone", "America/Los_Angeles"))
         local_now = datetime.now(timezone)
         last_risk_sweep_due = False
@@ -1213,18 +1296,17 @@ class TradingSupervisor:
             errors.append(f"durable entry count unavailable: {e}")
 
         try:
-            max_new_positions_per_day = await get_runtime_config_int(
-                "max_new_positions_per_day",
-                default=int(self.settings.max_new_positions_per_day),
-                minimum=1,
-                maximum=(
-                    3
-                    if bool(getattr(self.adapter, "paper", False))
-                    else int(self.settings.max_new_positions_per_day)
-                ),
+            risk_profile = await _runtime_risk_profile(
+                self.settings,
+                paper=bool(getattr(self.adapter, "paper", False)),
+            )
+            max_new_positions_per_day = await _runtime_entry_cap(
+                self.settings,
+                paper=bool(getattr(self.adapter, "paper", False)),
+                risk_profile=risk_profile,
             )
         except Exception as e:
-            errors.append(f"runtime entry cap unavailable: {e}")
+            errors.append(f"runtime profile/entry cap unavailable: {e}")
 
         try:
             if account is not None and account.get("status") == "CONNECTED":
@@ -1296,6 +1378,7 @@ class TradingSupervisor:
                     positions=positions,
                     today_new_entries=today_new_entries,
                     max_new_positions_per_day=max_new_positions_per_day,
+                    risk_profile=risk_profile,
                 )
             except Exception as e:
                 errors.append(f"entry loop failed: {e}")

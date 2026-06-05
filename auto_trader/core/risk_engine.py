@@ -10,6 +10,7 @@ from math import floor
 
 
 from auto_trader.core.models import RiskDecision, TradeIntent
+from auto_trader.core.risk_profile import get_risk_profile
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.utils.logging import get_logger
 
@@ -106,8 +107,13 @@ class RiskEngine:
                 trace_id=trace_id,
             )
 
+        profile = get_risk_profile(
+            getattr(snapshot, "risk_profile", getattr(self.settings, "risk_profile", "conservative")),
+            paper=bool(getattr(self.settings, "alpaca_paper", True)),
+        )
+
         # 2. Basic per-trade risk budget (v1 bootstrap: fractional long, no leverage)
-        early_notional_cap = snapshot.equity * 0.05
+        early_notional_cap = snapshot.equity * profile.early_notional_cap_pct
         sized_qty = floor((early_notional_cap / intent.entry_price) * 1_000_000) / 1_000_000
         proposed_notional = intent.entry_price * sized_qty
         max_risk_dollars = snapshot.equity * (self.settings.risk_per_trade_pct / 100.0)
@@ -124,15 +130,16 @@ class RiskEngine:
                 model_tag=model_tag,
                 trace_id=trace_id,
             )
-        if proposed_notional > early_notional_cap:  # conservative 5% cap early
+        if proposed_notional > early_notional_cap:
             return RiskDecision(
                 approved=False,
-                reason="Proposed size exceeds early conservative limit",
+                reason="Proposed size exceeds early profile limit",
                 sized_quantity=None,
                 risk_metrics={
                     "proposed_notional": proposed_notional,
                     "early_notional_cap": early_notional_cap,
                     "max_risk": max_risk_dollars,
+                    "risk_profile": profile.name,
                 },
                 model_tag=model_tag,
                 trace_id=trace_id,
@@ -170,6 +177,8 @@ class RiskEngine:
             risk_metrics={
                 "state": "ACTIVE",
                 "daily_new_after": self._daily_new_positions + 1,
+                "risk_profile": profile.name,
+                "early_notional_cap_pct": profile.early_notional_cap_pct,
             },
             model_tag=model_tag,
             trace_id=trace_id,

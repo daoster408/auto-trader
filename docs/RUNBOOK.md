@@ -261,6 +261,20 @@ Before any paid provider call, the deterministic paid-AI prefilter can block obv
 AI_PAID_PREFILTER_ENABLED=false
 ```
 
+Risk profiles control how wide the paper experiment funnel is:
+
+- `conservative`: current live-readiness posture; 3 max runtime paper entries, 5% early notional cap, strict discovery and paid-AI prefilter thresholds.
+- `aggressive`: paper-only wider opportunity search; 5 max runtime paper entries, 7.5% early notional cap, moderately looser discovery/prefilter thresholds.
+- `risky`: paper-only experiment mode; 8 max runtime paper entries, 10% early notional cap, wider discovery/prefilter thresholds. If `ALPACA_PAPER=false`, `risky` normalizes back to `conservative`.
+
+If `ALPACA_PAPER=false`, all experiment profiles normalize back to `conservative`. No risk profile bypasses `HALTED`, kill switch, broker/account blocks, daily/weekly loss halts, drawdown halts, duplicate-position guards, AI entry gate, or RiskEngine. Runtime changes:
+
+```text
+/config risk_profile conservative
+/config risk_profile aggressive
+/config risk_profile risky
+```
+
 After preflight is `READY`, run a no-order rehearsal against the real current candidate packet:
 
 ```bash

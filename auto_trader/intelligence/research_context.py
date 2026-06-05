@@ -183,6 +183,7 @@ def build_risk_research_context(
     positions: list[dict[str, Any]] | None = None,
     today_new_entries: int | None = None,
     max_new_positions_per_day: int | None = None,
+    risk_profile: str | None = None,
 ) -> dict[str, Any]:
     positions = [_dict(position) for position in (positions or [])]
     open_positions = [p for p in positions if abs(_num(p.get("qty"), 0.0) or 0.0) > 0]
@@ -208,6 +209,9 @@ def build_risk_research_context(
         "entry_limits": {
             "today_new_entries": today_new_entries,
             "max_new_positions_per_day": max_new_positions_per_day,
+        },
+        "risk_profile": {
+            "name": _text(risk_profile) or "unknown",
         },
     }
 

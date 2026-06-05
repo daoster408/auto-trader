@@ -24,6 +24,7 @@ class Settings(BaseSettings):
 
     # Risk (v1 defaults - changes require DECISIONS_LOG entry + restart)
     risk_per_trade_pct: float = Field(0.5, alias="RISK_PER_TRADE_PCT")
+    risk_profile: Literal["conservative", "aggressive", "risky"] = Field("conservative", alias="RISK_PROFILE")
     max_new_positions_per_day: int = Field(1, alias="MAX_NEW_POSITIONS_PER_DAY")
     max_gross_exposure_pct: float = Field(25.0, alias="MAX_GROSS_EXPOSURE_PCT")
     daily_loss_halt_pct: float = Field(-1.75, alias="DAILY_LOSS_HALT_PCT")
