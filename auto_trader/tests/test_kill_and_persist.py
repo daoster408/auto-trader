@@ -6090,6 +6090,211 @@ async def test_ai_entry_gate_cache_lookup_failure_blocks_without_paid_call(monke
 
 
 @pytest.mark.asyncio
+async def test_ai_paid_prefilter_blocks_low_volume_before_paid_provider(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 5
+        ai_paid_prefilter_enabled = True
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            raise AssertionError("OrderManager should not be called when paid AI prefilter blocks")
+
+    class ExplodingPaidCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+        async def research(self, intent, *, signal_id=None):
+            raise AssertionError("paid AI provider should not be called when paid prefilter blocks")
+
+    journal_entries = []
+    logged_memos = []
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+        return [
+            TradeIntent(
+                symbol="NI",
+                side="long",
+                entry_price=46.70,
+                confidence=0.8,
+                features={
+                    "research_context": {
+                        "technical": {
+                            "rel_volume": 0.48,
+                            "distance_from_high_pct": -0.001,
+                            "spread_pct": 0.0002,
+                        },
+                        "news": [],
+                        "fundamental": {"name": "NiSource Inc", "industry": "Utilities"},
+                    }
+                },
+            )
+        ]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_log_signal(**kwargs):
+        return 104
+
+    async def fake_cached_lookup(**kwargs):
+        return None
+
+    async def exploding_count(**kwargs):
+        raise AssertionError("paid AI budget/dedupe counters should not run when paid prefilter blocks")
+
+    async def fake_log_ai(**kwargs):
+        logged_memos.append(kwargs)
+        return 71
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", fake_cached_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", exploding_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts", exploding_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_ai_research_memo", fake_log_ai)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    supervisor.research_committee = ExplodingPaidCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["blocked"] is True
+    assert result["ai_gate"]["reason"].startswith("ai_paid_prefilter_blocked:")
+    assert "low_relative_volume" in result["ai_gate"]["reason"]
+    assert logged_memos[0]["provider"] == "prefilter"
+    assert logged_memos[0]["prompt_version"] == "ai_paid_prefilter/v0"
+    assert logged_memos[0]["memo"]["prefilter"]["reasons"] == ["low_relative_volume", "near_high_without_strong_volume_or_news"]
+    assert "ai_paid_prefilter_blocked" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_paid_prefilter_allows_strong_candidate_to_paid_provider(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 5
+        ai_paid_prefilter_enabled = True
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        def __init__(self):
+            self.calls = []
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            self.calls.append((intent, snapshot, signal_id))
+            return {"order": {"id": "entry-prefilter-pass"}, "risk_decision": {"approved": True}}
+
+    class ApprovingCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+        async def research(self, intent, *, signal_id=None):
+            return _provider_memo("openai", "approve", confidence=0.8)
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+        return [
+            TradeIntent(
+                symbol="POET",
+                side="long",
+                entry_price=10.0,
+                confidence=0.85,
+                features={
+                    "research_context": {
+                        "technical": {
+                            "rel_volume": 3.2,
+                            "distance_from_high_pct": -0.01,
+                            "spread_pct": 0.001,
+                        },
+                        "news": [{"headline": "POET announces new customer win"}],
+                        "fundamental": {"name": "POET Technologies", "industry": "Semiconductors"},
+                    }
+                },
+            )
+        ]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_count(**kwargs):
+        return 0
+
+    async def fake_log_signal(**kwargs):
+        return 105
+
+    async def fake_log_ai(**kwargs):
+        return 72
+
+    async def fake_cached_lookup(**kwargs):
+        return None
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_ai_research_memo", fake_log_ai)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", fake_cached_lookup)
+
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=manager,
+    )
+    supervisor.research_committee = ApprovingCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["order"]["id"] == "entry-prefilter-pass"
+    assert manager.calls[0][0].symbol == "POET"
+    assert manager.calls[0][2] == 105
+
+
+@pytest.mark.asyncio
 async def test_ai_entry_gate_approve_continues_to_order_manager(monkeypatch):
     class GateSettings(DummySupervisorSettings):
         auto_entry_enabled = True

@@ -255,6 +255,12 @@ Resume is allowed only after `READY_TO_RESUME`. After intentional resume and a c
 
 The preflight performs no provider API calls. `READY` requires `AI_RESEARCH_ENABLED=true`, a real provider such as `anthropic`, an explicit model, the matching provider key present, a positive `AI_RESEARCH_MAX_CALLS_PER_DAY`, a working DB budget count, enough calls remaining for the UTC day, and a bounded timeout. It also prints the effective `AI entry gate enabled` state after runtime config is applied. It prints only `key_present=true/false`; never key values, prefixes, or lengths.
 
+Before any paid provider call, the deterministic paid-AI prefilter can block obvious low-conviction candidates such as weak relative-volume moves, high-chase setups without catalyst/news, or additional leveraged/inverse exposure when the account already holds inverse/volatility positions. Prefilter blocks are audited as `ai_paid_prefilter/v0`, do not consume paid budget, and cannot approve trades. Disable only for a deliberate experiment:
+
+```bash
+AI_PAID_PREFILTER_ENABLED=false
+```
+
 After preflight is `READY`, run a no-order rehearsal against the real current candidate packet:
 
 ```bash

@@ -20,6 +20,12 @@ from auto_trader.intelligence.ai_committee import (
     real_research_providers,
     research_committee_round,
 )
+from auto_trader.intelligence.ai_paid_prefilter import (
+    PREFILTER_MODEL_TAG,
+    PREFILTER_PROMPT_VERSION,
+    PREFILTER_PROVIDER,
+    evaluate_paid_ai_prefilter,
+)
 from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.fred_client import FredClient
 from auto_trader.intelligence.research_context import build_risk_research_context, with_research_context
@@ -892,6 +898,74 @@ class TradingSupervisor:
                         reason=f"ai_research_cached_{cached_verdict}",
                         called_provider=False,
                     )
+            prefilter = evaluate_paid_ai_prefilter(intent, settings=self.settings)
+            if prefilter.blocked:
+                prefilter_already_logged = False
+                if len(real_providers) == 1:
+                    try:
+                        prefilter_already_logged = await get_latest_ai_research_memo_for_symbol(
+                            provider=PREFILTER_PROVIDER,
+                            symbol=intent.symbol,
+                            today_utc=True,
+                            prompt_versions=(PREFILTER_PROMPT_VERSION,),
+                        ) is not None
+                    except Exception as e:
+                        log.warning(
+                            "ai_paid_prefilter_dedupe_lookup_failed",
+                            symbol=intent.symbol.upper(),
+                            error=str(e),
+                        )
+                if not prefilter_already_logged:
+                    await log_ai_research_memo(
+                        signal_id=signal_id,
+                        symbol=intent.symbol,
+                        provider=PREFILTER_PROVIDER,
+                        model_tag=PREFILTER_MODEL_TAG,
+                        prompt_version=PREFILTER_PROMPT_VERSION,
+                        input_hash=digest,
+                        verdict="watch",
+                        confidence=None,
+                        used_only_provided_data=True,
+                        validation_passed=True,
+                        memo={
+                            "input_packet": packet,
+                            "committee": {
+                                "symbol": intent.symbol.upper(),
+                                "verdict": "watch",
+                                "confidence": None,
+                                "used_only_provided_data": True,
+                                "validation_errors": [],
+                                "judge_summary": (
+                                    "Paid AI research skipped by deterministic prefilter: "
+                                    + ", ".join(prefilter.reasons)
+                                ),
+                            },
+                            "prefilter": {
+                                "reasons": prefilter.reasons,
+                                "evidence": prefilter.evidence,
+                                "providers_saved": real_providers,
+                            },
+                        },
+                    )
+                else:
+                    log.info(
+                        "ai_paid_prefilter_skip_deduped",
+                        symbol=intent.symbol.upper(),
+                        reasons=prefilter.reasons,
+                    )
+                log.info(
+                    "ai_paid_prefilter_blocked",
+                    symbol=intent.symbol.upper(),
+                    reasons=prefilter.reasons,
+                    evidence=prefilter.evidence,
+                )
+                return AIResearchRunResult(
+                    symbol=intent.symbol.upper(),
+                    verdict="watch",
+                    validation_passed=True,
+                    reason="ai_paid_prefilter_blocked:" + ",".join(prefilter.reasons),
+                    called_provider=False,
+                )
             for provider_name in real_providers:
                 existing = await count_ai_research_memos(provider=provider_name, input_hash=digest)
                 if existing is None:
