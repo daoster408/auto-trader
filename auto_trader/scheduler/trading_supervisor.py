@@ -30,6 +30,7 @@ from auto_trader.persistence.db import (
     count_ai_research_chargeable_attempts,
     count_entry_orders_since,
     count_ai_research_memos,
+    get_latest_ai_research_memo_for_symbol,
     get_latest_entry_order_for_symbol,
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
@@ -764,8 +765,16 @@ class TradingSupervisor:
             default=bool(getattr(self.settings, "ai_entry_gate_enabled", False)),
         )
         ai_result: AIResearchRunResult | None = None
-        if ai_research_enabled:
+        real_providers = real_research_providers(self.research_committee)
+        paid_research_allowed = ai_gate_enabled or not real_providers
+        if ai_research_enabled and paid_research_allowed:
             ai_result = await self._run_ai_research(intent, signal_id=signal_id)
+        elif ai_research_enabled and real_providers:
+            log.info(
+                "paid_ai_research_skipped_gate_disabled",
+                symbol=intent.symbol.upper(),
+                providers=real_providers,
+            )
         elif ai_gate_enabled:
             ai_result = AIResearchRunResult(
                 symbol=intent.symbol.upper(),
@@ -845,6 +854,44 @@ class TradingSupervisor:
         model_tag = str(getattr(self.research_committee, "model_tag", provider))
         real_providers = real_research_providers(self.research_committee)
         if real_providers:
+            if len(real_providers) == 1:
+                try:
+                    cached = await get_latest_ai_research_memo_for_symbol(
+                        provider=real_providers[0],
+                        symbol=intent.symbol,
+                        today_utc=True,
+                        prompt_versions=("ai_research_committee/v0", "ai_research_failure/v0"),
+                    )
+                except Exception as e:
+                    log.warning(
+                        "ai_research_symbol_day_cache_failed",
+                        symbol=intent.symbol.upper(),
+                        provider=real_providers[0],
+                        error=str(e),
+                    )
+                    return AIResearchRunResult(
+                        symbol=intent.symbol.upper(),
+                        verdict="watch",
+                        validation_passed=False,
+                        reason="ai_research_symbol_day_cache_failed",
+                        called_provider=False,
+                    )
+                if cached is not None:
+                    cached_verdict = str(cached.get("verdict") or "watch")
+                    log.info(
+                        "ai_research_symbol_day_cache_hit",
+                        symbol=intent.symbol.upper(),
+                        provider=real_providers[0],
+                        verdict=cached_verdict,
+                        memo_id=cached.get("id"),
+                    )
+                    return AIResearchRunResult(
+                        symbol=intent.symbol.upper(),
+                        verdict=cached_verdict,
+                        validation_passed=bool(cached.get("validation_passed")),
+                        reason=f"ai_research_cached_{cached_verdict}",
+                        called_provider=False,
+                    )
             for provider_name in real_providers:
                 existing = await count_ai_research_memos(provider=provider_name, input_hash=digest)
                 if existing is None:
@@ -882,39 +929,62 @@ class TradingSupervisor:
                 )
             remaining_calls = max(0, daily_max - daily_count)
             if daily_max <= 0 or remaining_calls < attempts_needed:
-                await log_ai_research_memo(
-                    signal_id=signal_id,
-                    symbol=intent.symbol,
-                    provider=provider,
-                    model_tag=model_tag,
-                    prompt_version="ai_research_budget/v0",
-                    input_hash=digest,
-                    verdict="watch",
-                    confidence=None,
-                    used_only_provided_data=True,
-                    validation_passed=False,
-                    memo={
-                        "input_packet": packet,
-                        "committee": {
-                            "symbol": intent.symbol.upper(),
-                            "verdict": "watch",
-                            "confidence": None,
-                            "used_only_provided_data": True,
-                            "validation_errors": ["ai_research_budget_exhausted"],
-                            "judge_summary": (
-                                "Real-provider research skipped because daily paid-call budget is exhausted "
-                                "or not explicitly enabled."
-                            ),
+                budget_skip_already_logged = False
+                if len(real_providers) == 1:
+                    try:
+                        budget_skip_already_logged = await get_latest_ai_research_memo_for_symbol(
+                            provider=real_providers[0],
+                            symbol=intent.symbol,
+                            today_utc=True,
+                            prompt_versions=("ai_research_budget/v0",),
+                        ) is not None
+                    except Exception as e:
+                        log.warning(
+                            "ai_research_budget_skip_lookup_failed",
+                            symbol=intent.symbol.upper(),
+                            provider=real_providers[0],
+                            error=str(e),
+                        )
+                if not budget_skip_already_logged:
+                    await log_ai_research_memo(
+                        signal_id=signal_id,
+                        symbol=intent.symbol,
+                        provider=provider,
+                        model_tag=model_tag,
+                        prompt_version="ai_research_budget/v0",
+                        input_hash=digest,
+                        verdict="watch",
+                        confidence=None,
+                        used_only_provided_data=True,
+                        validation_passed=False,
+                        memo={
+                            "input_packet": packet,
+                            "committee": {
+                                "symbol": intent.symbol.upper(),
+                                "verdict": "watch",
+                                "confidence": None,
+                                "used_only_provided_data": True,
+                                "validation_errors": ["ai_research_budget_exhausted"],
+                                "judge_summary": (
+                                    "Real-provider research skipped because daily paid-call budget is exhausted "
+                                    "or not explicitly enabled."
+                                ),
+                            },
+                            "budget": {
+                                "daily_max": daily_max,
+                                "daily_count": daily_count,
+                                "remaining_calls": remaining_calls,
+                                "attempts_needed": attempts_needed,
+                                "providers": real_providers,
+                            },
                         },
-                        "budget": {
-                            "daily_max": daily_max,
-                            "daily_count": daily_count,
-                            "remaining_calls": remaining_calls,
-                            "attempts_needed": attempts_needed,
-                            "providers": real_providers,
-                        },
-                    },
-                )
+                    )
+                else:
+                    log.info(
+                        "ai_research_budget_skip_deduped",
+                        symbol=intent.symbol.upper(),
+                        provider=real_providers[0],
+                    )
                 return AIResearchRunResult(
                     symbol=intent.symbol.upper(),
                     verdict="watch",

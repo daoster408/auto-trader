@@ -340,6 +340,64 @@ async def get_latest_ai_research_memos(limit: int = 10) -> list[dict[str, Any]]:
             return []
 
 
+async def get_latest_ai_research_memo_for_symbol(
+    *,
+    provider: str,
+    symbol: str,
+    today_utc: bool = False,
+    prompt_versions: tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
+    """Return the latest AI memo for a provider/symbol slice."""
+    conditions = ["provider = ?", "upper(symbol) = ?"]
+    params: list[Any] = [str(provider), str(symbol).upper()]
+    if today_utc:
+        conditions.append("date(created_at) = date('now')")
+    if prompt_versions:
+        conditions.append(f"prompt_version IN ({','.join('?' for _ in prompt_versions)})")
+        params.extend(prompt_versions)
+    where = " AND ".join(conditions)
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    f"""
+                    SELECT id, created_at, signal_id, symbol, provider, model_tag,
+                           prompt_version, input_hash, verdict, confidence,
+                           used_only_provided_data, validation_passed, memo_json
+                    FROM ai_research_memos
+                    WHERE {where}
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    tuple(params),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return None
+                return {
+                    "id": row["id"],
+                    "created_at": row["created_at"],
+                    "signal_id": row["signal_id"],
+                    "symbol": row["symbol"],
+                    "provider": row["provider"],
+                    "model_tag": row["model_tag"],
+                    "prompt_version": row["prompt_version"],
+                    "input_hash": row["input_hash"],
+                    "verdict": row["verdict"],
+                    "confidence": row["confidence"],
+                    "used_only_provided_data": bool(row["used_only_provided_data"]),
+                    "validation_passed": bool(row["validation_passed"]),
+                    "memo": json.loads(row["memo_json"] or "{}"),
+                }
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("ai_research_memo_symbol_lookup_failed", provider=provider, symbol=symbol, error=str(e))
+            raise
+
+
 async def count_ai_research_memos(
     *,
     provider: str | None = None,
