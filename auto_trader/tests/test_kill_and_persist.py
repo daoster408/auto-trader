@@ -7,7 +7,9 @@ and verify the safety default to HALTED on failure.
 import asyncio
 import inspect
 import json
+import os
 import sqlite3
+import subprocess
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2615,6 +2617,33 @@ async def test_signal_shutdown_uses_planned_maintenance_marker_once(monkeypatch)
     ) is False
 
 
+def test_oracle_safe_restart_dry_run_arms_marker_before_restart():
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "scripts" / "oracle_safe_restart.sh"
+
+    result = subprocess.run(
+        [str(script)],
+        cwd=repo_root,
+        env={
+            **os.environ,
+            "ORACLE_HOST": "example.invalid",
+            "ORACLE_USER": "ubuntu",
+            "ORACLE_KEY": "/tmp/nonexistent-safe-restart-key",
+            "DRY_RUN": "true",
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    output = result.stdout
+    arm_index = output.index("Arming planned maintenance shutdown marker")
+    restart_index = output.index("Restarting auto-trader with planned-maintenance marker armed")
+    assert arm_index < restart_index
+    assert "auto_trader.maintenance request-shutdown" in output
+    assert "systemctl restart 'auto-trader'" in output
+
+
 @pytest.mark.asyncio
 async def test_stock_snapshots_accepts_top_level_alpaca_payload(monkeypatch):
     """Alpaca snapshots may return symbols at top level instead of under a snapshots key."""
@@ -2939,6 +2968,89 @@ def test_telegram_status_and_report_include_account_position_and_order():
     assert "Open unrealized P/L: $-0.04" in report
     assert "Journal:" in report
     assert "Auto-exit submitted for AMPX" in report
+
+
+def test_telegram_status_and_report_flag_halted_queued_close_orders():
+    sm = StateMachine(initial_state=SystemState.HALTED)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+    snapshot = {
+        "health": {"status": "CONNECTED", "paper": True, "market_open": False},
+        "account": {
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 399.14,
+            "cash": 339.22,
+            "buying_power": 339.22,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        "positions": [
+            {"symbol": "M", "qty": 0.853598, "market_value": 19.44, "unrealized_pl": -0.49},
+            {"symbol": "SPCE", "qty": 4.15677, "market_value": 19.87, "unrealized_pl": -0.06},
+            {"symbol": "TECS", "qty": 3.086001, "market_value": 20.61, "unrealized_pl": 0.68},
+        ],
+        "orders": [],
+        "broker_orders": [
+            {"symbol": "M", "side": "sell", "qty": 0.853598, "status": "accepted"},
+            {"symbol": "SPCE", "side": "sell", "qty": 4.15677, "status": "accepted"},
+            {"symbol": "TECS", "side": "sell", "qty": 3.086001, "status": "accepted"},
+        ],
+        "pending_exits": [],
+        "journal_entries": [],
+        "reconciled": 14,
+        "today_new_entries": 3,
+        "runtime_config": {"auto_entry_enabled": "true"},
+        "errors": [],
+    }
+
+    status = bot._build_status_message(snapshot)
+    report = bot._build_report_message(snapshot)
+
+    assert "State: HALTED" in status
+    assert "Warnings: HALTED with queued close orders pending for: M, SPCE, TECS" in status
+    assert "Warnings: HALTED with queued close orders pending for: M, SPCE, TECS" in report
+
+
+def test_telegram_status_flags_halted_positions_without_queued_close_orders():
+    sm = StateMachine(initial_state=SystemState.HALTED)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+    snapshot = {
+        "health": {"status": "CONNECTED", "paper": True, "market_open": False},
+        "account": {
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 399.14,
+            "cash": 339.22,
+            "buying_power": 339.22,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        "positions": [{"symbol": "M", "qty": 0.853598, "market_value": 19.44, "unrealized_pl": -0.49}],
+        "orders": [],
+        "broker_orders": [],
+        "pending_exits": [],
+        "journal_entries": [],
+        "reconciled": 14,
+        "today_new_entries": 3,
+        "runtime_config": {"auto_entry_enabled": "true"},
+        "errors": [],
+    }
+
+    status = bot._build_status_message(snapshot)
+
+    assert "Warnings: HALTED with open positions and no queued close order detected" in status
 
 
 @pytest.mark.asyncio

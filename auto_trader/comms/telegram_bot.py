@@ -110,6 +110,39 @@ def _format_pending_exits(pending_exits: list[dict[str, Any]], orders: list[dict
     return "\n".join(lines)
 
 
+def _queued_close_order_warnings(
+    *,
+    state: str,
+    positions: list[dict[str, Any]],
+    orders: list[dict[str, Any]],
+) -> list[str]:
+    if state != "HALTED" or not positions:
+        return []
+    position_qty: dict[str, float] = {}
+    for pos in positions:
+        symbol = str(pos.get("symbol", "")).upper()
+        try:
+            qty = float(pos.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if symbol and abs(qty) > 0:
+            position_qty[symbol] = qty
+    close_symbols: list[str] = []
+    for order in orders:
+        symbol = str(order.get("symbol", "")).upper()
+        side = str(order.get("side", "")).lower()
+        status = str(order.get("status", "")).lower()
+        qty = position_qty.get(symbol)
+        if qty is None or status not in {"accepted", "new", "pending_new", "pending"}:
+            continue
+        if (qty > 0 and side == "sell") or (qty < 0 and side in {"buy", "buy_to_cover"}):
+            close_symbols.append(symbol)
+    if not close_symbols:
+        return ["HALTED with open positions and no queued close order detected"]
+    symbols = ", ".join(sorted(set(close_symbols)))
+    return [f"HALTED with queued close orders pending for: {symbols}"]
+
+
 def _format_journal_entries(entries: list[dict[str, Any]]) -> str:
     if not entries:
         return "Journal: no entries yet"
@@ -366,6 +399,11 @@ class TelegramBot:
             cash=float(account.get("cash") or 0.0),
             open_positions=positions,
         )
+        state_warnings = _queued_close_order_warnings(
+            state=snap.state.value,
+            positions=positions,
+            orders=broker_orders + orders,
+        )
         max_positions = _runtime_int_from_values(
             runtime_config,
             "max_new_positions_per_day",
@@ -401,8 +439,9 @@ class TelegramBot:
         ]
         if snapshot.get("reconciled") is not None:
             lines.append(f"Orders reconciled: {snapshot['reconciled']}")
-        if errors:
-            lines.append("Warnings: " + "; ".join(str(e) for e in errors))
+        warnings = [str(e) for e in errors] + state_warnings
+        if warnings:
+            lines.append("Warnings: " + "; ".join(warnings))
         lines.append(f"Last updated: {snap.updated_at.isoformat()}Z")
         return "\n".join(lines)
 
@@ -453,6 +492,11 @@ class TelegramBot:
         errors = snapshot.get("errors") or []
         unrealized = sum(float(p.get("unrealized_pl") or 0.0) for p in positions)
         exposure = sum(abs(float(p.get("market_value") or 0.0)) for p in positions)
+        state_warnings = _queued_close_order_warnings(
+            state=self.sm.state.value,
+            positions=positions,
+            orders=broker_orders + orders,
+        )
         lines = [
             "DAILY REPORT",
             f"State: {self.sm.state.value}",
@@ -470,8 +514,9 @@ class TelegramBot:
             f"Generated at: {datetime.now(UTC).isoformat()}Z",
             _format_journal_entries(journal_entries),
         ]
-        if errors:
-            lines.append("Warnings: " + "; ".join(str(e) for e in errors))
+        warnings = [str(e) for e in errors] + state_warnings
+        if warnings:
+            lines.append("Warnings: " + "; ".join(warnings))
         return "\n".join(lines)
 
     async def _kill_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

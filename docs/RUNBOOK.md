@@ -138,12 +138,18 @@ Manual stop:
 sudo systemctl stop auto-trader
 ```
 
-Because Oracle uses `SHUTDOWN_FLATTEN_ON_EXIT=true`, an unmarked manual stop or restart intentionally persists `HALTED` and may flatten positions before shutdown.
+Because Oracle uses `SHUTDOWN_FLATTEN_ON_EXIT=true`, an unmarked manual stop or restart intentionally persists `HALTED` and may flatten positions before shutdown. Do not run raw `sudo systemctl restart auto-trader` while this setting is enabled.
 
 Planned maintenance deploys should use the one-shot maintenance marker instead of a hard kill or an unmarked restart. The marker is short-lived, consumed once by the old process on `SIGTERM`, and lets a normal `systemctl restart` preserve the active paper lifecycle:
 
 ```bash
 ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_planned_deploy.sh
+```
+
+For env reloads or restarts without syncing code, use the safe restart helper, which arms the same planned-maintenance marker before sending SIGTERM:
+
+```bash
+ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_safe_restart.sh
 ```
 
 The currently running process must already support the maintenance marker. The script checks a runtime capability marker written by the active systemd `MainPID`; checking files on disk is not enough. If the script reports that the remote service does not support planned maintenance, it will refuse the normal path before syncing code. For the one-time first rollout of the maintenance feature in paper mode only, use the guarded bootstrap path:
