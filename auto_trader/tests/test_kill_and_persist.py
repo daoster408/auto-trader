@@ -36,10 +36,12 @@ from auto_trader.ai_research_preflight import (
 import auto_trader.ai_research_smoke as ai_research_smoke
 import auto_trader.ai_entry_gate_rehearsal as ai_entry_gate_rehearsal
 from auto_trader.ai_entry_gate_rehearsal import run_ai_entry_gate_rehearsal, render_ai_entry_gate_rehearsal
+from auto_trader.ai_rehearsal_batch import run_ai_rehearsal_batch, render_ai_rehearsal_batch
 from auto_trader.ai_research_smoke import run_ai_research_smoke
 from auto_trader.ai_research_smoke import render_ai_research_smoke
 from auto_trader.friday_recovery_check import build_friday_recovery_report, recovery_exit_code
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
+from auto_trader.week2_launchpad import build_week2_launchpad_report, launchpad_exit_code
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.risk_profile import get_risk_profile
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
@@ -2857,6 +2859,237 @@ def test_friday_recovery_check_rejects_inactive_account_status_substring():
     assert "Recovery state: FAIL" in report
     assert "[FAIL] broker account tradable" in report
     assert recovery_exit_code(gates, report) == 2
+
+
+def test_week2_launchpad_reports_halted_positions_and_blocks_resume():
+    report, gates = build_week2_launchpad_report(
+        settings=DummySupervisorSettings(),
+        system_state=SystemState.HALTED,
+        system_meta={"halt_reason": "signal_15"},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": False},
+        positions=[
+            {"symbol": "TZA", "qty": 4.499099, "market_value": 20.97, "unrealized_pl": 0.94},
+            {"symbol": "UVXY", "qty": 0.677388, "market_value": 20.83, "unrealized_pl": 0.88},
+        ],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={"risk_profile": "risky", "auto_entry_enabled": "true", "ai_entry_gate_enabled": "true"},
+        today_new_entries=0,
+        ai_calls_used=2,
+    )
+
+    assert "WEEK 2 LAUNCHPAD" in report
+    assert "Bot state: HALTED" in report
+    assert "Risk profile: risky" in report
+    assert "Resume allowed: NO" in report
+    assert "stay HALTED" in report
+    assert "TZA: qty" in report
+    assert "UVXY: qty" in report
+    assert launchpad_exit_code(gates) == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_rehearsal_batch_prefilters_then_shadow_reviews(monkeypatch, tmp_path):
+    db_path = tmp_path / "ai_rehearsal_batch.db"
+
+    settings = type(
+        "BatchSettings",
+        (DummySupervisorSettings,),
+        {
+            "db_path": str(db_path),
+            "max_new_positions_per_day": 3,
+            "risk_profile": "conservative",
+            "ai_research_max_calls_per_day": 5,
+            "ai_paid_prefilter_enabled": True,
+        },
+    )()
+
+    class FakeAdapter:
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 400.0,
+                "cash": 380.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": False, "source": "alpaca"}
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    async def fake_signals(*args, **kwargs):
+        return [
+            TradeIntent(
+                symbol="LOWV",
+                side="long",
+                entry_price=10.0,
+                confidence=0.6,
+                rationale="low volume test",
+                features={
+                    "discovery": {"score": 5.0, "rel_volume": 0.2, "change_pct": 0.02, "spread_pct": 0.003},
+                    "research_context": {
+                        "market": {"provider": "test"},
+                        "technical": {
+                            "rel_volume": 0.2,
+                            "distance_from_high_pct": -0.01,
+                            "spread_pct": 0.003,
+                        },
+                    },
+                },
+            ),
+            TradeIntent(
+                symbol="PASS",
+                side="long",
+                entry_price=12.0,
+                confidence=0.82,
+                rationale="shadow review test",
+                features={
+                    "discovery": {"score": 6.0, "rel_volume": 3.0, "change_pct": 0.03, "spread_pct": 0.003},
+                    "research_context": {
+                        "market": {"provider": "test"},
+                        "technical": {
+                            "rel_volume": 3.0,
+                            "distance_from_high_pct": -0.01,
+                            "spread_pct": 0.003,
+                        },
+                    },
+                },
+            ),
+        ]
+
+    monkeypatch.setattr("auto_trader.ai_rehearsal_batch.get_simple_rules_signals", fake_signals)
+
+    result = await run_ai_rehearsal_batch(limit=2, paid=False, settings=settings, adapter=FakeAdapter())
+    rendered = render_ai_rehearsal_batch(result)
+
+    assert result.ok is True
+    assert result.generated == 2
+    assert result.blocked_by_prefilter == 1
+    assert result.reviewed == 1
+    assert result.approved_for_risk_engine == 1
+    assert result.provider == "shadow"
+    assert result.used_before == result.used_after == 0
+    assert "LOWV: prefilter=block:low_relative_volume" in rendered
+    assert "PASS: prefilter=pass, verdict=approve" in rendered
+
+
+@pytest.mark.asyncio
+async def test_ai_rehearsal_batch_paid_mode_blocks_when_budget_count_unavailable(monkeypatch, tmp_path):
+    settings = type(
+        "PaidBatchSettings",
+        (DummySupervisorSettings,),
+        {
+            "db_path": str(tmp_path / "paid_batch_budget.db"),
+            "ai_research_provider": "anthropic",
+            "ai_research_model": "claude-opus-4-8",
+            "ai_research_max_calls_per_day": 5,
+        },
+    )()
+
+    async def missing_budget(*args, **kwargs):
+        return None
+
+    async def fail_if_discovery_runs(*args, **kwargs):
+        raise AssertionError("paid batch should not discover candidates when budget count is unavailable")
+
+    monkeypatch.setattr("auto_trader.ai_rehearsal_batch.count_ai_research_chargeable_attempts", missing_budget)
+    monkeypatch.setattr("auto_trader.ai_rehearsal_batch.get_simple_rules_signals", fail_if_discovery_runs)
+
+    result = await run_ai_rehearsal_batch(limit=2, paid=True, settings=settings, adapter=object())
+
+    assert result.ok is False
+    assert result.reason == "chargeable budget count unavailable"
+    assert result.generated == 0
+    assert result.reviewed == 0
+
+
+@pytest.mark.asyncio
+async def test_ai_rehearsal_batch_paid_provider_failure_counts_chargeable(monkeypatch, tmp_path):
+    db_path = tmp_path / "paid_batch_failure.db"
+    settings = type(
+        "PaidFailureBatchSettings",
+        (DummySupervisorSettings,),
+        {
+            "db_path": str(db_path),
+            "ai_research_provider": "anthropic",
+            "ai_research_model": "claude-opus-4-8",
+            "ai_research_max_calls_per_day": 5,
+        },
+    )()
+
+    class FakeAdapter:
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 400.0,
+                "cash": 380.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": False, "source": "alpaca"}
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    class FailingCommittee:
+        provider = "anthropic"
+
+        async def research(self, intent, *, signal_id=None):
+            raise RuntimeError("provider unavailable")
+
+    async def fake_signals(*args, **kwargs):
+        return [
+            TradeIntent(
+                symbol="PAID",
+                side="long",
+                entry_price=12.0,
+                confidence=0.82,
+                rationale="paid failure audit test",
+                features={
+                    "discovery": {"score": 6.0, "rel_volume": 3.0, "change_pct": 0.03, "spread_pct": 0.003},
+                    "research_context": {
+                        "market": {"provider": "test"},
+                        "technical": {
+                            "rel_volume": 3.0,
+                            "distance_from_high_pct": -0.01,
+                            "spread_pct": 0.003,
+                        },
+                    },
+                },
+            )
+        ]
+
+    monkeypatch.setattr("auto_trader.ai_rehearsal_batch.get_simple_rules_signals", fake_signals)
+
+    result = await run_ai_rehearsal_batch(
+        limit=1,
+        paid=True,
+        settings=settings,
+        adapter=FakeAdapter(),
+        committee=FailingCommittee(),
+    )
+
+    assert result.ok is True
+    assert result.reviewed == 1
+    assert result.candidates[0].verdict == "watch"
+    assert result.candidates[0].validation_passed is False
+    assert result.candidates[0].reason.startswith("AI review failed")
+    assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 1
 
 
 @pytest.mark.asyncio

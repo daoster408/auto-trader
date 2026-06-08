@@ -381,3 +381,39 @@ scripts/live_preflight.sh --max-equity 500 --max-new-positions 3
 - The preflight also requires an explicit runtime `auto_entry_enabled` value so live cutover cannot depend on an accidental settings default.
 - After a reviewed switch to `ALPACA_PAPER=false`, rerun only with `--allow-current-live`; use `--allow-open-positions` only for a reviewed in-position validation window.
 - Get explicit live cutover approval.
+
+### Week 2 Launchpad And Batch Rehearsal
+
+Use the Week 2 launchpad when you need one read-only cockpit view before a market session or deploy decision:
+
+```bash
+scripts/week2_launchpad.sh
+```
+
+On Oracle:
+
+```bash
+ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_week2_launchpad.sh
+```
+
+The launchpad reads service/broker state through the configured environment and prints bot state, account status, market clock, positions, open orders, pending exits, risk profile, runtime auto-entry, runtime AI gate, paid AI budget usage, resume eligibility, and the next expected bot behavior. It does not submit, cancel, reconcile, resume, or call paid AI providers.
+
+For Sunday-night or premarket candidate learning without orders, run the AI rehearsal batch:
+
+```bash
+scripts/ai_rehearsal_batch.sh --limit 10
+```
+
+On Oracle:
+
+```bash
+ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_ai_rehearsal_batch.sh --limit 10
+```
+
+Default batch mode is `SHADOW`, which generates live candidates, adds risk/Finnhub/FRED context when configured, runs the deterministic paid-AI prefilter, then uses the zero-cost shadow committee for candidates that pass. It never imports `OrderManager`, never calls `RiskEngine`, and never submits orders. Use paid mode only during an explicit provider-budget experiment:
+
+```bash
+scripts/ai_rehearsal_batch.sh --limit 5 --paid
+```
+
+Paid mode can consume real provider budget. Keep it off for broad Sunday batches unless the goal is specifically to test provider behavior.

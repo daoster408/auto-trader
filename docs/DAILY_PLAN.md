@@ -1339,3 +1339,55 @@ Append-only by day. Do not remove past entries.
   - Runtime switch does not bypass RiskEngine or daily-entry limits.
 - Confidence:
   - high
+
+## 2026-06-07 (America/Los_Angeles) - Week 2 Sunday Launchpad
+
+- Date (local): 2026-06-07
+- Date (UTC): 2026-06-08
+- Role: Engineer
+- Session AI/model: openai/gpt-5-codex
+- DONE:
+  - Planned the Week 2 burn-the-ocean docket:
+    - Monday: clean HALTED recovery/resume only when safe, verify notification hygiene, run AI gate in paper mode.
+    - Tuesday: improve AI committee evidence quality and provider comparison.
+    - Wednesday: improve candidate discovery quality so paid AI sees fewer junk setups.
+    - Thursday: improve exit quality and paper-only hold/trim logic.
+    - Friday: scorecard review and live-money readiness gap assessment.
+  - Added a read-only Week 2 launchpad report:
+    - Oracle/broker snapshot state;
+    - bot state and halt reason;
+    - paper/live mode;
+    - market clock;
+    - account equity/cash/tradability;
+    - risk profile;
+    - runtime auto-entry and AI gate;
+    - paid AI budget used/max;
+    - positions, open orders, pending exits;
+    - resume allowed YES/NO;
+    - what the bot would do next.
+  - Added a no-order AI rehearsal batch:
+    - default `SHADOW` mode has zero paid provider calls;
+    - optional `--paid` mode can call real providers inside configured budget;
+    - flow is candidate -> risk context -> deterministic paid-AI prefilter -> AI/shadow verdict;
+    - no OrderManager, no RiskEngine invocation, no order submission.
+  - Added local and Oracle wrappers:
+    - `scripts/week2_launchpad.sh`;
+    - `scripts/oracle_week2_launchpad.sh`;
+    - `scripts/ai_rehearsal_batch.sh`;
+    - `scripts/oracle_ai_rehearsal_batch.sh`.
+  - Documented the new tools in `docs/RUNBOOK.md`.
+- IN_PROGRESS:
+  - Reviewer/Optimizer post-code review pending.
+- NEXT:
+  - Apply required review fixes if any.
+  - Commit, push, deploy to Oracle with planned-maintenance helper.
+  - Run Oracle launchpad and a shadow batch after deployment.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Focused tests: `2 passed`.
+  - Full suite: `191 passed`.
+  - `compileall` for touched modules/tests: passed.
+  - `git diff --check`: clean.
+- Confidence:
+  - high
