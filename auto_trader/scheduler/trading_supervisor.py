@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -48,6 +49,7 @@ from auto_trader.persistence.db import (
     log_ai_research_memo,
     log_signal,
     reconcile_broker_orders,
+    set_runtime_config_value,
     update_account_risk_state,
     upsert_pending_exit,
     upsert_order_record,
@@ -169,6 +171,15 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 def _now_utc() -> str:
     return datetime.now(UTC).isoformat() + "Z"
+
+
+def _alert_signature(message: str) -> str:
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
+
+
+def _alert_config_key(key: str) -> str:
+    safe = "".join(ch if ch.isalnum() else "_" for ch in key.lower()).strip("_")
+    return f"alert_{safe or 'supervisor'}"[:120]
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -435,20 +446,54 @@ class TradingSupervisor:
             else ShadowResearchCommittee()
         )
 
-    async def _notify(self, message: str) -> None:
+    def _alert_local_date(self) -> str:
+        timezone = ZoneInfo(getattr(self.settings, "report_timezone", "America/Los_Angeles"))
+        return datetime.now(timezone).date().isoformat()
+
+    async def _notify(self, message: str) -> bool:
         log.warning("supervisor_alert", message=message)
         if self.notifier is None:
-            return
+            return True
         try:
             await self.notifier(message)
+            return True
         except Exception as e:
             log.error("supervisor_notify_failed", error=str(e))
+            return False
 
-    async def _notify_once(self, key: str, message: str) -> None:
+    async def _notify_once(self, key: str, message: str) -> bool:
         if key in self._seen_alert_keys:
-            return
+            return False
         self._seen_alert_keys.add(key)
-        await self._notify(message)
+        return await self._notify(message)
+
+    async def _notify_persisted_once(
+        self,
+        key: str,
+        message: str,
+        *,
+        marker: str | None = None,
+    ) -> bool:
+        """Notify once per durable marker so planned restarts do not re-alert stale state."""
+        marker_value = (marker or f"{self._alert_local_date()}:{_alert_signature(message)}").lower()
+        config_key = _alert_config_key(f"{key}_{_alert_signature(marker_value)}")
+        try:
+            existing_marker = await get_runtime_config_value(config_key)
+        except Exception as e:
+            log.warning("supervisor_alert_marker_read_failed", key=config_key, error=str(e))
+            return await self._notify_once(f"{key}:{marker_value}", message)
+        if existing_marker == marker_value:
+            log.info("supervisor_alert_deduped_persistent", key=config_key, marker=marker_value)
+            return False
+
+        sent = await self._notify_once(f"{key}:{marker_value}", message)
+        if not sent:
+            return False
+        try:
+            await set_runtime_config_value(config_key, marker_value)
+        except Exception as e:
+            log.warning("supervisor_alert_marker_write_failed", key=config_key, marker=marker_value, error=str(e))
+        return True
 
     async def _halt_and_flatten(self, reason: str) -> KillResult:
         async def flatten() -> KillResult:
@@ -638,9 +683,10 @@ class TradingSupervisor:
         if not decision.should_exit:
             return None
         if self.sm.state.value == "HALTED":
-            await self._notify_once(
+            await self._notify_persisted_once(
                 f"exit-suppressed-halted-{decision.symbol}",
                 f"EXIT SUPPRESSED: system is HALTED; supervisor will not close {decision.symbol}.",
+                marker=f"{self._alert_local_date()}:{decision.symbol.lower()}:{_alert_signature(decision.reason)}",
             )
             return None
         if not self.settings.auto_exit_enabled:
@@ -1317,7 +1363,7 @@ class TradingSupervisor:
         if errors:
             alert = "SUPERVISOR WARNING: " + "; ".join(errors)
             alerts.append(alert)
-            await self._notify_once(f"supervisor-errors-{datetime.now(UTC).date()}", alert)
+            await self._notify_persisted_once("supervisor-errors", alert)
         alerted_error_count = len(errors)
 
         open_positions = [p for p in positions if abs(_float(p.get("qty"))) > 0]
@@ -1335,9 +1381,17 @@ class TradingSupervisor:
             log.info("positions_monitored", count=len(open_positions), summary=alert)
 
         if self.sm.state.value == "HALTED" and open_positions:
-            alert = "HALTED POSITION WARNING: broker still reports open positions after HALTED state."
+            symbols = ", ".join(sorted(open_symbols))
+            alert = (
+                "HALTED POSITION WARNING: broker still reports open positions after HALTED state"
+                f": {symbols}."
+            )
             alerts.append(alert)
-            await self._notify_once("halted-positions-open", alert)
+            await self._notify_persisted_once(
+                "halted-positions-open",
+                alert,
+                marker=f"{self._alert_local_date()}:{','.join(sorted(symbol.lower() for symbol in open_symbols))}",
+            )
 
         for position in open_positions:
             try:
@@ -1368,7 +1422,7 @@ class TradingSupervisor:
         if len(errors) > alerted_error_count:
             alert = "SUPERVISOR WARNING: " + "; ".join(errors)
             alerts.append(alert)
-            await self._notify_once(f"supervisor-late-errors-{datetime.now(UTC).date()}", alert)
+            await self._notify_persisted_once("supervisor-late-errors", alert)
 
         if account is not None and clock is not None and not errors:
             try:
@@ -1402,7 +1456,7 @@ class TradingSupervisor:
             "auto_entry_enabled",
             default=bool(self.settings.auto_entry_enabled),
         )
-        await self._notify_once(
+        await self._notify_persisted_once(
             "supervisor-started",
             (
                 "TRADING SUPERVISOR STARTED: "
@@ -1410,12 +1464,17 @@ class TradingSupervisor:
                 f"auto_exit={self.settings.auto_exit_enabled}, "
                 f"monitor_interval={self.settings.position_monitor_interval_seconds}s"
             ),
+            marker=(
+                f"{self._alert_local_date()}:{bool(effective_auto_entry)}:"
+                f"{bool(self.settings.auto_exit_enabled)}:"
+                f"{self.settings.position_monitor_interval_seconds}:{self.sm.state.value.lower()}"
+            ),
         )
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(self.tick_once(), timeout=float(self.settings.supervisor_tick_timeout_seconds))
             except asyncio.TimeoutError:
-                await self._notify_once("supervisor-timeout", "SUPERVISOR WARNING: tick timed out.")
+                await self._notify_persisted_once("supervisor-timeout", "SUPERVISOR WARNING: tick timed out.")
             except Exception as e:
                 await self._notify_once("supervisor-failed", f"SUPERVISOR WARNING: tick failed: {e}")
                 log.exception("supervisor_tick_failed", error=str(e))

@@ -779,6 +779,34 @@ async def test_runtime_capabilities_record_current_process_pid():
 
 
 @pytest.mark.asyncio
+async def test_supervisor_persistent_alert_dedupes_across_instances(tmp_path):
+    configure_db_path(tmp_path / "alert_dedupe.db")
+    await init_db()
+    notifications: list[str] = []
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    def build_supervisor():
+        return TradingSupervisor(
+            settings=DummySupervisorSettings(),
+            state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+            adapter=object(),
+            order_manager=object(),
+            notifier=fake_notify,
+        )
+
+    message = "TRADING SUPERVISOR STARTED: auto_entry=True, auto_exit=True, monitor_interval=60s"
+
+    assert await build_supervisor()._notify_persisted_once("supervisor-started", message) is True
+    assert await build_supervisor()._notify_persisted_once("supervisor-started", message) is False
+
+    assert notifications == [message]
+    values = await get_runtime_config_values()
+    assert any(key.startswith("alert_supervisor_started_") for key in values)
+
+
+@pytest.mark.asyncio
 async def test_signal_log_persists_features_json():
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "signals.db"
@@ -5753,7 +5781,9 @@ async def test_supervisor_clears_persisted_pending_exit_after_position_disappear
 
 
 @pytest.mark.asyncio
-async def test_supervisor_halted_suppresses_auto_exit(monkeypatch):
+async def test_supervisor_halted_suppresses_auto_exit(monkeypatch, tmp_path):
+    configure_db_path(tmp_path / "halted_exit.db")
+    await init_db()
     sm = StateMachine(initial_state=SystemState.HALTED)
     notifications = []
 
@@ -5828,6 +5858,7 @@ async def test_supervisor_halted_suppresses_auto_exit(monkeypatch):
     assert result.exit_decisions[0].reason == "position take profit reached"
     assert adapter.close_calls == 0
     assert any("HALTED POSITION WARNING" in message for message in notifications)
+    assert any("AMPX" in message for message in notifications if "HALTED POSITION WARNING" in message)
     assert any("EXIT SUPPRESSED: system is HALTED" in message for message in notifications)
 
 
