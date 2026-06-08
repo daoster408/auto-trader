@@ -308,10 +308,10 @@ AI_RESEARCH_PROVIDERS=anthropic,openai,xai
 AI_RESEARCH_ANTHROPIC_MODEL=claude-opus-4-8
 AI_RESEARCH_OPENAI_MODEL=<chosen-openai-model>
 AI_RESEARCH_XAI_MODEL=<chosen-grok-model>
-AI_RESEARCH_MAX_CALLS_PER_DAY=3
+AI_RESEARCH_MAX_CALLS_PER_DAY=12
 ```
 
-One committee round consumes one chargeable call per selected real provider, and preflight reports how many full rounds remain from the current daily budget. The v1 aggregate is deterministic: at least two valid provider approvals with confidence >= 0.65 and no valid reject can produce an AI advisory `approve`; any valid reject produces `reject`; everything else is `watch`. Invalid provider output, timeouts, and failures are audited but cannot force approval. RiskEngine remains the only execution and sizing authority.
+One committee round consumes one chargeable call per selected real provider; with the Week 2 standing budget of 12 calls/day, the three-provider committee gets four full candidate rounds. Preflight reports how many full rounds remain from the current daily budget. The v1 aggregate is deterministic: at least two valid provider approvals with confidence >= 0.65 and no valid reject can produce an AI advisory `approve`; any valid reject produces `reject`; everything else is `watch`. Invalid provider output, timeouts, and failures are audited but cannot force approval. RiskEngine remains the only execution and sizing authority.
 
 The default `AI_RESEARCH_MAX_CALLS_PER_DAY=0` intentionally reports `NOT_READY`, even when a key is present.
 
