@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any
+from urllib.request import Request, urlopen
 
 from auto_trader.account_risk_validate import ValidationGate, validation_exit_code
 from auto_trader.config.settings import get_settings
@@ -46,6 +48,7 @@ class ProviderReadiness:
     model: str
     key_present: bool
     real_provider: bool
+    model_availability: str = "not_checked"
 
 
 @dataclass(frozen=True)
@@ -99,12 +102,46 @@ def _cost_assumptions_from_settings(settings: Any) -> CostAssumptions:
     )
 
 
+def _xai_available_models(api_key: str, *, timeout_seconds: float) -> set[str]:
+    request = Request(
+        "https://api.x.ai/v1/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "auto-trader/0.1",
+        },
+        method="GET",
+    )
+    with urlopen(request, timeout=timeout_seconds) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return {str(row.get("id", "")).strip() for row in payload.get("data", []) if row.get("id")}
+
+
+def _provider_model_availability(settings: Any, providers: list[str], timeout_seconds: float) -> dict[str, str]:
+    """Read-only provider model checks that are cheap enough for operator preflight."""
+    availability: dict[str, str] = {}
+    if "xai" in providers:
+        model = model_for_provider(settings, "xai")
+        api_key = str(getattr(settings, "xai_api_key", "") or "").strip()
+        if not model or not api_key:
+            availability["xai"] = "not_checked"
+        else:
+            try:
+                models = _xai_available_models(api_key, timeout_seconds=min(max(timeout_seconds, 1.0), 15.0))
+            except Exception:
+                availability["xai"] = "error"
+            else:
+                availability["xai"] = "available" if model in models else "unavailable"
+    return availability
+
+
 def build_ai_research_preflight_report(
     *,
     settings: Any,
     used_calls: int | None,
     cost: CostAssumptions | None = None,
     ai_entry_gate_enabled: bool | None = None,
+    model_availability: dict[str, str] | None = None,
 ) -> AIResearchPreflightReport:
     """Build a zero-network readiness report for paid AI research."""
     providers = selected_research_providers(settings)
@@ -115,12 +152,14 @@ def build_ai_research_preflight_report(
         if ai_entry_gate_enabled is None
         else bool(ai_entry_gate_enabled)
     )
+    model_availability = model_availability or {}
     provider_reports = [
         ProviderReadiness(
             provider=name,
             model=model_for_provider(settings, name),
             key_present=False if name == "shadow" else _provider_key_present(settings, name),
             real_provider=name in _PROVIDER_KEY_ATTRS,
+            model_availability=model_availability.get(name, "not_checked"),
         )
         for name in providers
     ]
@@ -134,6 +173,10 @@ def build_ai_research_preflight_report(
     real_provider = all(row.real_provider for row in provider_reports)
     key_present = all(row.key_present for row in provider_reports)
     all_models_present = all(row.model for row in provider_reports)
+    model_availability_ok = all(row.model_availability not in {"unavailable", "error"} for row in provider_reports)
+    model_availability_detail = ", ".join(
+        f"{row.provider}:{row.model or 'n/a'}={row.model_availability}" for row in provider_reports
+    )
     attempts_per_round = len([row for row in provider_reports if row.real_provider])
     remaining_calls = max(0, max_calls - used_calls) if used_calls is not None else None
     cost = cost or _cost_assumptions_from_settings(settings)
@@ -142,6 +185,7 @@ def build_ai_research_preflight_report(
         _gate("AI enabled", enabled, f"AI_RESEARCH_ENABLED={str(enabled).lower()}"),
         _gate("Real provider selected", real_provider, f"AI_RESEARCH_PROVIDER={provider}"),
         _gate("Explicit model", all_models_present, "all provider models are set" if all_models_present else model),
+        _gate("Provider model available", model_availability_ok, model_availability_detail),
         _gate("Provider key present", key_present, "key_present=true" if key_present else "key_present=false"),
         _gate("Daily call budget", max_calls > 0, f"AI_RESEARCH_MAX_CALLS_PER_DAY={max_calls}"),
         _gate(
@@ -207,7 +251,8 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
         lines.extend(
             (
                 f"- {row.provider}: model={row.model or 'n/a'}, "
-                f"key_present={str(row.key_present).lower()}"
+                f"key_present={str(row.key_present).lower()}, "
+                f"model_availability={row.model_availability}"
             )
             for row in report.providers
         )
@@ -227,10 +272,16 @@ async def run_ai_research_preflight(settings: Any | None = None) -> tuple[str, l
         "ai_entry_gate_enabled",
         default=bool(getattr(settings, "ai_entry_gate_enabled", False)),
     )
+    model_availability = _provider_model_availability(
+        settings,
+        providers,
+        float(getattr(settings, "ai_research_timeout_seconds", 8.0) or 8.0),
+    )
     report = build_ai_research_preflight_report(
         settings=settings,
         used_calls=used_calls,
         ai_entry_gate_enabled=ai_entry_gate_enabled,
+        model_availability=model_availability,
     )
     return render_ai_research_preflight(report), report.gates
 

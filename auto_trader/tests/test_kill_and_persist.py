@@ -1620,7 +1620,11 @@ def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
         openai_api_key = "openai-secret"
         xai_api_key = "xai-secret"
 
-    report = build_ai_research_preflight_report(settings=CommitteeSettings(), used_calls=3)
+    report = build_ai_research_preflight_report(
+        settings=CommitteeSettings(),
+        used_calls=3,
+        model_availability={"xai": "available"},
+    )
     text = render_ai_research_preflight(report)
 
     assert report.ready is True
@@ -1633,10 +1637,37 @@ def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
     assert "Chargeable calls per round: 3" in text
     assert "Full rounds remaining: 1" in text
     assert "Estimated cost per round: $0.3750" in text
-    assert "- anthropic: model=claude-opus-4-8, key_present=true" in text
+    assert "- anthropic: model=claude-opus-4-8, key_present=true, model_availability=not_checked" in text
+    assert "- xai: model=grok-4.3, key_present=true, model_availability=available" in text
+    assert "[PASS] Provider model available" in text
     assert text.index("Providers:") < text.index("Gates:")
     assert "anthropic-secret" not in text
     assert "openai-secret" not in text
+    assert "xai-secret" not in text
+
+
+def test_ai_research_preflight_fails_when_xai_model_unavailable():
+    class CommitteeSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_providers = "anthropic,openai,xai"
+        ai_research_anthropic_model = "claude-opus-4-8"
+        ai_research_openai_model = "gpt-5.5"
+        ai_research_xai_model = "grok-4.2"
+        ai_research_max_calls_per_day = 6
+        anthropic_api_key = "anthropic-secret"
+        openai_api_key = "openai-secret"
+        xai_api_key = "xai-secret"
+
+    report = build_ai_research_preflight_report(
+        settings=CommitteeSettings(),
+        used_calls=0,
+        model_availability={"xai": "unavailable"},
+    )
+    text = render_ai_research_preflight(report)
+
+    assert report.ready is False
+    assert any(gate.name == "Provider model available" and gate.status == "FAIL" for gate in report.gates)
+    assert "xai:grok-4.2=unavailable" in text
     assert "xai-secret" not in text
 
 
