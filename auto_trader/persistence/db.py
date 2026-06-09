@@ -344,12 +344,16 @@ async def get_latest_ai_research_memo_for_symbol(
     *,
     provider: str,
     symbol: str,
+    model_tag: str | None = None,
     today_utc: bool = False,
     prompt_versions: tuple[str, ...] | None = None,
 ) -> dict[str, Any] | None:
     """Return the latest AI memo for a provider/symbol slice."""
     conditions = ["provider = ?", "upper(symbol) = ?"]
     params: list[Any] = [str(provider), str(symbol).upper()]
+    if model_tag is not None:
+        conditions.append("model_tag = ?")
+        params.append(str(model_tag))
     if today_utc:
         conditions.append("date(created_at) = date('now')")
     if prompt_versions:

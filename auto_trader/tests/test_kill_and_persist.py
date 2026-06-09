@@ -920,10 +920,24 @@ async def test_latest_ai_research_memo_for_symbol_filters_provider_symbol_and_da
             validation_passed=True,
             memo={"summary": "third"},
         )
+        await log_ai_research_memo(
+            signal_id=4,
+            symbol="TZA",
+            provider="anthropic",
+            model_tag="anthropic/new-model",
+            prompt_version="ai_research_committee/v0",
+            input_hash="fourth",
+            verdict="reject",
+            confidence=0.9,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"summary": "fourth"},
+        )
 
         latest = await get_latest_ai_research_memo_for_symbol(
             provider="anthropic",
             symbol="tza",
+            model_tag="anthropic/claude-opus-4-8",
             today_utc=True,
             prompt_versions=("ai_research_committee/v0",),
         )
@@ -6518,8 +6532,221 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
     assert result["blocked"] is True
     assert result["ai_gate"]["reason"] == "ai_research_cached_watch"
     assert cache_calls[0]["symbol"] == "TZA"
+    assert cache_calls[0]["model_tag"] == "openai/gpt-5.5"
     assert cache_calls[0]["prompt_versions"] == ("ai_research_committee/v0", "ai_research_failure/v0")
     assert "ai_research_cached_watch" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_providers = "anthropic,openai,xai"
+        ai_research_anthropic_model = "claude-opus-4-8"
+        ai_research_openai_model = "gpt-5.5"
+        ai_research_xai_model = "grok-4.3"
+        ai_research_max_calls_per_day = 12
+        anthropic_api_key = "anthropic-key"
+        openai_api_key = "openai-key"
+        xai_api_key = "xai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            raise AssertionError("OrderManager should not be called when cached multi-provider AI memo is watch")
+
+    class ExplodingPaidMember:
+        def __init__(self, provider, model_tag):
+            self.provider = provider
+            self.model_tag = model_tag
+
+        async def research(self, intent, *, signal_id=None):
+            raise AssertionError("paid AI provider should not be called when same-symbol multi memo exists")
+
+    journal_entries = []
+    cache_calls = []
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+        return [TradeIntent(symbol="IVT", side="long", entry_price=34.24, confidence=0.8)]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_log_signal(**kwargs):
+        return 594
+
+    async def fake_cached_lookup(**kwargs):
+        cache_calls.append(kwargs)
+        return {
+            "id": 322,
+            "symbol": "IVT",
+            "provider": "multi",
+            "prompt_version": "ai_research_aggregate/v0",
+            "verdict": "watch",
+            "validation_passed": True,
+        }
+
+    async def exploding_count(**kwargs):
+        raise AssertionError("budget counters should not run when multi-provider symbol/day AI cache hits")
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", fake_cached_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", exploding_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts", exploding_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    supervisor.research_committee = MultiProviderResearchCommittee(
+        [
+            ExplodingPaidMember("anthropic", "anthropic/claude-opus-4-8"),
+            ExplodingPaidMember("openai", "openai/gpt-5.5"),
+            ExplodingPaidMember("xai", "xai/grok-4.3"),
+        ]
+    )
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["blocked"] is True
+    assert result["ai_gate"]["reason"] == "ai_research_cached_watch"
+    assert cache_calls[0]["provider"] == "multi"
+    assert cache_calls[0]["symbol"] == "IVT"
+    assert cache_calls[0]["model_tag"] == "multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.3"
+    assert cache_calls[0]["prompt_versions"] == ("ai_research_aggregate/v0", "ai_research_failure/v0")
+    assert "ai_research_cached_watch" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_providers = "anthropic,openai,xai"
+        ai_research_anthropic_model = "claude-opus-4-8"
+        ai_research_openai_model = "gpt-5.5"
+        ai_research_xai_model = "grok-4.3"
+        ai_research_max_calls_per_day = 12
+        anthropic_api_key = "anthropic-key"
+        openai_api_key = "openai-key"
+        xai_api_key = "xai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            return {"order": {"id": "entry-after-current-committee", "symbol": intent.symbol}}
+
+    class ApprovingPaidMember:
+        def __init__(self, provider, model_tag, calls):
+            self.provider = provider
+            self.model_tag = model_tag
+            self.calls = calls
+
+        async def research(self, intent, *, signal_id=None):
+            self.calls.append(self.provider)
+            packet = build_research_packet(intent, signal_id=signal_id)
+            return ResearchMemo(
+                symbol=intent.symbol.upper(),
+                provider=self.provider,
+                model_tag=self.model_tag,
+                prompt_version="ai_research_committee/v0",
+                input_hash=packet_hash(packet),
+                verdict="approve",
+                confidence=0.8,
+                used_only_provided_data=True,
+                validation_passed=True,
+                memo={
+                    "input_packet": packet,
+                    "committee": {
+                        "symbol": intent.symbol.upper(),
+                        "verdict": "approve",
+                        "confidence": 0.8,
+                        "used_only_provided_data": True,
+                        "bull_case": "Current committee approves from provided packet.",
+                        "bear_case": "Advisory only.",
+                        "judge_summary": "Current provider set approved.",
+                    },
+                },
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "stale_multi_cache.db")
+        await init_db()
+        await log_ai_research_memo(
+            signal_id=593,
+            symbol="IVT",
+            provider="multi",
+            model_tag="multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.2",
+            prompt_version="ai_research_aggregate/v0",
+            input_hash="old-aggregate",
+            verdict="watch",
+            confidence=0.61,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"summary": "old xAI model should not cache-hit"},
+        )
+
+        async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+            return [TradeIntent(symbol="IVT", side="long", entry_price=34.24, confidence=0.8)]
+
+        async def fake_bool(key, *, default):
+            return True
+
+        monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+        monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+
+        member_calls = []
+        supervisor = TradingSupervisor(
+            settings=GateSettings(),
+            state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+            adapter=FakeAdapter(),
+            order_manager=FakeOrderManager(),
+        )
+        supervisor.research_committee = MultiProviderResearchCommittee(
+            [
+                ApprovingPaidMember("anthropic", "anthropic/claude-opus-4-8", member_calls),
+                ApprovingPaidMember("openai", "openai/gpt-5.5", member_calls),
+                ApprovingPaidMember("xai", "xai/grok-4.3", member_calls),
+            ]
+        )
+
+        result = await supervisor._maybe_submit_entry(
+            account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+            clock={"is_open": True},
+            positions=[],
+            today_new_entries=0,
+            max_new_positions_per_day=1,
+        )
+
+    assert result["order"]["id"] == "entry-after-current-committee"
+    assert member_calls == ["anthropic", "openai", "xai"]
 
 
 @pytest.mark.asyncio

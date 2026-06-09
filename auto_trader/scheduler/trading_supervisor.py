@@ -985,44 +985,50 @@ class TradingSupervisor:
         model_tag = str(getattr(self.research_committee, "model_tag", provider))
         real_providers = real_research_providers(self.research_committee)
         if real_providers:
-            if len(real_providers) == 1:
-                try:
-                    cached = await get_latest_ai_research_memo_for_symbol(
-                        provider=real_providers[0],
-                        symbol=intent.symbol,
-                        today_utc=True,
-                        prompt_versions=("ai_research_committee/v0", "ai_research_failure/v0"),
-                    )
-                except Exception as e:
-                    log.warning(
-                        "ai_research_symbol_day_cache_failed",
-                        symbol=intent.symbol.upper(),
-                        provider=real_providers[0],
-                        error=str(e),
-                    )
-                    return AIResearchRunResult(
-                        symbol=intent.symbol.upper(),
-                        verdict="watch",
-                        validation_passed=False,
-                        reason="ai_research_symbol_day_cache_failed",
-                        called_provider=False,
-                    )
-                if cached is not None:
-                    cached_verdict = str(cached.get("verdict") or "watch")
-                    log.info(
-                        "ai_research_symbol_day_cache_hit",
-                        symbol=intent.symbol.upper(),
-                        provider=real_providers[0],
-                        verdict=cached_verdict,
-                        memo_id=cached.get("id"),
-                    )
-                    return AIResearchRunResult(
-                        symbol=intent.symbol.upper(),
-                        verdict=cached_verdict,
-                        validation_passed=bool(cached.get("validation_passed")),
-                        reason=f"ai_research_cached_{cached_verdict}",
-                        called_provider=False,
-                    )
+            cache_provider = real_providers[0] if len(real_providers) == 1 else provider
+            cache_prompt_versions = (
+                ("ai_research_committee/v0", "ai_research_failure/v0")
+                if len(real_providers) == 1
+                else ("ai_research_aggregate/v0", "ai_research_failure/v0")
+            )
+            try:
+                cached = await get_latest_ai_research_memo_for_symbol(
+                    provider=cache_provider,
+                    symbol=intent.symbol,
+                    model_tag=model_tag,
+                    today_utc=True,
+                    prompt_versions=cache_prompt_versions,
+                )
+            except Exception as e:
+                log.warning(
+                    "ai_research_symbol_day_cache_failed",
+                    symbol=intent.symbol.upper(),
+                    provider=cache_provider,
+                    error=str(e),
+                )
+                return AIResearchRunResult(
+                    symbol=intent.symbol.upper(),
+                    verdict="watch",
+                    validation_passed=False,
+                    reason="ai_research_symbol_day_cache_failed",
+                    called_provider=False,
+                )
+            if cached is not None:
+                cached_verdict = str(cached.get("verdict") or "watch")
+                log.info(
+                    "ai_research_symbol_day_cache_hit",
+                    symbol=intent.symbol.upper(),
+                    provider=cache_provider,
+                    verdict=cached_verdict,
+                    memo_id=cached.get("id"),
+                )
+                return AIResearchRunResult(
+                    symbol=intent.symbol.upper(),
+                    verdict=cached_verdict,
+                    validation_passed=bool(cached.get("validation_passed")),
+                    reason=f"ai_research_cached_{cached_verdict}",
+                    called_provider=False,
+                )
             prefilter = evaluate_paid_ai_prefilter(intent, settings=self.settings, risk_profile=risk_profile)
             if prefilter.blocked:
                 prefilter_already_logged = False
