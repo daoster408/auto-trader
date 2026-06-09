@@ -6,6 +6,7 @@ Commands exactly as specified in SOURCE_OF_TRUTH:
 - /resume <token>
 - /kill   ← absolute highest priority, must preempt everything
 - /report
+- /edge [days]
 """
 import asyncio
 from datetime import UTC, datetime
@@ -24,6 +25,7 @@ from auto_trader.core.models import KillResult
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.risk_profile import VALID_RISK_PROFILES, get_risk_profile
 from auto_trader.core.state_machine import StateMachine
+from auto_trader.edge_report import run_edge_report
 from auto_trader.persistence.db import (
     append_journal_entry,
     count_entry_orders_since,
@@ -40,6 +42,8 @@ from auto_trader.utils.logging import get_logger
 from auto_trader.utils.retry import retry_kill_critical
 
 log = get_logger("auto_trader.comms.telegram_bot")
+
+MAX_EDGE_REPORT_DAYS = 90
 
 
 def _money(value: Any) -> str:
@@ -636,6 +640,32 @@ class TelegramBot:
             warnings=len(snapshot.get("errors") or []),
         )
 
+    async def _edge_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_authorized(update, "/edge"):
+            return
+        args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+        if len(args) > 1:
+            await update.message.reply_text(f"Use: /edge [days], where days is 1-{MAX_EDGE_REPORT_DAYS}.")
+            return
+        try:
+            days = int(args[0]) if args else 14
+        except ValueError:
+            await update.message.reply_text(f"Use: /edge [days], where days is 1-{MAX_EDGE_REPORT_DAYS}.")
+            return
+        if days < 1 or days > MAX_EDGE_REPORT_DAYS:
+            await update.message.reply_text(f"Use: /edge [days], where days is 1-{MAX_EDGE_REPORT_DAYS}.")
+            return
+        try:
+            report = await asyncio.wait_for(run_edge_report(window_days=days), timeout=8.0)
+        except Exception as e:
+            log.warning("edge_report_failed", error=str(e), days=days)
+            await update.message.reply_text(f"EDGE REPORT unavailable: {e}")
+            return
+        if len(report) > 3900:
+            report = report[:3850].rstrip() + "\n...truncated; use /edge with fewer days."
+        await update.message.reply_text(report)
+        log.info("edge_report_requested", days=days)
+
     async def _config_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_authorized(update, "/config"):
             return
@@ -768,7 +798,9 @@ class TelegramBot:
     async def _unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_authorized(update, "unknown"):
             return
-        await update.message.reply_text("Unknown command. Use /status, /pause, /resume <token>, /kill, /report, /config")
+        await update.message.reply_text(
+            "Unknown command. Use /status, /pause, /resume <token>, /kill, /report, /edge, /config"
+        )
 
     def build(self) -> Application:
         """Build the Application with all command handlers."""
@@ -779,6 +811,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("resume", self._resume_handler))
         app.add_handler(CommandHandler("kill", self._kill_handler))
         app.add_handler(CommandHandler("report", self._report_handler))
+        app.add_handler(CommandHandler("edge", self._edge_handler))
         app.add_handler(CommandHandler("config", self._config_handler))
         app.add_handler(CommandHandler("start", self._status_handler))
         app.add_handler(CommandHandler("help", self._status_handler))

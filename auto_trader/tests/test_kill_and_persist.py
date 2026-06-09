@@ -4125,6 +4125,188 @@ async def test_telegram_authorized_status_reads_snapshot(monkeypatch):
     assert "Today new entries: 0 / 3" in update.message.replies[0]
 
 
+@pytest.mark.asyncio
+async def test_telegram_edge_handler_returns_default_scoreboard(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {}
+
+    async def fake_edge_report(*, window_days):
+        called["window_days"] = window_days
+        return "EDGE REPORT\nClosed trades: 9\nRealized P/L: -$0.04"
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.run_edge_report", fake_edge_report)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._edge_handler(update, FakeTelegramContext())
+
+    assert called == {"window_days": 14}
+    assert update.message.replies == ["EDGE REPORT\nClosed trades: 9\nRealized P/L: -$0.04"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_edge_handler_accepts_custom_days(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {}
+
+    async def fake_edge_report(*, window_days):
+        called["window_days"] = window_days
+        return f"EDGE REPORT\nWindow: last {window_days} days"
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.run_edge_report", fake_edge_report)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._edge_handler(update, FakeTelegramContext(["30"]))
+
+    assert called == {"window_days": 30}
+    assert update.message.replies == ["EDGE REPORT\nWindow: last 30 days"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_edge_handler_rejects_out_of_range_days(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {"edge": 0}
+
+    async def fake_edge_report(*, window_days):
+        called["edge"] += 1
+        return "EDGE REPORT"
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.run_edge_report", fake_edge_report)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._edge_handler(update, FakeTelegramContext(["91"]))
+
+    assert called == {"edge": 0}
+    assert update.message.replies == ["Use: /edge [days], where days is 1-90."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_edge_handler_rejects_zero_days(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {"edge": 0}
+
+    async def fake_edge_report(*, window_days):
+        called["edge"] += 1
+        return "EDGE REPORT"
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.run_edge_report", fake_edge_report)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._edge_handler(update, FakeTelegramContext(["0"]))
+
+    assert called == {"edge": 0}
+    assert update.message.replies == ["Use: /edge [days], where days is 1-90."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_edge_handler_rejects_multiple_args(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {"edge": 0}
+
+    async def fake_edge_report(*, window_days):
+        called["edge"] += 1
+        return "EDGE REPORT"
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.run_edge_report", fake_edge_report)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._edge_handler(update, FakeTelegramContext(["14", "extra"]))
+
+    assert called == {"edge": 0}
+    assert update.message.replies == ["Use: /edge [days], where days is 1-90."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_edge_handler_rejects_invalid_days(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {"edge": 0}
+
+    async def fake_edge_report(*, window_days):
+        called["edge"] += 1
+        return "EDGE REPORT"
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.run_edge_report", fake_edge_report)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._edge_handler(update, FakeTelegramContext(["abc"]))
+
+    assert called == {"edge": 0}
+    assert update.message.replies == ["Use: /edge [days], where days is 1-90."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_unauthorized_edge_does_not_read_report(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {"edge": 0}
+
+    async def fake_edge_report(*, window_days):
+        called["edge"] += 1
+        return "EDGE REPORT"
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.run_edge_report", fake_edge_report)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[999],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._edge_handler(update, FakeTelegramContext())
+
+    assert called == {"edge": 0}
+    assert update.message.replies == ["Unauthorized."]
+
+
 def test_telegram_status_surfaces_runtime_auto_entry_disabled():
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     bot = TelegramBot(

@@ -285,11 +285,11 @@ async def main() -> None:
     try:
         log.info(
             "starting_telegram_control_surface",
-            commands="status,pause,resume,kill,report",
+            commands="status,pause,resume,kill,report,edge",
             kill_priority="absolute",
         )
         print("\n✅ AUTO-TRADER (OPTIMIZED) running on Oracle ARM target.")
-        print("   /status | /pause | /resume <token> | /kill | /report")
+        print("   /status | /pause | /resume <token> | /kill | /report | /edge")
         print("   /kill is bulletproof async + real SDK + retries + HALTED persists.\n")
 
         await bot.run(stop_event=stop_event)
