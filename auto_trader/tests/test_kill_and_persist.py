@@ -6850,6 +6850,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
 
     journal_entries = []
     cache_calls = []
+    signal_calls = []
 
     async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
         return [TradeIntent(symbol="TZA", side="long", entry_price=4.45, confidence=0.8)]
@@ -6858,6 +6859,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
         return True
 
     async def fake_log_signal(**kwargs):
+        signal_calls.append(kwargs)
         return 102
 
     async def fake_cached_lookup(**kwargs):
@@ -6906,7 +6908,8 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
     assert cache_calls[0]["symbol"] == "TZA"
     assert cache_calls[0]["model_tag"] == "openai/gpt-5.5"
     assert cache_calls[0]["prompt_versions"] == ("ai_research_committee/v0", "ai_research_failure/v0")
-    assert "ai_research_cached_watch" in journal_entries[0]
+    assert signal_calls == []
+    assert journal_entries == []
 
 
 @pytest.mark.asyncio
@@ -6944,6 +6947,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
 
     journal_entries = []
     cache_calls = []
+    signal_calls = []
 
     async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
         return [TradeIntent(symbol="IVT", side="long", entry_price=34.24, confidence=0.8)]
@@ -6952,6 +6956,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
         return True
 
     async def fake_log_signal(**kwargs):
+        signal_calls.append(kwargs)
         return 594
 
     async def fake_cached_lookup(**kwargs):
@@ -7007,7 +7012,8 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
     assert cache_calls[0]["symbol"] == "IVT"
     assert cache_calls[0]["model_tag"] == "multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.3"
     assert cache_calls[0]["prompt_versions"] == ("ai_research_aggregate/v0", "ai_research_failure/v0")
-    assert "ai_research_cached_watch" in journal_entries[0]
+    assert signal_calls == []
+    assert journal_entries == []
 
 
 @pytest.mark.asyncio
@@ -7478,6 +7484,109 @@ async def test_ai_paid_prefilter_blocks_low_volume_before_paid_provider(monkeypa
     assert logged_memos[0]["prompt_version"] == "ai_paid_prefilter/v0"
     assert logged_memos[0]["memo"]["prefilter"]["reasons"] == ["low_relative_volume", "near_high_without_strong_volume_or_news"]
     assert "ai_paid_prefilter_blocked" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_cached_prefilter_watch_skips_signal_and_journal(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_providers = "anthropic,openai,xai"
+        ai_research_anthropic_model = "claude-opus-4-8"
+        ai_research_openai_model = "gpt-5.5"
+        ai_research_xai_model = "grok-4.3"
+        ai_research_max_calls_per_day = 12
+        anthropic_api_key = "anthropic-key"
+        openai_api_key = "openai-key"
+        xai_api_key = "xai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            raise AssertionError("OrderManager should not be called for cached prefilter watch")
+
+    class ExplodingPaidMember:
+        def __init__(self, provider, model_tag):
+            self.provider = provider
+            self.model_tag = model_tag
+
+        async def research(self, intent, *, signal_id=None):
+            raise AssertionError("paid AI provider should not be called for cached prefilter watch")
+
+    cache_calls = []
+    signal_calls = []
+    journal_entries = []
+
+    async def fake_signals(adapter, max_signals=1, **kwargs):
+        return [TradeIntent(symbol="TNA", side="long", entry_price=40.0, confidence=0.8)]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_log_signal(**kwargs):
+        signal_calls.append(kwargs)
+        return 901
+
+    async def fake_cached_lookup(**kwargs):
+        cache_calls.append(kwargs)
+        if kwargs["provider"] == "prefilter":
+            return {
+                "id": 44,
+                "symbol": "TNA",
+                "provider": "prefilter",
+                "prompt_version": "ai_paid_prefilter/v0",
+                "verdict": "watch",
+                "validation_passed": True,
+            }
+        return None
+
+    async def exploding_count(**kwargs):
+        raise AssertionError("paid AI counters should not run for cached prefilter watch")
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", fake_cached_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", exploding_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts", exploding_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    supervisor.research_committee = MultiProviderResearchCommittee(
+        [
+            ExplodingPaidMember("anthropic", "anthropic/claude-opus-4-8"),
+            ExplodingPaidMember("openai", "openai/gpt-5.5"),
+            ExplodingPaidMember("xai", "xai/grok-4.3"),
+        ]
+    )
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["blocked"] is True
+    assert result["ai_gate"]["reason"] == "ai_paid_prefilter_cached_watch"
+    assert [call["provider"] for call in cache_calls] == ["multi", "prefilter"]
+    assert signal_calls == []
+    assert journal_entries == []
 
 
 def test_ai_paid_prefilter_explicit_env_override_wins_in_aggressive(monkeypatch):

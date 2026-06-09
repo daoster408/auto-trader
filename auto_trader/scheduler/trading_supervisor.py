@@ -61,6 +61,7 @@ NotifyFn = Callable[[str], Awaitable[None]]
 log = get_logger("auto_trader.scheduler.trading_supervisor")
 
 ENTRY_CANDIDATE_EVAL_LIMIT = 10
+AI_ENTRY_GATE_CANDIDATE_BLOCK_VERDICTS = {"watch", "reject"}
 
 
 async def _runtime_risk_profile(settings: Any, *, paper: bool) -> str:
@@ -401,7 +402,24 @@ def _is_open_entry_order(order: dict[str, Any]) -> bool:
 
 
 def _candidate_specific_ai_block(ai_result: AIResearchRunResult) -> bool:
-    return ai_result.validation_passed and ai_result.verdict in {"watch", "reject"}
+    return ai_result.validation_passed and ai_result.verdict in AI_ENTRY_GATE_CANDIDATE_BLOCK_VERDICTS
+
+
+def _cached_candidate_block_result(symbol: str, memo: dict[str, Any] | None) -> AIResearchRunResult | None:
+    if memo is None or not bool(memo.get("validation_passed")):
+        return None
+    verdict = str(memo.get("verdict") or "watch").lower()
+    if verdict not in AI_ENTRY_GATE_CANDIDATE_BLOCK_VERDICTS:
+        return None
+    prompt_version = str(memo.get("prompt_version") or "")
+    reason = "ai_paid_prefilter_cached_watch" if prompt_version == PREFILTER_PROMPT_VERSION else f"ai_research_cached_{verdict}"
+    return AIResearchRunResult(
+        symbol=symbol.upper(),
+        verdict=verdict,
+        validation_passed=True,
+        reason=reason,
+        called_provider=False,
+    )
 
 
 def _order_matches_pending_exit(order: dict[str, Any], pending: dict[str, Any]) -> bool:
@@ -876,6 +894,30 @@ class TradingSupervisor:
         )
         last_blocked_result: dict[str, Any] | None = None
         for signal in signals:
+            real_providers = real_research_providers(self.research_committee)
+            cached_candidate_block = await self._same_day_candidate_ai_block(
+                signal.symbol,
+                ai_gate_enabled=ai_gate_enabled,
+                ai_research_enabled=ai_research_enabled,
+                real_providers=real_providers,
+            )
+            if cached_candidate_block is not None:
+                last_blocked_result = {
+                    "blocked": True,
+                    "reason": f"AI entry gate skipped cached blocked candidate {signal.symbol.upper()}: {cached_candidate_block.reason}",
+                    "ai_gate": {
+                        "verdict": cached_candidate_block.verdict,
+                        "validation_passed": cached_candidate_block.validation_passed,
+                        "reason": cached_candidate_block.reason,
+                    },
+                }
+                log.info(
+                    "ai_entry_gate_skipped_cached_candidate",
+                    symbol=signal.symbol.upper(),
+                    verdict=cached_candidate_block.verdict,
+                    reason=cached_candidate_block.reason,
+                )
+                continue
             intent = with_research_context(
                 signal,
                 {
@@ -898,7 +940,6 @@ class TradingSupervisor:
                 features=intent.features,
             )
             ai_result: AIResearchRunResult | None = None
-            real_providers = real_research_providers(self.research_committee)
             paid_research_allowed = ai_gate_enabled or not real_providers
             if ai_research_enabled and paid_research_allowed:
                 ai_result = await self._run_ai_research(intent, signal_id=signal_id, risk_profile=risk_profile)
@@ -994,6 +1035,58 @@ class TradingSupervisor:
                 "reason": ai_result.reason,
             },
         }
+
+    async def _same_day_candidate_ai_block(
+        self,
+        symbol: str,
+        *,
+        ai_gate_enabled: bool,
+        ai_research_enabled: bool,
+        real_providers: list[str],
+    ) -> AIResearchRunResult | None:
+        if not ai_gate_enabled or not ai_research_enabled or not real_providers:
+            return None
+        provider = str(getattr(self.research_committee, "provider", "shadow"))
+        model_tag = str(getattr(self.research_committee, "model_tag", provider))
+        cache_provider = real_providers[0] if len(real_providers) == 1 else provider
+        cache_prompt_versions = (
+            ("ai_research_committee/v0", "ai_research_failure/v0")
+            if len(real_providers) == 1
+            else ("ai_research_aggregate/v0", "ai_research_failure/v0")
+        )
+        lookups = (
+            {
+                "provider": cache_provider,
+                "model_tag": model_tag,
+                "prompt_versions": cache_prompt_versions,
+            },
+            {
+                "provider": PREFILTER_PROVIDER,
+                "model_tag": PREFILTER_MODEL_TAG,
+                "prompt_versions": (PREFILTER_PROMPT_VERSION,),
+            },
+        )
+        for lookup in lookups:
+            try:
+                cached = await get_latest_ai_research_memo_for_symbol(
+                    provider=str(lookup["provider"]),
+                    symbol=symbol,
+                    model_tag=str(lookup["model_tag"]),
+                    today_utc=True,
+                    prompt_versions=lookup["prompt_versions"],
+                )
+            except Exception as e:
+                log.warning(
+                    "ai_entry_gate_cached_candidate_lookup_failed",
+                    symbol=symbol.upper(),
+                    provider=lookup["provider"],
+                    error=str(e),
+                )
+                return None
+            result = _cached_candidate_block_result(symbol, cached)
+            if result is not None:
+                return result
+        return None
 
     async def _run_ai_research(
         self,
