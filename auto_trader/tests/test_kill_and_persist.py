@@ -71,7 +71,7 @@ from auto_trader.intelligence.ai_paid_prefilter import evaluate_paid_ai_prefilte
 import auto_trader.intelligence.rules_fallback as rules_fallback
 from auto_trader.intelligence.rules_fallback import DiscoveryCandidate, get_simple_rules_signals
 from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_shutdown, _should_emergency_halt_on_shutdown
-from auto_trader.scheduler.trading_supervisor import TradingSupervisor
+from auto_trader.scheduler.trading_supervisor import AIResearchRunResult, TradingSupervisor
 from auto_trader.persistence.db import (
     append_journal_entry,
     consume_planned_maintenance_shutdown,
@@ -7008,6 +7008,182 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
     assert cache_calls[0]["model_tag"] == "multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.3"
     assert cache_calls[0]["prompt_versions"] == ("ai_research_aggregate/v0", "ai_research_failure/v0")
     assert "ai_research_cached_watch" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_cached_watch_tries_next_ranked_candidate(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 5
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        def __init__(self):
+            self.calls = []
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            self.calls.append((intent, snapshot, signal_id))
+            return {"order": {"id": "entry-approved-next", "symbol": intent.symbol}, "risk_decision": {"approved": True}}
+
+    class FakeCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+    journal_entries = []
+    researched = []
+    signal_ids = iter([201, 202])
+
+    async def fake_signals(adapter, max_signals=1, **kwargs):
+        assert max_signals >= 2
+        return [
+            TradeIntent(symbol="TNA", side="long", entry_price=40.0, confidence=0.8),
+            TradeIntent(symbol="POET", side="long", entry_price=14.0, confidence=0.8),
+        ]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_log_signal(**kwargs):
+        return next(signal_ids)
+
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+        researched.append((intent.symbol, signal_id))
+        if intent.symbol == "TNA":
+            return AIResearchRunResult(
+                symbol="TNA",
+                verdict="watch",
+                validation_passed=True,
+                reason="ai_research_cached_watch",
+            )
+        return AIResearchRunResult(
+            symbol="POET",
+            verdict="approve",
+            validation_passed=True,
+            reason="ai_research_approve",
+        )
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
+    monkeypatch.setattr(TradingSupervisor, "_run_ai_research", fake_run_ai)
+
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=manager,
+    )
+    supervisor.research_committee = FakeCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["order"]["id"] == "entry-approved-next"
+    assert manager.calls[0][0].symbol == "POET"
+    assert manager.calls[0][2] == 202
+    assert researched == [("TNA", 201), ("POET", 202)]
+    assert "AI entry gate blocked TNA" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_systemic_failure_does_not_try_next_candidate(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 0
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            raise AssertionError("OrderManager should not be called when AI failure is systemic")
+
+    class FakeCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+    researched = []
+    journal_entries = []
+
+    async def fake_signals(adapter, max_signals=1, **kwargs):
+        assert max_signals >= 2
+        return [
+            TradeIntent(symbol="TNA", side="long", entry_price=40.0, confidence=0.8),
+            TradeIntent(symbol="POET", side="long", entry_price=14.0, confidence=0.8),
+        ]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_log_signal(**kwargs):
+        return 301
+
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+        researched.append(intent.symbol)
+        return AIResearchRunResult(
+            symbol=intent.symbol,
+            verdict="watch",
+            validation_passed=False,
+            reason="ai_research_budget_exhausted",
+        )
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
+    monkeypatch.setattr(TradingSupervisor, "_run_ai_research", fake_run_ai)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    supervisor.research_committee = FakeCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["blocked"] is True
+    assert result["ai_gate"]["reason"] == "ai_research_budget_exhausted"
+    assert researched == ["TNA"]
+    assert "AI entry gate blocked TNA" in journal_entries[0]
 
 
 @pytest.mark.asyncio

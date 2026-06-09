@@ -44,7 +44,7 @@ from auto_trader.persistence.db import (
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
     get_runtime_config_bool,
-    get_runtime_config_int,
+    get_runtime_config_int,  # noqa: F401 - retained for existing test monkeypatch surface
     get_runtime_config_value,
     log_ai_research_memo,
     log_signal,
@@ -59,6 +59,8 @@ from auto_trader.utils.logging import get_logger
 NotifyFn = Callable[[str], Awaitable[None]]
 
 log = get_logger("auto_trader.scheduler.trading_supervisor")
+
+ENTRY_CANDIDATE_EVAL_LIMIT = 10
 
 
 async def _runtime_risk_profile(settings: Any, *, paper: bool) -> str:
@@ -396,6 +398,10 @@ def _is_open_entry_order(order: dict[str, Any]) -> bool:
         return False
     side = str(order.get("side", "")).lower()
     return side in {"buy", "long"}
+
+
+def _candidate_specific_ai_block(ai_result: AIResearchRunResult) -> bool:
+    return ai_result.validation_passed and ai_result.verdict in {"watch", "reject"}
 
 
 def _order_matches_pending_exit(order: dict[str, Any], pending: dict[str, Any]) -> bool:
@@ -852,9 +858,10 @@ class TradingSupervisor:
             )
             return None
 
+        candidate_limit = max(1, ENTRY_CANDIDATE_EVAL_LIMIT)
         signals = await _get_profiled_rules_signals(
             self.adapter,
-            max_signals=1,
+            max_signals=candidate_limit,
             finnhub_client=self.finnhub_client,
             fred_client=self.fred_client,
             risk_profile=risk_profile,
@@ -862,83 +869,99 @@ class TradingSupervisor:
         )
         if not signals:
             return None
-        intent = with_research_context(
-            signals[0],
-            {
-                "risk": build_risk_research_context(
-                    account=account,
-                    clock=clock,
-                    positions=positions,
-                    today_new_entries=today_new_entries,
-                    max_new_positions_per_day=max_new_positions_per_day,
-                    risk_profile=risk_profile,
-                )
-            },
-        )
-        signal_id = await log_signal(
-            symbol=intent.symbol,
-            thesis=intent.rationale,
-            confidence=intent.confidence,
-            source="rules_fallback",
-            model_tag="rules_fallback/v0",
-            features=intent.features,
-        )
         ai_research_enabled = bool(getattr(self.settings, "ai_research_enabled", True))
         ai_gate_enabled = await get_runtime_config_bool(
             "ai_entry_gate_enabled",
             default=bool(getattr(self.settings, "ai_entry_gate_enabled", False)),
         )
-        ai_result: AIResearchRunResult | None = None
-        real_providers = real_research_providers(self.research_committee)
-        paid_research_allowed = ai_gate_enabled or not real_providers
-        if ai_research_enabled and paid_research_allowed:
-            ai_result = await self._run_ai_research(intent, signal_id=signal_id, risk_profile=risk_profile)
-        elif ai_research_enabled and real_providers:
-            log.info(
-                "paid_ai_research_skipped_gate_disabled",
-                symbol=intent.symbol.upper(),
-                providers=real_providers,
+        last_blocked_result: dict[str, Any] | None = None
+        for signal in signals:
+            intent = with_research_context(
+                signal,
+                {
+                    "risk": build_risk_research_context(
+                        account=account,
+                        clock=clock,
+                        positions=positions,
+                        today_new_entries=today_new_entries,
+                        max_new_positions_per_day=max_new_positions_per_day,
+                        risk_profile=risk_profile,
+                    )
+                },
             )
-        elif ai_gate_enabled:
-            ai_result = AIResearchRunResult(
-                symbol=intent.symbol.upper(),
-                verdict="watch",
-                validation_passed=False,
-                reason="ai_research_disabled",
+            signal_id = await log_signal(
+                symbol=intent.symbol,
+                thesis=intent.rationale,
+                confidence=intent.confidence,
+                source="rules_fallback",
+                model_tag="rules_fallback/v0",
+                features=intent.features,
             )
-        if ai_gate_enabled:
-            if ai_result is None:
-                ai_result = AIResearchRunResult(
-                    symbol=intent.symbol.upper(),
-                    verdict="watch",
-                    validation_passed=False,
-                    reason="ai_research_not_run",
-                )
+            ai_result: AIResearchRunResult | None = None
             real_providers = real_research_providers(self.research_committee)
-            if ai_research_enabled and not real_providers:
+            paid_research_allowed = ai_gate_enabled or not real_providers
+            if ai_research_enabled and paid_research_allowed:
+                ai_result = await self._run_ai_research(intent, signal_id=signal_id, risk_profile=risk_profile)
+            elif ai_research_enabled and real_providers:
+                log.info(
+                    "paid_ai_research_skipped_gate_disabled",
+                    symbol=intent.symbol.upper(),
+                    providers=real_providers,
+                )
+            elif ai_gate_enabled:
                 ai_result = AIResearchRunResult(
                     symbol=intent.symbol.upper(),
                     verdict="watch",
                     validation_passed=False,
-                    reason="real_ai_provider_required_for_entry_gate",
+                    reason="ai_research_disabled",
                 )
-            if not ai_result.approved_for_entry:
-                return await self._block_entry_for_ai_gate(intent, signal_id=signal_id, ai_result=ai_result)
-        snapshot = type(
-            "SupervisorSnapshot",
-            (object,),
-            {
-                "equity": _float(account.get("equity")),
-                "open_positions": positions,
-                "today_new_entries": today_new_entries,
-                "max_new_positions_per_day": max_new_positions_per_day,
-                "risk_profile": risk_profile,
-            },
-        )()
-        result = await self.order_manager.submit_trade_intent(intent, snapshot, signal_id=signal_id)
-        if result.get("order"):
-            await self._notify(_format_entry_notification(result, adapter=self.adapter))
-        return result
+            if ai_gate_enabled:
+                if ai_result is None:
+                    ai_result = AIResearchRunResult(
+                        symbol=intent.symbol.upper(),
+                        verdict="watch",
+                        validation_passed=False,
+                        reason="ai_research_not_run",
+                    )
+                real_providers = real_research_providers(self.research_committee)
+                if ai_research_enabled and not real_providers:
+                    ai_result = AIResearchRunResult(
+                        symbol=intent.symbol.upper(),
+                        verdict="watch",
+                        validation_passed=False,
+                        reason="real_ai_provider_required_for_entry_gate",
+                    )
+                if not ai_result.approved_for_entry:
+                    last_blocked_result = await self._block_entry_for_ai_gate(
+                        intent,
+                        signal_id=signal_id,
+                        ai_result=ai_result,
+                    )
+                    if _candidate_specific_ai_block(ai_result):
+                        log.info(
+                            "ai_entry_gate_trying_next_candidate",
+                            blocked_symbol=intent.symbol.upper(),
+                            verdict=ai_result.verdict,
+                            reason=ai_result.reason,
+                        )
+                        continue
+                    return last_blocked_result
+            snapshot = type(
+                "SupervisorSnapshot",
+                (object,),
+                {
+                    "equity": _float(account.get("equity")),
+                    "open_positions": positions,
+                    "today_new_entries": today_new_entries,
+                    "max_new_positions_per_day": max_new_positions_per_day,
+                    "risk_profile": risk_profile,
+                },
+            )()
+            result = await self.order_manager.submit_trade_intent(intent, snapshot, signal_id=signal_id)
+            if result.get("order"):
+                await self._notify(_format_entry_notification(result, adapter=self.adapter))
+            return result
+        return last_blocked_result
 
     async def _block_entry_for_ai_gate(
         self,
