@@ -11,7 +11,6 @@ Wires directly to existing persistence/schema.sql .
 """
 import asyncio
 import json
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -36,6 +35,11 @@ def configure_db_path(path: str | Path) -> None:
     """Called at startup from settings so DB location is configurable."""
     global _DB_PATH
     _DB_PATH = Path(path).expanduser().resolve()
+
+
+def get_configured_db_path() -> Path:
+    """Return the currently configured SQLite DB path for read-only reports."""
+    return _DB_PATH
 
 
 async def init_db() -> None:

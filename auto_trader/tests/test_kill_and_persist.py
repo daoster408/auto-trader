@@ -28,6 +28,7 @@ from auto_trader.account_risk_validate import (
     validation_exit_code as account_risk_validation_exit_code,
 )
 from auto_trader.day3_validate import build_day3_validation_report, validation_exit_code
+from auto_trader.edge_report import build_edge_report, render_edge_report
 from auto_trader.ai_research_preflight import (
     build_ai_research_preflight_report,
     render_ai_research_preflight,
@@ -3390,6 +3391,195 @@ async def test_latest_entry_order_for_symbol_can_ignore_later_reentry():
         assert latest_before_close["avg_fill_price"] == 24.13
         assert latest_unbounded is not None
         assert latest_unbounded["broker_order_id"] == "entry-after-close"
+
+
+@pytest.mark.asyncio
+async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "edge_closed.db")
+        await init_db()
+
+        signal_id = await log_signal(
+            symbol="POET",
+            thesis="breakout with liquidity",
+            confidence=0.74,
+            source="test",
+            model_tag="rules_fallback/v0",
+            features={"risk": {"risk_profile": "conservative"}},
+        )
+        risk_id = await log_risk_decision(
+            signal_id=signal_id,
+            approved=True,
+            reason="Passed risk gates",
+            symbol="POET",
+            side="long",
+            proposed_qty=2.0,
+            sized_qty=2.0,
+            equity_snapshot=400.0,
+            risk_metrics={"risk_profile": "aggressive"},
+            model_tag="risk/v1",
+            trace_id="edge1234",
+        )
+        await log_ai_research_memo(
+            signal_id=signal_id,
+            symbol="POET",
+            provider="multi",
+            model_tag="multi/v1",
+            prompt_version="test",
+            input_hash="poet-hash",
+            verdict="approve",
+            confidence=0.8,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"rationale": "clean setup"},
+        )
+        now = datetime.now(UTC)
+        mixed_day = (now - timedelta(days=10)).replace(hour=14, minute=0, second=0, microsecond=0)
+        await upsert_order_record(
+            {
+                "id": "entry-poet",
+                "symbol": "POET",
+                "side": "buy",
+                "qty": 2.0,
+                "order_type": "market",
+                "status": "filled",
+                "filled_qty": 2.0,
+                "avg_fill_price": 10.0,
+                "submitted_at": mixed_day.isoformat(),
+                "filled_at": (mixed_day + timedelta(seconds=1)).isoformat(),
+            },
+            risk_decision_id=risk_id,
+            rationale="entry",
+        )
+        await upsert_order_record(
+            {
+                "id": "entry-poet-later-mixed-format",
+                "symbol": "POET",
+                "side": "buy",
+                "qty": 2.0,
+                "order_type": "market",
+                "status": "filled",
+                "filled_qty": 2.0,
+                "avg_fill_price": 50.0,
+                "submitted_at": (mixed_day + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"),
+                "filled_at": (mixed_day + timedelta(hours=1, seconds=1)).strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            risk_decision_id=risk_id,
+            rationale="entry",
+        )
+        await upsert_order_record(
+            {
+                "id": "exit-poet",
+                "symbol": "POET",
+                "side": "sell",
+                "qty": 2.0,
+                "order_type": "market",
+                "status": "filled",
+                "filled_qty": 2.0,
+                "avg_fill_price": 12.0,
+                "submitted_at": (now - timedelta(hours=1)).isoformat(),
+                "filled_at": (now - timedelta(hours=1) + timedelta(seconds=1)).isoformat(),
+            },
+            rationale="take profit reached",
+        )
+
+        report = await build_edge_report(window_days=7)
+        rendered = render_edge_report(report)
+
+        assert len(report.closed_trades) == 1
+        trade = report.closed_trades[0]
+        assert trade.symbol == "POET"
+        assert trade.pnl == pytest.approx(4.0)
+        assert trade.pnl_pct == pytest.approx(20.0)
+        assert trade.ai_verdict == "multi:approve"
+        assert trade.risk_profile == "aggressive"
+        assert "Closed trades: 1" in rendered
+        assert "Realized P/L: $4.00" in rendered
+        assert "- multi:approve: n=1, P/L $4.00" in rendered
+
+
+@pytest.mark.asyncio
+async def test_edge_report_classifies_skipped_opportunities():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "edge_opportunities.db")
+        await init_db()
+
+        watch_signal_id = await log_signal(
+            symbol="SSPE",
+            thesis="interesting but not clean enough",
+            confidence=0.5,
+            source="test",
+            model_tag="rules_fallback/v0",
+            features={"risk": {"risk_profile": "aggressive"}},
+        )
+        await log_ai_research_memo(
+            signal_id=watch_signal_id,
+            symbol="SSPE",
+            provider="multi",
+            model_tag="multi/v1",
+            prompt_version="test",
+            input_hash="sspe-hash",
+            verdict="watch",
+            confidence=0.55,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"rationale": "wait for cleaner setup"},
+        )
+
+        prefilter_signal_id = await log_signal(
+            symbol="TZA",
+            thesis="high volatility candidate",
+            confidence=0.48,
+            source="test",
+            model_tag="rules_fallback/v0",
+            features={},
+        )
+        await log_ai_research_memo(
+            signal_id=prefilter_signal_id,
+            symbol="TZA",
+            provider="prefilter",
+            model_tag="prefilter/v1",
+            prompt_version="test",
+            input_hash="tza-hash",
+            verdict="reject",
+            confidence=0.7,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"rationale": "duplicate weak idea"},
+        )
+
+        risk_signal_id = await log_signal(
+            symbol="GLL",
+            thesis="candidate fails risk sizing",
+            confidence=0.6,
+            source="test",
+            model_tag="rules_fallback/v0",
+            features={},
+        )
+        await log_risk_decision(
+            signal_id=risk_signal_id,
+            approved=False,
+            reason="daily limit reached",
+            symbol="GLL",
+            side="long",
+            proposed_qty=1.0,
+            sized_qty=0.0,
+            equity_snapshot=400.0,
+            risk_metrics={},
+            model_tag="risk/v1",
+            trace_id="edge5678",
+        )
+
+        report = await build_edge_report(window_days=30)
+        rendered = render_edge_report(report)
+        outcomes = {opportunity.symbol: opportunity.outcome for opportunity in report.opportunities}
+
+        assert outcomes["SSPE"] == "ai_watch"
+        assert outcomes["TZA"] == "prefilter_blocked"
+        assert outcomes["GLL"] == "risk_blocked"
+        assert "- ai_watch: 1" in rendered
+        assert "- prefilter_blocked: 1" in rendered
+        assert "- risk_blocked: 1" in rendered
 
 
 @pytest.mark.asyncio
