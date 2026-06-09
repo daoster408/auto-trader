@@ -6650,10 +6650,14 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
     async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
         return [TradeIntent(symbol="AMPX", side="long", entry_price=20.0)]
 
+    async def failing_journal(**kwargs):
+        raise RuntimeError("journal db unavailable")
+
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", failing_journal)
     patch_empty_pending_exit_state(monkeypatch)
 
     manager = FakeOrderManager()
@@ -7724,6 +7728,12 @@ async def test_ai_paid_prefilter_allows_strong_candidate_to_paid_provider(monkey
     async def fake_cached_lookup(**kwargs):
         return None
 
+    journal_entries = []
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+        return len(journal_entries)
+
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", fake_count)
@@ -7731,6 +7741,7 @@ async def test_ai_paid_prefilter_allows_strong_candidate_to_paid_provider(monkey
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_ai_research_memo", fake_log_ai)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", fake_cached_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
 
     manager = FakeOrderManager()
     supervisor = TradingSupervisor(
@@ -7804,6 +7815,12 @@ async def test_ai_entry_gate_approve_continues_to_order_manager(monkeypatch):
     async def fake_cached_lookup(**kwargs):
         return None
 
+    journal_entries = []
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+        return len(journal_entries)
+
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", fake_count)
@@ -7811,6 +7828,7 @@ async def test_ai_entry_gate_approve_continues_to_order_manager(monkeypatch):
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_ai_research_memo", fake_log_ai)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", fake_cached_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
 
     manager = FakeOrderManager()
     supervisor = TradingSupervisor(
@@ -7832,6 +7850,103 @@ async def test_ai_entry_gate_approve_continues_to_order_manager(monkeypatch):
     assert result["order"]["id"] == "entry-approved"
     assert manager.calls[0][0].symbol == "POET"
     assert manager.calls[0][2] == 44
+    assert len(journal_entries) == 1
+    assert "BUY: POET" in journal_entries[0]
+    assert "Scanner:" in journal_entries[0]
+    assert "AI gate: approve" in journal_entries[0]
+    assert "votes: approve" in journal_entries[0]
+    assert "RiskEngine:" in journal_entries[0]
+    assert "Signal: 44" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_submission_error_does_not_write_buy_journal(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 1
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            return {
+                "order": {"error": "broker unavailable"},
+                "risk_decision": {"approved": False, "reason": "order submission failed"},
+            }
+
+    class ApprovingCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+        async def research(self, intent, *, signal_id=None):
+            return _provider_memo("openai", "approve", confidence=0.8)
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+        return [TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.8)]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_count(**kwargs):
+        return 0
+
+    async def fake_log_signal(**kwargs):
+        return 45
+
+    async def fake_log_ai(**kwargs):
+        return 56
+
+    async def fake_cached_lookup(**kwargs):
+        return None
+
+    journal_entries = []
+    notifications = []
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+        return len(journal_entries)
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_ai_research_memo", fake_log_ai)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", fake_cached_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+        notifier=fake_notify,
+    )
+    supervisor.research_committee = ApprovingCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["order"]["error"] == "broker unavailable"
+    assert journal_entries == []
+    assert notifications == []
 
 
 @pytest.mark.asyncio

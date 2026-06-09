@@ -270,6 +270,13 @@ def _entry_order_action(order: dict[str, Any]) -> str:
     return f"market {side}"
 
 
+def _has_submitted_entry_order(result: dict[str, Any]) -> bool:
+    order = result.get("order")
+    if not isinstance(order, dict) or order.get("error"):
+        return False
+    return bool(order.get("id") or order.get("broker_order_id") or order.get("client_order_id"))
+
+
 def _format_entry_notification(result: dict[str, Any], *, adapter: AlpacaAdapter | None = None) -> str:
     order = result.get("order") or {}
     risk = result.get("risk_decision") or {}
@@ -291,6 +298,87 @@ def _format_entry_notification(result: dict[str, Any], *, adapter: AlpacaAdapter
             f"Trace: {trace}",
             f"Risk decision: {decision_id}",
             f"Order ID: {_short_order_id(order)}",
+        ]
+    )
+
+
+def _short_journal_text(value: Any, *, limit: int = 260) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unavailable"
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _format_ai_vote_summary(ai_result: "AIResearchRunResult | None") -> str:
+    if ai_result is None:
+        return "not run"
+    memo = ai_result.memo.memo if ai_result.memo and isinstance(ai_result.memo.memo, dict) else {}
+    votes = memo.get("provider_votes") if isinstance(memo, dict) else None
+    if not isinstance(votes, list) or not votes:
+        confidence = f", confidence={ai_result.memo.confidence:.2f}" if ai_result.memo and ai_result.memo.confidence is not None else ""
+        return f"{ai_result.verdict}{confidence}; reason={ai_result.reason}"
+    parts = []
+    for vote in votes:
+        if not isinstance(vote, dict):
+            continue
+        provider = str(vote.get("provider") or "provider")
+        verdict = str(vote.get("verdict") or "unknown")
+        confidence = vote.get("confidence")
+        if isinstance(confidence, int | float):
+            parts.append(f"{provider} {verdict} {float(confidence):.2f}")
+        else:
+            parts.append(f"{provider} {verdict}")
+    return ", ".join(parts) or f"{ai_result.verdict}; reason={ai_result.reason}"
+
+
+def _format_entry_journal_entry(
+    result: dict[str, Any],
+    *,
+    intent: Any,
+    signal_id: int | None,
+    ai_result: "AIResearchRunResult | None",
+    risk_profile: str,
+    adapter: AlpacaAdapter | None = None,
+) -> str:
+    order = result.get("order") or {}
+    risk = result.get("risk_decision") or {}
+    symbol = str(order.get("symbol") or getattr(intent, "symbol", "?")).upper()
+    label = _paper_live_label(order, adapter=adapter)
+    qty = _float(order.get("qty") or risk.get("sized_quantity") or risk.get("sized_qty"))
+    price = _float(order.get("avg_fill_price") or getattr(intent, "entry_price", 0.0))
+    notional = qty * price if qty and price else 0.0
+    fill_text = _format_price(price) if price else "pending"
+    notional_text = _format_price(notional) if notional else "pending"
+    order_status = str(order.get("status") or "unknown")
+    risk_reason = risk.get("reason") or "risk decision unavailable"
+    risk_id = risk.get("risk_decision_id") or "unknown"
+    trace_id = risk.get("trace_id") or "unknown"
+    scanner_reason = _short_journal_text(getattr(intent, "rationale", ""))
+
+    memo = ai_result.memo.memo if ai_result and ai_result.memo and isinstance(ai_result.memo.memo, dict) else {}
+    committee = memo.get("committee") if isinstance(memo, dict) else {}
+    bull_case = _short_journal_text(committee.get("bull_case") if isinstance(committee, dict) else None)
+    bear_case = _short_journal_text(committee.get("bear_case") if isinstance(committee, dict) else None)
+    ai_verdict = ai_result.verdict if ai_result else "not_run"
+    ai_confidence = (
+        f"{ai_result.memo.confidence:.2f}"
+        if ai_result and ai_result.memo and ai_result.memo.confidence is not None
+        else "n/a"
+    )
+
+    return "\n".join(
+        [
+            f"BUY: {symbol} ({label}, {risk_profile})",
+            f"Order: qty {qty:.6f}, status {order_status}, fill {fill_text}, notional {notional_text}.",
+            f"Scanner: {scanner_reason}",
+            f"AI gate: {ai_verdict}, confidence {ai_confidence}; votes: {_format_ai_vote_summary(ai_result)}.",
+            f"RiskEngine: {risk_reason}; decision {risk_id}; trace {trace_id}.",
+            f"Why: {bull_case}",
+            f"Watchouts: {bear_case}",
+            f"Signal: {signal_id if signal_id is not None else 'unknown'}",
         ]
     )
 
@@ -1001,7 +1089,25 @@ class TradingSupervisor:
                 },
             )()
             result = await self.order_manager.submit_trade_intent(intent, snapshot, signal_id=signal_id)
-            if result.get("order"):
+            if _has_submitted_entry_order(result):
+                try:
+                    await append_journal_entry(
+                        content=_format_entry_journal_entry(
+                            result,
+                            intent=intent,
+                            signal_id=signal_id,
+                            ai_result=ai_result,
+                            risk_profile=risk_profile,
+                            adapter=self.adapter,
+                        )
+                    )
+                except Exception as e:
+                    log.warning(
+                        "entry_journal_failed",
+                        symbol=intent.symbol.upper(),
+                        signal_id=signal_id,
+                        error=str(e),
+                    )
                 await self._notify(_format_entry_notification(result, adapter=self.adapter))
             return result
         return last_blocked_result
