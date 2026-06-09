@@ -15,6 +15,8 @@ from auto_trader.core.models import KillResult, SystemState
 from auto_trader.core.risk_profile import get_risk_profile
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.ai_committee import (
+    AGGREGATE_PROMPT_VERSION,
+    PROMPT_VERSION,
     ResearchMemo,
     ShadowResearchCommittee,
     build_research_packet,
@@ -1050,9 +1052,9 @@ class TradingSupervisor:
         model_tag = str(getattr(self.research_committee, "model_tag", provider))
         cache_provider = real_providers[0] if len(real_providers) == 1 else provider
         cache_prompt_versions = (
-            ("ai_research_committee/v0", "ai_research_failure/v0")
+            (PROMPT_VERSION, "ai_research_failure/v0")
             if len(real_providers) == 1
-            else ("ai_research_aggregate/v0", "ai_research_failure/v0")
+            else (AGGREGATE_PROMPT_VERSION, "ai_research_failure/v0")
         )
         lookups = (
             {
@@ -1103,9 +1105,9 @@ class TradingSupervisor:
         if real_providers:
             cache_provider = real_providers[0] if len(real_providers) == 1 else provider
             cache_prompt_versions = (
-                ("ai_research_committee/v0", "ai_research_failure/v0")
+                (PROMPT_VERSION, "ai_research_failure/v0")
                 if len(real_providers) == 1
-                else ("ai_research_aggregate/v0", "ai_research_failure/v0")
+                else (AGGREGATE_PROMPT_VERSION, "ai_research_failure/v0")
             )
             try:
                 cached = await get_latest_ai_research_memo_for_symbol(

@@ -1211,10 +1211,40 @@ def test_multi_provider_aggregate_approves_only_two_valid_approves_no_reject():
     )
 
     assert aggregate.provider == "multi"
-    assert aggregate.prompt_version == "ai_research_aggregate/v0"
+    assert aggregate.prompt_version == "ai_research_aggregate/v1"
     assert aggregate.verdict == "approve"
     assert aggregate.validation_passed is True
     assert aggregate.memo["quorum"]["approve_count"] == 2
+    assert aggregate.memo["quorum"]["risk_profile"] == "conservative"
+
+
+def test_multi_provider_aggregate_aggressive_allows_one_valid_approve_no_reject():
+    packet = build_research_packet(
+        TradeIntent(
+            symbol="SRTY",
+            side="long",
+            entry_price=20.0,
+            confidence=0.7,
+            features={"research_context": {"risk_profile": {"name": "aggressive"}}},
+        )
+    )
+    aggregate = aggregate_research_memos(
+        "SRTY",
+        [
+            _provider_memo("anthropic", "watch", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.68),
+            _provider_memo("xai", "watch", confidence=0.7),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "approve"
+    assert aggregate.validation_passed is True
+    assert aggregate.memo["quorum"]["approve_count"] == 1
+    assert aggregate.memo["quorum"]["reject_count"] == 0
+    assert aggregate.memo["quorum"]["risk_profile"] == "aggressive"
+    assert "aggressive approve requires at least one valid approve" in aggregate.memo["quorum"]["rule"]
 
 
 def test_multi_provider_aggregate_reject_overrides_approve_quorum():
@@ -2042,7 +2072,7 @@ async def test_multi_provider_supervisor_logs_members_and_aggregate():
         assert len(memos) == 4
         assert {memo["provider"] for memo in memos} == {"anthropic", "openai", "xai", "multi"}
         aggregate = next(memo for memo in memos if memo["provider"] == "multi")
-        assert aggregate["prompt_version"] == "ai_research_aggregate/v0"
+        assert aggregate["prompt_version"] == "ai_research_aggregate/v1"
         assert aggregate["verdict"] == "approve"
         assert len(aggregate["memo"]["provider_memo_ids"]) == 3
         assert {row["provider"] for row in aggregate["memo"]["provider_memo_ids"]} == {"anthropic", "openai", "xai"}
@@ -6965,7 +6995,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
             "id": 322,
             "symbol": "IVT",
             "provider": "multi",
-            "prompt_version": "ai_research_aggregate/v0",
+            "prompt_version": "ai_research_aggregate/v1",
             "verdict": "watch",
             "validation_passed": True,
         }
@@ -7011,7 +7041,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
     assert cache_calls[0]["provider"] == "multi"
     assert cache_calls[0]["symbol"] == "IVT"
     assert cache_calls[0]["model_tag"] == "multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.3"
-    assert cache_calls[0]["prompt_versions"] == ("ai_research_aggregate/v0", "ai_research_failure/v0")
+    assert cache_calls[0]["prompt_versions"] == ("ai_research_aggregate/v1", "ai_research_failure/v0")
     assert signal_calls == []
     assert journal_entries == []
 
@@ -7258,7 +7288,7 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache(monkey
             symbol="IVT",
             provider="multi",
             model_tag="multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.2",
-            prompt_version="ai_research_aggregate/v0",
+            prompt_version="ai_research_aggregate/v1",
             input_hash="old-aggregate",
             verdict="watch",
             confidence=0.61,

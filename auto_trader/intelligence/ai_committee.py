@@ -21,7 +21,7 @@ from auto_trader.utils.logging import get_logger
 log = get_logger("auto_trader.intelligence.ai_committee")
 
 PROMPT_VERSION = "ai_research_committee/v0"
-AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v0"
+AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v1"
 VALID_VERDICTS = {"approve", "reject", "watch"}
 REAL_PROVIDERS = ("openai", "xai", "anthropic", "gemini")
 MIN_APPROVE_CONFIDENCE = 0.65
@@ -579,6 +579,7 @@ def aggregate_research_memos(
     input_hash: str,
 ) -> ResearchMemo:
     """Aggregate independent provider memos into an auditable advisory verdict."""
+    risk_profile = _aggregate_risk_profile(packet)
     valid_memos = [memo for memo in member_memos if memo.validation_passed]
     valid_rejects = [memo for memo in valid_memos if memo.verdict == "reject"]
     valid_approves = [
@@ -590,9 +591,9 @@ def aggregate_research_memos(
     if valid_rejects:
         verdict = "reject"
         reason = "valid provider reject overrides approve quorum"
-    elif len(valid_approves) >= 2:
+    elif _aggregate_approve_quorum_met(risk_profile=risk_profile, approve_count=len(valid_approves)):
         verdict = "approve"
-        reason = "at least two valid providers approved and no valid provider rejected"
+        reason = _aggregate_approve_reason(risk_profile)
     else:
         verdict = "watch"
         reason = "approve quorum not met"
@@ -652,8 +653,9 @@ def aggregate_research_memos(
             "input_packet": packet,
             "committee": output,
             "quorum": {
-                "rule": "approve requires at least two valid approve votes with confidence >= 0.65 and no valid reject",
+                "rule": _aggregate_rule_text(risk_profile),
                 "reason": reason,
+                "risk_profile": risk_profile,
                 "valid_provider_count": len(valid_memos),
                 "approve_count": len(valid_approves),
                 "reject_count": len(valid_rejects),
@@ -662,6 +664,35 @@ def aggregate_research_memos(
             "provider_votes": votes,
         },
     )
+
+
+def _aggregate_risk_profile(packet: dict[str, Any]) -> str:
+    context = packet.get("verified_research_context")
+    if isinstance(context, dict):
+        risk_profile = context.get("risk_profile")
+        if isinstance(risk_profile, dict):
+            name = str(risk_profile.get("name") or "").lower()
+            if name in {"conservative", "aggressive", "risky"}:
+                return name
+    return "conservative"
+
+
+def _aggregate_approve_quorum_met(*, risk_profile: str, approve_count: int) -> bool:
+    if risk_profile == "aggressive":
+        return approve_count >= 1
+    return approve_count >= 2
+
+
+def _aggregate_approve_reason(risk_profile: str) -> str:
+    if risk_profile == "aggressive":
+        return "aggressive profile allows one valid provider approve and no valid provider rejected"
+    return "at least two valid providers approved and no valid provider rejected"
+
+
+def _aggregate_rule_text(risk_profile: str) -> str:
+    if risk_profile == "aggressive":
+        return "aggressive approve requires at least one valid approve vote with confidence >= 0.65 and no valid reject"
+    return "approve requires at least two valid approve votes with confidence >= 0.65 and no valid reject"
 
 
 async def research_committee_round(
