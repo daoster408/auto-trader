@@ -67,7 +67,7 @@ Required output bundle per major milestone:
 
 - Per-trade risk: 0.5% of equity
 - Max new positions per day (initial): 1
-- Max initial gross exposure: 25% of equity
+- Max initial gross exposure: 25% of equity by default; active aggressive experiments may set the configured cap to 100% while preserving per-position sizing, halts, duplicate guards, and RiskEngine authority.
 - Daily loss halt: -1.75%
 - Weekly loss halt: -4.0%
 - Peak drawdown halt: -6.0%

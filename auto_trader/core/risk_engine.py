@@ -26,7 +26,7 @@ class RiskEngine:
         self._daily_new_positions = 0  # reset at EOD (later)
         log.info("risk_engine_initialized", model_tag="risk/v0")
 
-    def evaluate(self, intent: TradeIntent, snapshot) -> RiskDecision:
+    def evaluate(self, intent: TradeIntent, snapshot, *, consume_daily_counter: bool = True) -> RiskDecision:
         """Core decision point. Returns approved/rejected with full audit trail."""
         trace_id = str(uuid.uuid4())[:8]
         model_tag = "rules_fallback/v0"  # will be overridden when LLM wired
@@ -157,14 +157,21 @@ class RiskEngine:
             )
 
         # 4. Gross exposure guard (very loose for bootstrap)
-        current_exposure = sum(p.get("market_value", 0) for p in open_positions)
+        current_exposure = sum(abs(float(p.get("market_value", 0) or 0)) for p in open_positions)
         projected = current_exposure + proposed_notional
-        if projected > snapshot.equity * (self.settings.max_gross_exposure_pct / 100):
+        projected_exposure_pct = (projected / snapshot.equity) * 100 if snapshot.equity else 0.0
+        max_gross_exposure_pct = self._effective_max_gross_exposure_pct()
+        if projected > snapshot.equity * (max_gross_exposure_pct / 100):
             return RiskDecision(
                 approved=False,
                 reason="Gross exposure limit would be breached",
                 sized_quantity=None,
-                risk_metrics={"current": current_exposure, "projected": projected},
+                risk_metrics={
+                    "current": current_exposure,
+                    "projected": projected,
+                    "projected_exposure_pct": projected_exposure_pct,
+                    "max_gross_exposure_pct": max_gross_exposure_pct,
+                },
                 model_tag=model_tag,
                 trace_id=trace_id,
             )
@@ -179,12 +186,17 @@ class RiskEngine:
                 "daily_new_after": self._daily_new_positions + 1,
                 "risk_profile": profile.name,
                 "early_notional_cap_pct": profile.early_notional_cap_pct,
+                "current_gross_exposure": current_exposure,
+                "projected_gross_exposure": projected,
+                "projected_gross_exposure_pct": projected_exposure_pct,
+                "max_gross_exposure_pct": max_gross_exposure_pct,
             },
             model_tag=model_tag,
             trace_id=trace_id,
         )
 
-        self._daily_new_positions += 1
+        if consume_daily_counter:
+            self._daily_new_positions += 1
         log.info(
             "risk_decision_approved",
             symbol=intent.symbol,
@@ -197,3 +209,9 @@ class RiskEngine:
     def reset_daily_counters(self) -> None:
         self._daily_new_positions = 0
         log.info("daily_risk_counters_reset")
+
+    def _effective_max_gross_exposure_pct(self) -> float:
+        configured = float(self.settings.max_gross_exposure_pct)
+        if bool(getattr(self.settings, "alpaca_paper", True)):
+            return configured
+        return min(configured, 25.0)

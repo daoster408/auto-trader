@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import ValidationError
 
-from auto_trader.core.models import SystemState, KillResult, TradeIntent
+from auto_trader.core.models import SystemState, KillResult, RiskDecision, TradeIntent
 from auto_trader.account_risk_validate import (
     AccountRiskScenario,
     ValidationGate as AccountRiskValidationGate,
@@ -186,6 +186,21 @@ class DummySnapshot:
     equity = 100.0
     open_positions = []
     today_new_entries = 0
+
+
+class ApprovingPreviewRisk:
+    def evaluate(self, intent, snapshot, *, consume_daily_counter=True):
+        assert consume_daily_counter is False
+        return RiskDecision(
+            approved=True,
+            reason="preview passed",
+            sized_quantity=1.0,
+            risk_metrics={
+                "projected_gross_exposure_pct": 5.0,
+                "projected_gross_exposure": 5.0,
+                "max_gross_exposure_pct": 100.0,
+            },
+        )
 
 
 class DummySnapshotWithOpenPosition:
@@ -1245,6 +1260,75 @@ def test_multi_provider_aggregate_aggressive_allows_one_valid_approve_no_reject(
     assert aggregate.memo["quorum"]["reject_count"] == 0
     assert aggregate.memo["quorum"]["risk_profile"] == "aggressive"
     assert "aggressive approve requires at least one valid approve" in aggregate.memo["quorum"]["rule"]
+
+
+def test_multi_provider_aggregate_high_exposure_requires_unanimous_approve():
+    packet = build_research_packet(
+        TradeIntent(
+            symbol="SRTY",
+            side="long",
+            entry_price=20.0,
+            confidence=0.7,
+            features={
+                "research_context": {
+                    "risk": {
+                        "risk_profile": {"name": "aggressive"},
+                        "ai_unanimous_required": True,
+                    }
+                }
+            },
+        )
+    )
+
+    aggregate = aggregate_research_memos(
+        "SRTY",
+        [
+            _provider_memo("anthropic", "watch", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.68),
+            _provider_memo("xai", "watch", confidence=0.7),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "watch"
+    assert aggregate.memo["quorum"]["unanimous_required"] is True
+    assert aggregate.memo["quorum"]["approve_count"] == 1
+    assert "unanimous valid provider approve" in aggregate.memo["quorum"]["reason"]
+
+
+def test_multi_provider_aggregate_high_exposure_accepts_unanimous_approve():
+    packet = build_research_packet(
+        TradeIntent(
+            symbol="SRTY",
+            side="long",
+            entry_price=20.0,
+            confidence=0.7,
+            features={
+                "research_context": {
+                    "risk": {
+                        "risk_profile": {"name": "aggressive"},
+                        "ai_unanimous_required": True,
+                    }
+                }
+            },
+        )
+    )
+
+    aggregate = aggregate_research_memos(
+        "SRTY",
+        [
+            _provider_memo("anthropic", "approve", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.68),
+            _provider_memo("xai", "approve", confidence=0.7),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "approve"
+    assert aggregate.memo["quorum"]["unanimous_required"] is True
+    assert aggregate.memo["quorum"]["approve_count"] == 3
 
 
 def test_multi_provider_aggregate_supports_legacy_top_level_risk_profile():
@@ -3252,6 +3336,67 @@ def test_risk_engine_sizes_fractional_quantity_under_early_cap():
     assert decision.sized_quantity is not None
     assert decision.sized_quantity < 1.0
     assert decision.sized_quantity * intent.entry_price <= DummySnapshot.equity * 0.05
+
+
+def test_risk_engine_preview_does_not_consume_daily_counter():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, DummySettings())
+    intent = TradeIntent(symbol="AMPX", side="long", entry_price=10.0)
+
+    preview = risk.evaluate(intent, DummySnapshot(), consume_daily_counter=False)
+    actual = risk.evaluate(intent, DummySnapshot())
+
+    assert preview.approved is True
+    assert actual.approved is True
+    assert preview.risk_metrics["daily_new_after"] == 1
+    assert actual.risk_metrics["daily_new_after"] == 1
+
+
+def test_risk_engine_allows_100_pct_gross_exposure_capacity():
+    class FullExposureSettings(DummySettings):
+        max_gross_exposure_pct = 100.0
+        max_new_positions_per_day = 5
+
+    class Snapshot:
+        equity = 100.0
+        open_positions = [
+            {"symbol": "AAA", "qty": 1, "market_value": 30.0},
+            {"symbol": "BBB", "qty": 1, "market_value": 30.0},
+            {"symbol": "CCC", "qty": 1, "market_value": 30.0},
+        ]
+        today_new_entries = 3
+        max_new_positions_per_day = 5
+
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, FullExposureSettings())
+
+    decision = risk.evaluate(TradeIntent(symbol="DDD", side="long", entry_price=10.0), Snapshot())
+
+    assert decision.approved is True
+    assert decision.risk_metrics["projected_gross_exposure_pct"] == pytest.approx(95.0)
+    assert decision.risk_metrics["max_gross_exposure_pct"] == 100.0
+
+
+def test_risk_engine_clamps_100_pct_gross_exposure_outside_paper():
+    class FullExposureLiveSettings(DummySettings):
+        alpaca_paper = False
+        max_gross_exposure_pct = 100.0
+        max_new_positions_per_day = 5
+
+    class Snapshot:
+        equity = 100.0
+        open_positions = [{"symbol": "AAA", "qty": 1, "market_value": 30.0}]
+        today_new_entries = 1
+        max_new_positions_per_day = 5
+
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, FullExposureLiveSettings())
+
+    decision = risk.evaluate(TradeIntent(symbol="DDD", side="long", entry_price=10.0), Snapshot())
+
+    assert decision.approved is False
+    assert decision.reason == "Gross exposure limit would be breached"
+    assert decision.risk_metrics["max_gross_exposure_pct"] == 25.0
 
 
 def test_risk_profile_controls_paper_sizing_and_live_risky_downgrades():
@@ -6638,6 +6783,8 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.calls = []
 
@@ -6743,6 +6890,8 @@ async def test_supervisor_auto_entry_logs_shadow_ai_research(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.intents = []
 
@@ -6825,6 +6974,8 @@ async def test_supervisor_skips_paid_ai_research_when_gate_disabled(monkeypatch)
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.calls = []
 
@@ -6897,6 +7048,8 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when cached AI memo is watch")
 
@@ -6993,6 +7146,8 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when cached multi-provider AI memo is watch")
 
@@ -7093,6 +7248,8 @@ async def test_ai_entry_gate_cached_watch_tries_next_ranked_candidate(monkeypatc
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.calls = []
 
@@ -7188,6 +7345,8 @@ async def test_ai_entry_gate_systemic_failure_does_not_try_next_candidate(monkey
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when AI failure is systemic")
 
@@ -7273,6 +7432,8 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache(monkey
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             return {"order": {"id": "entry-after-current-committee", "symbol": intent.symbol}}
 
@@ -7380,6 +7541,8 @@ async def test_ai_entry_gate_cache_lookup_failure_blocks_without_paid_call(monke
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when AI cache lookup fails")
 
@@ -7458,6 +7621,8 @@ async def test_ai_paid_prefilter_blocks_low_volume_before_paid_provider(monkeypa
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when paid AI prefilter blocks")
 
@@ -7567,6 +7732,8 @@ async def test_ai_entry_gate_cached_prefilter_watch_skips_signal_and_journal(mon
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called for cached prefilter watch")
 
@@ -7703,6 +7870,8 @@ async def test_ai_paid_prefilter_allows_strong_candidate_to_paid_provider(monkey
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.calls = []
 
@@ -7808,6 +7977,8 @@ async def test_ai_entry_gate_approve_continues_to_order_manager(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.calls = []
 
@@ -7885,6 +8056,215 @@ async def test_ai_entry_gate_approve_continues_to_order_manager(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_entry_capacity_precheck_skips_paid_ai_when_risk_would_reject(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 12
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class PreviewRejectRisk:
+        def evaluate(self, intent, snapshot, *, consume_daily_counter=True):
+            assert consume_daily_counter is False
+            return RiskDecision(
+                approved=False,
+                reason="Gross exposure limit would be breached",
+                sized_quantity=None,
+                risk_metrics={"projected_gross_exposure_pct": 101.0},
+            )
+
+    class FakeOrderManager:
+        risk = PreviewRejectRisk()
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            raise AssertionError("OrderManager should not submit when capacity preview rejects")
+
+    class ExplodingCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+        async def research(self, intent, *, signal_id=None):
+            raise AssertionError("paid AI should not run when capacity preview rejects")
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+        return [TradeIntent(symbol="EWN", side="long", entry_price=67.0, confidence=0.9)]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def exploding_log_signal(**kwargs):
+        raise AssertionError("signal should not be logged when capacity preview rejects before AI")
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", exploding_log_signal)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    supervisor.research_committee = ExplodingCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[{"symbol": "AAA", "qty": 1, "market_value": 99.0}],
+        today_new_entries=1,
+        max_new_positions_per_day=5,
+        risk_profile="aggressive",
+    )
+
+    assert result["blocked"] is True
+    assert result["risk_precheck"]["reason"] == "Gross exposure limit would be breached"
+
+
+@pytest.mark.asyncio
+async def test_entry_capacity_preview_unavailable_blocks_before_paid_ai(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 12
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            raise AssertionError("OrderManager should not submit when capacity preview is unavailable")
+
+    class ExplodingCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+        async def research(self, intent, *, signal_id=None):
+            raise AssertionError("paid AI should not run when capacity preview is unavailable")
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+        return [TradeIntent(symbol="EWN", side="long", entry_price=67.0, confidence=0.9)]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def exploding_log_signal(**kwargs):
+        raise AssertionError("signal should not be logged when capacity preview is unavailable")
+
+    async def exploding_count(**kwargs):
+        raise AssertionError("budget counters should not run when capacity preview is unavailable")
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", exploding_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", exploding_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts", exploding_count)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    supervisor.research_committee = ExplodingCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=5,
+        risk_profile="aggressive",
+    )
+
+    assert result["blocked"] is True
+    assert result["risk_precheck"]["reason"] == "entry_capacity_preview_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_entry_inactive_account_status_blocks_before_paid_ai(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 12
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            raise AssertionError("open orders should not be fetched when account is inactive")
+
+    class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            raise AssertionError("OrderManager should not submit when account is inactive")
+
+    class ExplodingCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+        async def research(self, intent, *, signal_id=None):
+            raise AssertionError("paid AI should not run when account is inactive")
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def exploding_signals(*args, **kwargs):
+        raise AssertionError("signals should not be generated when account is inactive")
+
+    async def exploding_log_signal(**kwargs):
+        raise AssertionError("signal should not be logged when account is inactive")
+
+    async def exploding_count(**kwargs):
+        raise AssertionError("budget counters should not run when account is inactive")
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", exploding_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", exploding_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", exploding_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts", exploding_count)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    supervisor.research_committee = ExplodingCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.INACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=5,
+        risk_profile="aggressive",
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_ai_entry_gate_submission_error_does_not_write_buy_journal(monkeypatch):
     class GateSettings(DummySupervisorSettings):
         auto_entry_enabled = True
@@ -7902,6 +8282,8 @@ async def test_ai_entry_gate_submission_error_does_not_write_buy_journal(monkeyp
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             return {
                 "order": {"error": "broker unavailable"},
@@ -7992,6 +8374,8 @@ async def test_ai_entry_gate_reject_blocks_before_order_manager(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.calls = []
 
@@ -8079,6 +8463,8 @@ async def test_ai_entry_gate_runtime_config_enables_gate(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when runtime AI gate rejects")
 
@@ -8164,6 +8550,8 @@ async def test_ai_entry_gate_budget_exhausted_fails_closed(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when AI budget is exhausted")
 
@@ -8300,6 +8688,8 @@ async def test_ai_entry_gate_requires_real_provider(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when gate has only shadow research")
 
@@ -8372,6 +8762,8 @@ async def test_ai_entry_gate_invalid_output_fails_closed(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when AI output is invalid")
 
@@ -8454,6 +8846,8 @@ async def test_ai_entry_gate_provider_failure_fails_closed(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when AI provider fails")
 
@@ -8538,6 +8932,8 @@ async def test_ai_entry_gate_research_disabled_fails_closed(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when AI research is disabled")
 
@@ -8598,6 +8994,8 @@ async def test_ai_entry_gate_budget_count_failure_fails_closed(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         async def submit_trade_intent(self, intent, snapshot, signal_id=None):
             raise AssertionError("OrderManager should not be called when AI budget count fails")
 
@@ -8694,6 +9092,8 @@ async def test_supervisor_auto_entry_uses_runtime_entry_cap(monkeypatch):
             return []
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.snapshots = []
 
@@ -8781,6 +9181,8 @@ async def test_supervisor_blocks_auto_entry_when_broker_has_open_entry_order(mon
             ]
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.calls = 0
 
@@ -8864,6 +9266,8 @@ async def test_supervisor_account_risk_halt_flattens_and_blocks_entry(monkeypatc
             return 1
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.calls = 0
 
@@ -8955,6 +9359,8 @@ async def test_supervisor_blocks_auto_entry_when_positions_unavailable(monkeypat
             raise RuntimeError("positions down")
 
     class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
         def __init__(self):
             self.calls = 0
 

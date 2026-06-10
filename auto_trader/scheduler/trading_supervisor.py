@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.state_machine import StateMachine
-from auto_trader.core.models import KillResult, SystemState
+from auto_trader.core.models import KillResult, RiskDecision, SystemState
 from auto_trader.core.risk_profile import get_risk_profile
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.ai_committee import (
@@ -64,6 +64,7 @@ log = get_logger("auto_trader.scheduler.trading_supervisor")
 
 ENTRY_CANDIDATE_EVAL_LIMIT = 10
 AI_ENTRY_GATE_CANDIDATE_BLOCK_VERDICTS = {"watch", "reject"}
+AI_HIGH_EXPOSURE_UNANIMOUS_REASON = "projected gross exposure exceeds unanimous AI threshold"
 
 
 async def _runtime_risk_profile(settings: Any, *, paper: bool) -> str:
@@ -176,6 +177,77 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 def _now_utc() -> str:
     return datetime.now(UTC).isoformat() + "Z"
+
+
+def _account_status_is_active(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    if "." in normalized:
+        normalized = normalized.rsplit(".", 1)[-1]
+    return normalized == "active"
+
+
+def _entry_snapshot(
+    *,
+    account: dict[str, Any],
+    positions: list[dict[str, Any]],
+    today_new_entries: int,
+    max_new_positions_per_day: int,
+    risk_profile: str,
+):
+    return type(
+        "SupervisorSnapshot",
+        (object,),
+        {
+            "equity": _float(account.get("equity")),
+            "open_positions": positions,
+            "today_new_entries": today_new_entries,
+            "max_new_positions_per_day": max_new_positions_per_day,
+            "risk_profile": risk_profile,
+        },
+    )()
+
+
+def _preview_entry_capacity(order_manager: Any, intent: Any, snapshot: Any) -> RiskDecision | None:
+    risk = getattr(order_manager, "risk", None)
+    evaluate = getattr(risk, "evaluate", None)
+    if not callable(evaluate):
+        return None
+    try:
+        return evaluate(intent, snapshot, consume_daily_counter=False)
+    except TypeError:
+        log.warning("entry_capacity_preview_unsupported")
+        return None
+
+
+def _risk_context_with_entry_capacity(
+    risk_context: dict[str, Any],
+    decision: RiskDecision | None,
+    *,
+    settings: Any,
+) -> dict[str, Any]:
+    if decision is None:
+        return risk_context
+    metrics = decision.risk_metrics or {}
+    projected_pct = _float(metrics.get("projected_gross_exposure_pct"))
+    threshold = float(getattr(settings, "ai_high_exposure_unanimous_threshold_pct", 60.0) or 60.0)
+    enriched = dict(risk_context)
+    enriched["entry_capacity"] = {
+        "precheck_approved": bool(decision.approved),
+        "reason": decision.reason,
+        "sized_quantity": decision.sized_quantity,
+        "current_gross_exposure": metrics.get("current_gross_exposure", metrics.get("current")),
+        "projected_gross_exposure": metrics.get("projected_gross_exposure", metrics.get("projected")),
+        "projected_gross_exposure_pct": projected_pct,
+        "max_gross_exposure_pct": metrics.get(
+            "max_gross_exposure_pct",
+            getattr(settings, "max_gross_exposure_pct", None),
+        ),
+    }
+    enriched["ai_unanimous_threshold_pct"] = threshold
+    enriched["ai_unanimous_required"] = bool(decision.approved and projected_pct > threshold)
+    if enriched["ai_unanimous_required"]:
+        enriched["ai_unanimous_reason"] = AI_HIGH_EXPOSURE_UNANIMOUS_REASON
+    return enriched
 
 
 def _alert_signature(message: str) -> str:
@@ -941,12 +1013,11 @@ class TradingSupervisor:
             return None
         if not clock.get("is_open"):
             return None
-        account_status = str(account.get("account_status", "")).lower()
         if (
             account.get("status") != "CONNECTED"
             or account.get("trading_blocked")
             or account.get("account_blocked")
-            or "active" not in account_status
+            or not _account_status_is_active(account.get("account_status"))
         ):
             await self._notify_once("entry-account-not-tradable", "ENTRY BLOCKED: Alpaca account is not tradable.")
             return None
@@ -1008,16 +1079,65 @@ class TradingSupervisor:
                     reason=cached_candidate_block.reason,
                 )
                 continue
+            risk_context = build_risk_research_context(
+                account=account,
+                clock=clock,
+                positions=positions,
+                today_new_entries=today_new_entries,
+                max_new_positions_per_day=max_new_positions_per_day,
+                risk_profile=risk_profile,
+            )
+            intent = with_research_context(signal, {"risk": risk_context})
+            snapshot = _entry_snapshot(
+                account=account,
+                positions=positions,
+                today_new_entries=today_new_entries,
+                max_new_positions_per_day=max_new_positions_per_day,
+                risk_profile=risk_profile,
+            )
+            capacity_decision = _preview_entry_capacity(self.order_manager, intent, snapshot)
+            if capacity_decision is None and ai_gate_enabled and ai_research_enabled and real_providers:
+                last_blocked_result = {
+                    "blocked": True,
+                    "reason": f"Entry blocked before paid AI for {intent.symbol.upper()}: capacity preview unavailable",
+                    "risk_precheck": {
+                        "approved": False,
+                        "reason": "entry_capacity_preview_unavailable",
+                    },
+                }
+                log.warning(
+                    "entry_blocked_capacity_preview_unavailable",
+                    symbol=intent.symbol.upper(),
+                    providers=real_providers,
+                )
+                return last_blocked_result
+            if capacity_decision is not None and not capacity_decision.approved:
+                last_blocked_result = {
+                    "blocked": True,
+                    "reason": (
+                        f"Entry skipped before paid AI for {intent.symbol.upper()}: "
+                        f"{capacity_decision.reason}"
+                    ),
+                    "risk_precheck": {
+                        "approved": False,
+                        "reason": capacity_decision.reason,
+                        "metrics": capacity_decision.risk_metrics,
+                    },
+                }
+                log.info(
+                    "entry_skipped_before_paid_ai",
+                    symbol=intent.symbol.upper(),
+                    reason=capacity_decision.reason,
+                    metrics=capacity_decision.risk_metrics,
+                )
+                continue
             intent = with_research_context(
                 signal,
                 {
-                    "risk": build_risk_research_context(
-                        account=account,
-                        clock=clock,
-                        positions=positions,
-                        today_new_entries=today_new_entries,
-                        max_new_positions_per_day=max_new_positions_per_day,
-                        risk_profile=risk_profile,
+                    "risk": _risk_context_with_entry_capacity(
+                        risk_context,
+                        capacity_decision,
+                        settings=self.settings,
                     )
                 },
             )
@@ -1077,17 +1197,6 @@ class TradingSupervisor:
                         )
                         continue
                     return last_blocked_result
-            snapshot = type(
-                "SupervisorSnapshot",
-                (object,),
-                {
-                    "equity": _float(account.get("equity")),
-                    "open_positions": positions,
-                    "today_new_entries": today_new_entries,
-                    "max_new_positions_per_day": max_new_positions_per_day,
-                    "risk_profile": risk_profile,
-                },
-            )()
             result = await self.order_manager.submit_trade_intent(intent, snapshot, signal_id=signal_id)
             if _has_submitted_entry_order(result):
                 try:
@@ -1256,20 +1365,19 @@ class TradingSupervisor:
             prefilter = evaluate_paid_ai_prefilter(intent, settings=self.settings, risk_profile=risk_profile)
             if prefilter.blocked:
                 prefilter_already_logged = False
-                if len(real_providers) == 1:
-                    try:
-                        prefilter_already_logged = await get_latest_ai_research_memo_for_symbol(
-                            provider=PREFILTER_PROVIDER,
-                            symbol=intent.symbol,
-                            today_utc=True,
-                            prompt_versions=(PREFILTER_PROMPT_VERSION,),
-                        ) is not None
-                    except Exception as e:
-                        log.warning(
-                            "ai_paid_prefilter_dedupe_lookup_failed",
-                            symbol=intent.symbol.upper(),
-                            error=str(e),
-                        )
+                try:
+                    prefilter_already_logged = await get_latest_ai_research_memo_for_symbol(
+                        provider=PREFILTER_PROVIDER,
+                        symbol=intent.symbol,
+                        today_utc=True,
+                        prompt_versions=(PREFILTER_PROMPT_VERSION,),
+                    ) is not None
+                except Exception as e:
+                    log.warning(
+                        "ai_paid_prefilter_dedupe_lookup_failed",
+                        symbol=intent.symbol.upper(),
+                        error=str(e),
+                    )
                 if not prefilter_already_logged:
                     await log_ai_research_memo(
                         signal_id=signal_id,
@@ -1359,21 +1467,21 @@ class TradingSupervisor:
             remaining_calls = max(0, daily_max - daily_count)
             if daily_max <= 0 or remaining_calls < attempts_needed:
                 budget_skip_already_logged = False
-                if len(real_providers) == 1:
-                    try:
-                        budget_skip_already_logged = await get_latest_ai_research_memo_for_symbol(
-                            provider=real_providers[0],
-                            symbol=intent.symbol,
-                            today_utc=True,
-                            prompt_versions=("ai_research_budget/v0",),
-                        ) is not None
-                    except Exception as e:
-                        log.warning(
-                            "ai_research_budget_skip_lookup_failed",
-                            symbol=intent.symbol.upper(),
-                            provider=real_providers[0],
-                            error=str(e),
-                        )
+                try:
+                    budget_skip_already_logged = await get_latest_ai_research_memo_for_symbol(
+                        provider=provider,
+                        symbol=intent.symbol,
+                        model_tag=model_tag,
+                        today_utc=True,
+                        prompt_versions=("ai_research_budget/v0",),
+                    ) is not None
+                except Exception as e:
+                    log.warning(
+                        "ai_research_budget_skip_lookup_failed",
+                        symbol=intent.symbol.upper(),
+                        provider=provider,
+                        error=str(e),
+                    )
                 if not budget_skip_already_logged:
                     await log_ai_research_memo(
                         signal_id=signal_id,
@@ -1412,7 +1520,7 @@ class TradingSupervisor:
                     log.info(
                         "ai_research_budget_skip_deduped",
                         symbol=intent.symbol.upper(),
-                        provider=real_providers[0],
+                        provider=provider,
                     )
                 return AIResearchRunResult(
                     symbol=intent.symbol.upper(),

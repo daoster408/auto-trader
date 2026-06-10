@@ -580,6 +580,7 @@ def aggregate_research_memos(
 ) -> ResearchMemo:
     """Aggregate independent provider memos into an auditable advisory verdict."""
     risk_profile = _aggregate_risk_profile(packet)
+    unanimous_required = _aggregate_unanimous_required(packet)
     valid_memos = [memo for memo in member_memos if memo.validation_passed]
     valid_rejects = [memo for memo in valid_memos if memo.verdict == "reject"]
     valid_approves = [
@@ -591,6 +592,12 @@ def aggregate_research_memos(
     if valid_rejects:
         verdict = "reject"
         reason = "valid provider reject overrides approve quorum"
+    elif unanimous_required and len(valid_approves) == len(member_memos) and len(valid_memos) == len(member_memos):
+        verdict = "approve"
+        reason = "projected high exposure requires every configured provider to approve"
+    elif unanimous_required:
+        verdict = "watch"
+        reason = "projected high exposure requires unanimous valid provider approve"
     elif _aggregate_approve_quorum_met(risk_profile=risk_profile, approve_count=len(valid_approves)):
         verdict = "approve"
         reason = _aggregate_approve_reason(risk_profile)
@@ -656,6 +663,7 @@ def aggregate_research_memos(
                 "rule": _aggregate_rule_text(risk_profile),
                 "reason": reason,
                 "risk_profile": risk_profile,
+                "unanimous_required": unanimous_required,
                 "valid_provider_count": len(valid_memos),
                 "approve_count": len(valid_approves),
                 "reject_count": len(valid_rejects),
@@ -678,6 +686,16 @@ def _aggregate_risk_profile(packet: dict[str, Any]) -> str:
         if name:
             return name
     return "conservative"
+
+
+def _aggregate_unanimous_required(packet: dict[str, Any]) -> bool:
+    context = packet.get("verified_research_context")
+    if not isinstance(context, dict):
+        return False
+    risk = context.get("risk")
+    if not isinstance(risk, dict):
+        return False
+    return bool(risk.get("ai_unanimous_required"))
 
 
 def _risk_profile_name(value: Any) -> str | None:
@@ -703,6 +721,8 @@ def _aggregate_approve_reason(risk_profile: str) -> str:
 
 
 def _aggregate_rule_text(risk_profile: str) -> str:
+    # High-exposure packets can add a stricter unanimous override; that trigger
+    # is recorded separately in quorum.unanimous_required/reason.
     if risk_profile == "aggressive":
         return "aggressive approve requires at least one valid approve vote with confidence >= 0.65 and no valid reject"
     return "approve requires at least two valid approve votes with confidence >= 0.65 and no valid reject"

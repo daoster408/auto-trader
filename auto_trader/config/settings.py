@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     ai_research_gemini_model: str = Field("", alias="AI_RESEARCH_GEMINI_MODEL")
     ai_research_timeout_seconds: float = Field(8.0, ge=1.0, le=15.0, alias="AI_RESEARCH_TIMEOUT_SECONDS")
     ai_research_max_calls_per_day: int = Field(0, ge=0, alias="AI_RESEARCH_MAX_CALLS_PER_DAY")
+    ai_high_exposure_unanimous_threshold_pct: float = Field(
+        60.0,
+        ge=0.0,
+        le=100.0,
+        alias="AI_HIGH_EXPOSURE_UNANIMOUS_THRESHOLD_PCT",
+    )
     ai_paid_prefilter_enabled: bool = Field(True, alias="AI_PAID_PREFILTER_ENABLED")
     ai_paid_prefilter_min_rel_volume: float = Field(1.0, ge=0.0, alias="AI_PAID_PREFILTER_MIN_REL_VOLUME")
     ai_paid_prefilter_strong_rel_volume: float = Field(2.5, ge=0.0, alias="AI_PAID_PREFILTER_STRONG_REL_VOLUME")
