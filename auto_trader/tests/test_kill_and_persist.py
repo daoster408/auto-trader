@@ -35,7 +35,12 @@ from auto_trader.edge_report import (
     render_learning_brief,
     write_scoreboard_memory_pack,
 )
-from auto_trader.brain_review import build_brain_review_bundle, run_brain_review_pack, write_brain_review_bundle
+from auto_trader.brain_review import (
+    build_brain_guidance_pack,
+    build_brain_review_bundle,
+    run_brain_review_pack,
+    write_brain_review_bundle,
+)
 from auto_trader.ai_research_preflight import (
     build_ai_research_preflight_report,
     render_ai_research_preflight,
@@ -43,6 +48,14 @@ from auto_trader.ai_research_preflight import (
 )
 import auto_trader.ai_research_smoke as ai_research_smoke
 import auto_trader.ai_entry_gate_rehearsal as ai_entry_gate_rehearsal
+from auto_trader.ai_postmortem_review import (
+    AI_POSTMORTEM_PROMPT_VERSION,
+    PostmortemProviderMemo,
+    build_ai_postmortem_pack,
+    postmortem_attempt_hash,
+    postmortem_packet_hash,
+    run_ai_postmortem_review,
+)
 from auto_trader.ai_entry_gate_rehearsal import run_ai_entry_gate_rehearsal, render_ai_entry_gate_rehearsal
 from auto_trader.ai_rehearsal_batch import run_ai_rehearsal_batch, render_ai_rehearsal_batch
 from auto_trader.ai_research_smoke import run_ai_research_smoke
@@ -1510,6 +1523,286 @@ async def test_brain_guidance_approve_wording_cannot_force_shadow_approval(tmp_p
     assert memo.verdict == "reject"
     assert memo.memo["input_packet"]["verified_research_context"]["brain_guidance"]["status"] == "loaded"
     assert "sized_quantity" not in memo.memo["committee"]
+
+
+class _PostmortemSettings:
+    def __init__(self, tmp_path: Path, *, max_calls: int = 3) -> None:
+        self.db_path = str(tmp_path / "postmortem.db")
+        self.ai_research_max_calls_per_day = 0
+        self.ai_postmortem_max_calls_per_day = max_calls
+        self.brain_review_dir = str(tmp_path / "brain_reviews")
+        self.brain_guidance_path = str(tmp_path / "brain_reviews" / "brain_guidance_pack.json")
+        self.ai_postmortem_path = str(tmp_path / "brain_reviews" / "ai_postmortem_pack.json")
+        self.ai_research_providers = "openai"
+        self.ai_research_provider = "openai"
+        self.ai_research_model = "fake-postmortem"
+        self.ai_research_openai_model = "fake-postmortem"
+        self.ai_research_timeout_seconds = 1.0
+
+
+class _FakePostmortemProvider:
+    provider = "openai"
+    model_tag = "openai/fake-postmortem"
+
+    def __init__(self, *, valid: bool = True) -> None:
+        self.valid = valid
+        self.calls = 0
+
+    async def review(self, packet):
+        self.calls += 1
+        digest = postmortem_packet_hash(packet)
+        if not self.valid:
+            return PostmortemProviderMemo(
+                provider=self.provider,
+                model_tag=self.model_tag,
+                prompt_version=AI_POSTMORTEM_PROMPT_VERSION,
+                input_hash=digest,
+                used_only_provided_data=False,
+                validation_passed=False,
+                output={
+                    "used_only_provided_data": False,
+                    "lessons": [],
+                    "edge_hypotheses": [],
+                    "budget_leaks": [],
+                    "provider_notes": [],
+                    "operator_recommendations": [],
+                    "judge_summary": "",
+                    "validation_errors": ["used_unverified_data", "invalid_judge_summary"],
+                },
+            )
+        return PostmortemProviderMemo(
+            provider=self.provider,
+            model_tag=self.model_tag,
+            prompt_version=AI_POSTMORTEM_PROMPT_VERSION,
+            input_hash=digest,
+            used_only_provided_data=True,
+            validation_passed=True,
+            output={
+                "used_only_provided_data": True,
+                "lessons": ["Prioritize strong relative volume when spread is tight."],
+                "edge_hypotheses": ["Test aggressive-profile candidates with fresh news and relvol above 2x."],
+                "budget_leaks": ["Stop repeatedly spending on candidate_only setups with missing move data."],
+                "provider_notes": ["OpenAI fake provider found one review-only edge hypothesis."],
+                "operator_recommendations": ["Review relvol:strong candidate priority; do not auto-change config."],
+                "judge_summary": "Review-only postmortem; RiskEngine remains authority.",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_default_does_not_call_paid_provider(tmp_path):
+    settings = _PostmortemSettings(tmp_path)
+    provider = _FakePostmortemProvider()
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=False,
+        write_cache=True,
+    )
+
+    assert provider.calls == 0
+    assert result.path == Path(settings.ai_postmortem_path)
+    assert result.path.exists()
+    assert result.pack["status"] == "not_run"
+    assert result.pack["paid_called"] is False
+    assert result.pack["reason"] == "paid postmortem requires --run-paid"
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_paid_fake_provider_writes_review_only_pack(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _FakePostmortemProvider()
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+        write_cache=True,
+        refresh_brain_guidance=True,
+    )
+
+    assert provider.calls == 1
+    assert result.pack["status"] == "completed"
+    assert result.pack["paid_called"] is True
+    assert result.pack["chargeable_calls"]["before"] == 0
+    assert result.pack["chargeable_calls"]["after"] == 1
+    assert result.pack["operator_recommendations"][0]["review_only"] is True
+    assert "Prioritize strong relative volume" in result.pack["prompt_guidance"]
+    assert result.guidance_refreshed is True
+    guidance = json.loads(Path(settings.brain_guidance_path).read_text(encoding="utf-8"))
+    assert guidance["ai_postmortem"]["status"] == "completed"
+    assert "AI POSTMORTEM" in guidance["prompt_context"]
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_invalid_provider_output_is_not_distilled(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _FakePostmortemProvider(valid=False)
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    assert provider.calls == 1
+    assert result.pack["status"] == "invalid"
+    assert result.pack["distilled_lessons"] == []
+    assert result.pack["provider_results"][0]["validation_passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_budget_exhausted_does_not_call_provider(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=0)
+    provider = _FakePostmortemProvider()
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    assert provider.calls == 0
+    assert result.pack["status"] == "not_run"
+    assert result.pack["reason"] == "AI_POSTMORTEM_MAX_CALLS_PER_DAY or --max-paid-calls must be positive"
+    assert result.pack["paid_called"] is False
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_run_paid_requires_second_confirmation(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _FakePostmortemProvider()
+
+    result = await run_ai_postmortem_review(settings=settings, providers=[provider], run_paid=True)
+
+    assert provider.calls == 0
+    assert result.pack["status"] == "not_run"
+    assert result.pack["reason"] == "paid postmortem requires --confirm-paid-postmortem"
+    assert result.pack["paid_called"] is False
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_dedupes_provider_model_window_hash(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _FakePostmortemProvider()
+
+    first = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+    second = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    assert first.pack["status"] == "completed"
+    assert second.pack["status"] == "deduped"
+    assert second.pack["paid_called"] is False
+    assert provider.calls == 1
+    attempt_hash = postmortem_attempt_hash(
+        evidence_hash=first.pack["input_hash"],
+        provider=provider.provider,
+        model_tag=provider.model_tag,
+        window_days=7,
+    )
+    assert first.pack["provider_results"][0]["input_hash"] == attempt_hash
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_provider_setup_failure_writes_invalid_artifact(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=1)
+    settings.ai_research_openai_model = ""
+    settings.ai_research_model = ""
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    assert result.path == Path(settings.ai_postmortem_path)
+    assert result.path.exists()
+    assert result.pack["status"] == "invalid"
+    assert result.pack["paid_called"] is False
+    assert "postmortem provider setup failed" in result.pack["reason"]
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_provider_failure_counts_separate_budget(tmp_path):
+    class FailingProvider(_FakePostmortemProvider):
+        async def review(self, packet):
+            self.calls += 1
+            raise RuntimeError("provider down")
+
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = FailingProvider()
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    assert provider.calls == 1
+    assert result.pack["status"] == "invalid"
+    assert result.pack["chargeable_calls"]["after"] == 1
+    assert result.pack["provider_results"][0]["prompt_version"] == "ai_postmortem_failure/v0"
+
+
+def test_brain_guidance_pack_includes_compact_ai_postmortem_only():
+    memo = PostmortemProviderMemo(
+        provider="openai",
+        model_tag="openai/fake-postmortem",
+        prompt_version=AI_POSTMORTEM_PROMPT_VERSION,
+        input_hash="abc123",
+        used_only_provided_data=True,
+        validation_passed=True,
+        output={
+            "used_only_provided_data": True,
+            "lessons": ["Press high-volume winners."],
+            "edge_hypotheses": ["Test fresh-news breakouts."],
+            "budget_leaks": ["Avoid stale candidate repeats."],
+            "provider_notes": ["note"],
+            "operator_recommendations": ["Review candidate priority."],
+            "judge_summary": "summary",
+        },
+    )
+    postmortem = build_ai_postmortem_pack(
+        packet={"window_days": 7, "closed_trade_count": 1, "opportunity_count": 2},
+        input_hash="abc123",
+        status="completed",
+        reason="valid postmortem generated",
+        paid_called=True,
+        provider_memos=[memo],
+        used_before=0,
+        used_after=1,
+        attempts_needed=1,
+    )
+
+    guidance = build_brain_guidance_pack([], postmortem_pack=postmortem)
+
+    assert guidance["ai_postmortem"]["status"] == "completed"
+    assert guidance["ai_postmortem"]["distilled_lessons"] == ["Press high-volume winners."]
+    assert "raw_committee_output" not in json.dumps(guidance)
+    assert "AI POSTMORTEM" in guidance["prompt_context"]
+
+
+def test_ai_postmortem_module_has_no_execution_imports():
+    source = Path("auto_trader/ai_postmortem_review.py").read_text(encoding="utf-8")
+
+    assert "from auto_trader.execution" not in source
+    assert "from auto_trader.broker" not in source
+    assert "from auto_trader.core.risk_engine" not in source
+    assert "from auto_trader.scheduler" not in source
 
 
 @pytest.mark.asyncio
@@ -7292,10 +7585,14 @@ def test_settings_accepts_optional_brain_review_paths():
         RESUME_TOKEN="resume",
         AUTO_TRADER_BRAIN_REVIEW_DIR="/tmp/brain",
         AUTO_TRADER_BRAIN_GUIDANCE_PATH="/tmp/brain/brain_guidance_pack.json",
+        AUTO_TRADER_AI_POSTMORTEM_PATH="/tmp/brain/ai_postmortem_pack.json",
+        AI_POSTMORTEM_MAX_CALLS_PER_DAY=1,
     )
 
     assert settings.brain_review_dir == "/tmp/brain"
     assert settings.brain_guidance_path == "/tmp/brain/brain_guidance_pack.json"
+    assert settings.ai_postmortem_path == "/tmp/brain/ai_postmortem_pack.json"
+    assert settings.ai_postmortem_max_calls_per_day == 1
 
 
 async def test_brain_guidance_path_from_env_file_writes_and_loads_same_file(tmp_path, monkeypatch):

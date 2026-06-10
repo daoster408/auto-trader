@@ -139,6 +139,7 @@ def build_brain_review_pack(
 def build_brain_guidance_pack(
     review_packs: list[dict[str, Any]],
     *,
+    postmortem_pack: dict[str, Any] | None = None,
     generated_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Combine review packs into the tiny artifact loaded by AI packets."""
@@ -152,6 +153,8 @@ def build_brain_guidance_pack(
         "source_labels": [str(pack.get("label")) for pack in review_packs],
         "reviews": [_compact_review_for_guidance(pack) for pack in review_packs],
     }
+    if postmortem_pack:
+        pack["ai_postmortem"] = _compact_postmortem_for_guidance(postmortem_pack)
     pack["prompt_context"] = render_brain_guidance_prompt_context(pack)
     return pack
 
@@ -160,6 +163,7 @@ async def build_brain_review_bundle(
     *,
     db_path: Path | None = None,
     generated_at: datetime | None = None,
+    postmortem_pack: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build weekly/monthly/quarterly review packs plus combined guidance."""
     await init_db()
@@ -181,7 +185,11 @@ async def build_brain_review_bundle(
             observed_sessions=[value.isoformat() for value in sessions],
             generated_at=generated,
         )
-    guidance = build_brain_guidance_pack(list(reviews.values()), generated_at=generated)
+    guidance = build_brain_guidance_pack(
+        list(reviews.values()),
+        postmortem_pack=postmortem_pack,
+        generated_at=generated,
+    )
     return {
         "kind": "brain_review_bundle",
         "generated_at": generated.astimezone(UTC).isoformat().replace("+00:00", "Z"),
@@ -286,6 +294,18 @@ def render_brain_guidance_prompt_context(pack: dict[str, Any]) -> str:
         for row in review.get("observed_leaks") or []:
             if isinstance(row, dict):
                 lines.append(f"- leak: {row.get('key')} count={row.get('count')}")
+    postmortem = pack.get("ai_postmortem")
+    if isinstance(postmortem, dict) and postmortem.get("status") == "completed":
+        lines.append("AI POSTMORTEM:")
+        for lesson in postmortem.get("distilled_lessons") or []:
+            if isinstance(lesson, str) and lesson.strip():
+                lines.append(f"- lesson: {lesson}")
+        for hypothesis in postmortem.get("edge_hypotheses") or []:
+            if isinstance(hypothesis, str) and hypothesis.strip():
+                lines.append(f"- test: {hypothesis}")
+        for leak in postmortem.get("budget_leaks") or []:
+            if isinstance(leak, str) and leak.strip():
+                lines.append(f"- paid-budget leak: {leak}")
     lines.append("If review context conflicts with the current packet, explain the conflict and judge the current packet.")
     return "\n".join(lines)
 
@@ -409,6 +429,26 @@ def _compact_review_for_guidance(pack: dict[str, Any]) -> dict[str, Any]:
         "provider_behavior": _bounded_dict_list(pack.get("provider_behavior"), limit=4),
         "operator_recommendations": _bounded_dict_list(pack.get("operator_recommendations"), limit=3),
     }
+
+
+def _compact_postmortem_for_guidance(pack: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": pack.get("kind"),
+        "status": pack.get("status"),
+        "generated_at": pack.get("generated_at"),
+        "input_hash": pack.get("input_hash"),
+        "paid_called": bool(pack.get("paid_called")),
+        "distilled_lessons": _bounded_text_list(pack.get("distilled_lessons"), limit=4),
+        "edge_hypotheses": _bounded_text_list(pack.get("edge_hypotheses"), limit=4),
+        "budget_leaks": _bounded_text_list(pack.get("budget_leaks"), limit=3),
+        "operator_recommendations": _bounded_dict_list(pack.get("operator_recommendations"), limit=3),
+    }
+
+
+def _bounded_text_list(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [" ".join(str(item).split())[:500] for item in value[:limit] if str(item or "").strip()]
 
 
 def _bounded_dict_list(value: Any, *, limit: int) -> list[dict[str, Any]]:

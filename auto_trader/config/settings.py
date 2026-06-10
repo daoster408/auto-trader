@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     scoreboard_memory_path: str | None = Field(None, alias="AUTO_TRADER_SCOREBOARD_MEMORY_PATH")
     brain_review_dir: str | None = Field(None, alias="AUTO_TRADER_BRAIN_REVIEW_DIR")
     brain_guidance_path: str | None = Field(None, alias="AUTO_TRADER_BRAIN_GUIDANCE_PATH")
+    ai_postmortem_path: str | None = Field(None, alias="AUTO_TRADER_AI_POSTMORTEM_PATH")
 
     # Optional LLM (populated later)
     finnhub_api_key: str | None = Field(None, alias="FINNHUB_API_KEY")
@@ -85,6 +86,7 @@ class Settings(BaseSettings):
     ai_research_est_output_tokens: int = Field(2000, ge=0, alias="AI_RESEARCH_EST_OUTPUT_TOKENS")
     ai_research_input_price_per_mtok: float = Field(5.0, ge=0.0, alias="AI_RESEARCH_INPUT_PRICE_PER_MTOK")
     ai_research_output_price_per_mtok: float = Field(25.0, ge=0.0, alias="AI_RESEARCH_OUTPUT_PRICE_PER_MTOK")
+    ai_postmortem_max_calls_per_day: int = Field(0, ge=0, alias="AI_POSTMORTEM_MAX_CALLS_PER_DAY")
     openai_api_key: str | None = Field(None, alias="OPENAI_API_KEY")
     anthropic_api_key: str | None = Field(None, alias="ANTHROPIC_API_KEY")
     xai_api_key: str | None = Field(None, alias="XAI_API_KEY")
