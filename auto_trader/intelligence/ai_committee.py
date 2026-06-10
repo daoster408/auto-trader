@@ -669,12 +669,25 @@ def aggregate_research_memos(
 def _aggregate_risk_profile(packet: dict[str, Any]) -> str:
     context = packet.get("verified_research_context")
     if isinstance(context, dict):
-        risk_profile = context.get("risk_profile")
-        if isinstance(risk_profile, dict):
-            name = str(risk_profile.get("name") or "").lower()
-            if name in {"conservative", "aggressive", "risky"}:
+        risk = context.get("risk")
+        if isinstance(risk, dict):
+            name = _risk_profile_name(risk.get("risk_profile"))
+            if name:
                 return name
+        name = _risk_profile_name(context.get("risk_profile"))
+        if name:
+            return name
     return "conservative"
+
+
+def _risk_profile_name(value: Any) -> str | None:
+    if isinstance(value, dict):
+        name = str(value.get("name") or "").lower()
+    else:
+        name = str(value or "").lower()
+    if name in {"conservative", "aggressive", "risky"}:
+        return name
+    return None
 
 
 def _aggregate_approve_quorum_met(*, risk_profile: str, approve_count: int) -> bool:

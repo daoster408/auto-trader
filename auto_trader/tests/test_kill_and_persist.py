@@ -1225,7 +1225,7 @@ def test_multi_provider_aggregate_aggressive_allows_one_valid_approve_no_reject(
             side="long",
             entry_price=20.0,
             confidence=0.7,
-            features={"research_context": {"risk_profile": {"name": "aggressive"}}},
+            features={"research_context": {"risk": {"risk_profile": {"name": "aggressive"}}}},
         )
     )
     aggregate = aggregate_research_memos(
@@ -1245,6 +1245,31 @@ def test_multi_provider_aggregate_aggressive_allows_one_valid_approve_no_reject(
     assert aggregate.memo["quorum"]["reject_count"] == 0
     assert aggregate.memo["quorum"]["risk_profile"] == "aggressive"
     assert "aggressive approve requires at least one valid approve" in aggregate.memo["quorum"]["rule"]
+
+
+def test_multi_provider_aggregate_supports_legacy_top_level_risk_profile():
+    packet = build_research_packet(
+        TradeIntent(
+            symbol="SRTY",
+            side="long",
+            entry_price=20.0,
+            confidence=0.7,
+            features={"research_context": {"risk_profile": {"name": "aggressive"}}},
+        )
+    )
+    aggregate = aggregate_research_memos(
+        "SRTY",
+        [
+            _provider_memo("anthropic", "watch", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.68),
+            _provider_memo("xai", "watch", confidence=0.7),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "approve"
+    assert aggregate.memo["quorum"]["risk_profile"] == "aggressive"
 
 
 def test_multi_provider_aggregate_reject_overrides_approve_quorum():
