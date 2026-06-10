@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     # Persistence
     db_path: str = Field("auto_trader.db", alias="DB_PATH")
     scoreboard_memory_path: str | None = Field(None, alias="AUTO_TRADER_SCOREBOARD_MEMORY_PATH")
+    brain_review_dir: str | None = Field(None, alias="AUTO_TRADER_BRAIN_REVIEW_DIR")
+    brain_guidance_path: str | None = Field(None, alias="AUTO_TRADER_BRAIN_GUIDANCE_PATH")
 
     # Optional LLM (populated later)
     finnhub_api_key: str | None = Field(None, alias="FINNHUB_API_KEY")

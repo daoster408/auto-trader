@@ -15,6 +15,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from auto_trader.core.models import TradeIntent
+from auto_trader.intelligence.brain_guidance import load_brain_guidance_context
 from auto_trader.intelligence.research_context import build_verified_research_context
 from auto_trader.intelligence.scoreboard_memory import load_scoreboard_memory_context
 from auto_trader.utils.logging import get_logger
@@ -73,6 +74,7 @@ def build_research_packet(intent: TradeIntent, *, signal_id: int | None = None) 
     """Build the verified data packet handed to an AI/shadow committee."""
     verified_context = build_verified_research_context(intent)
     verified_context["scoreboard_memory"] = load_scoreboard_memory_context()
+    verified_context["brain_guidance"] = load_brain_guidance_context()
     return {
         "generated_at": datetime.now(UTC).isoformat() + "Z",
         "signal_id": signal_id,
@@ -99,13 +101,15 @@ def packet_hash(packet: dict[str, Any]) -> str:
     stable_packet.pop("generated_at", None)
     stable_packet.pop("signal_id", None)
     context = stable_packet.get("verified_research_context")
-    if isinstance(context, dict) and isinstance(context.get("scoreboard_memory"), dict):
+    if isinstance(context, dict):
         stable_context = dict(context)
-        scoreboard_memory = stable_context.get("scoreboard_memory")
-        stable_memory = dict(scoreboard_memory)
-        stable_memory.pop("path", None)
-        stable_memory.pop("age_seconds", None)
-        stable_context["scoreboard_memory"] = stable_memory
+        for context_key in ("scoreboard_memory", "brain_guidance"):
+            if not isinstance(stable_context.get(context_key), dict):
+                continue
+            stable_payload = dict(stable_context[context_key])
+            stable_payload.pop("path", None)
+            stable_payload.pop("age_seconds", None)
+            stable_context[context_key] = stable_payload
         stable_packet["verified_research_context"] = stable_context
     payload = json.dumps(stable_packet, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
