@@ -12,6 +12,7 @@ from typing import Any
 import aiosqlite
 
 from auto_trader.config.settings import get_settings
+from auto_trader.intelligence.ai_paid_prefilter import INVERSE_OR_LEVERAGED_SYMBOLS
 from auto_trader.persistence.db import configure_db_path, get_configured_db_path, init_db
 from auto_trader.utils.logging import setup_logging
 
@@ -34,6 +35,8 @@ class ClosedTradeEvidence:
     ai_verdict: str
     risk_profile: str
     signal_id: int | None
+    setup_tags: tuple[str, ...] = ()
+    provider_votes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,8 @@ class OpportunityEvidence:
     risk_profile: str
     signal_id: int
     created_at: datetime | None
+    setup_tags: tuple[str, ...] = ()
+    provider_votes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,43 @@ def _json(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _num(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pct_decimal(value: Any) -> float | None:
+    number = _num(value)
+    if number is None:
+        return None
+    if abs(number) > 1:
+        return number / 100.0
+    return number
+
+
+def _merge_dicts(*parts: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for part in parts:
+        for key, value in part.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = _merge_dicts(merged[key], value)
+            elif value not in ({}, [], None):
+                merged[key] = value
+    return merged
+
+
 def _risk_profile_from_signal(signal: dict[str, Any] | None, risk_decision: dict[str, Any] | None = None) -> str:
     metrics = _json((risk_decision or {}).get("metrics_json"))
     if metrics.get("risk_profile"):
@@ -132,6 +174,153 @@ def _ai_verdict_for_signal(memos: list[dict[str, Any]], signal_id: int | None) -
     provider = str(memo.get("provider") or "unknown")
     verdict = str(memo.get("verdict") or "watch")
     return f"{provider}:{verdict}"
+
+
+def _memo_json(memo: dict[str, Any] | None) -> dict[str, Any]:
+    if not memo:
+        return {}
+    return _json(memo.get("memo_json"))
+
+
+def _research_context(signal: dict[str, Any] | None, memo: dict[str, Any] | None) -> dict[str, Any]:
+    features = _json((signal or {}).get("features_json"))
+    feature_context = _dict(features.get("research_context"))
+    memo_packet = _dict(_memo_json(memo).get("input_packet"))
+    memo_context = _dict(memo_packet.get("verified_research_context"))
+    return _merge_dicts(feature_context, memo_context)
+
+
+def _technical_value(features: dict[str, Any], context: dict[str, Any], name: str) -> Any:
+    technical = _dict(context.get("technical"))
+    discovery = _dict(features.get("discovery"))
+    if name in technical:
+        return technical.get(name)
+    if name in discovery:
+        return discovery.get(name)
+    return features.get(name)
+
+
+def _has_fundamental(context: dict[str, Any]) -> bool:
+    fundamental = _dict(context.get("fundamental"))
+    return any(value not in (None, "", 0, {}) for value in fundamental.values())
+
+
+def _news_count(context: dict[str, Any]) -> int:
+    return sum(
+        1
+        for item in _list(context.get("news"))
+        if isinstance(item, dict) and str(item.get("headline") or "").strip()
+    )
+
+
+def _macro_tag(context: dict[str, Any]) -> str:
+    macro = context.get("macro")
+    if not isinstance(macro, dict):
+        return "macro:missing"
+    if macro.get("error"):
+        return "macro:error"
+    if macro.get("enabled") or macro.get("series") or macro.get("regime"):
+        return "macro:ok"
+    return "macro:missing"
+
+
+def _setup_tags(signal: dict[str, Any] | None, memo: dict[str, Any] | None, risk_profile: str) -> tuple[str, ...]:
+    symbol = str((signal or {}).get("symbol") or (memo or {}).get("symbol") or "").upper()
+    features = _json((signal or {}).get("features_json"))
+    context = _research_context(signal, memo)
+    tags: list[str] = [f"profile:{risk_profile}"]
+
+    rel_volume = _num(_technical_value(features, context, "rel_volume"))
+    if rel_volume is None:
+        tags.append("relvol:missing")
+    elif rel_volume < 0.8:
+        tags.append("relvol:low")
+    elif rel_volume < 2.0:
+        tags.append("relvol:normal")
+    elif rel_volume < 4.0:
+        tags.append("relvol:strong")
+    else:
+        tags.append("relvol:hot")
+
+    change_pct = _pct_decimal(_technical_value(features, context, "change_pct"))
+    if change_pct is None:
+        tags.append("move:missing")
+    elif change_pct < 0.005:
+        tags.append("move:cold")
+    elif change_pct < 0.08:
+        tags.append("move:tradable")
+    elif change_pct < 0.15:
+        tags.append("move:extended")
+    else:
+        tags.append("move:parabolic")
+
+    spread_pct = _pct_decimal(_technical_value(features, context, "spread_pct"))
+    if spread_pct is None:
+        tags.append("spread:missing")
+    elif spread_pct <= 0.006:
+        tags.append("spread:tight")
+    elif spread_pct <= 0.01:
+        tags.append("spread:workable")
+    else:
+        tags.append("spread:wide")
+
+    distance_from_high_pct = _pct_decimal(_technical_value(features, context, "distance_from_high_pct"))
+    if distance_from_high_pct is not None and distance_from_high_pct >= -0.02:
+        tags.append("near_high")
+    if _news_count(context) > 0:
+        tags.append("news:present")
+    else:
+        tags.append("news:missing")
+    tags.append("fundamental:present" if _has_fundamental(context) else "fundamental:missing")
+    tags.append(_macro_tag(context))
+    if symbol in INVERSE_OR_LEVERAGED_SYMBOLS:
+        tags.append("inverse_or_leveraged")
+
+    return tuple(dict.fromkeys(tags))
+
+
+def _provider_votes_for_signal(memos: list[dict[str, Any]], signal_id: int | None) -> tuple[str, ...]:
+    memo = _latest_ai_memo(memos, signal_id=signal_id)
+    votes = _list(_memo_json(memo).get("provider_votes"))
+    formatted: list[str] = []
+    for vote in votes:
+        if not isinstance(vote, dict):
+            continue
+        provider = str(vote.get("provider") or "unknown").strip().lower()
+        verdict = str(vote.get("verdict") or "unknown").strip().lower()
+        formatted.append(_provider_vote_label(provider, verdict, vote.get("validation_passed"), vote.get("confidence")))
+    if not formatted and signal_id is not None:
+        member_memos = [
+            row
+            for row in memos
+            if row.get("signal_id") == signal_id and str(row.get("provider") or "") not in {"multi", "prefilter"}
+        ]
+        member_memos.sort(
+            key=lambda row: (_parse_dt(row.get("created_at")) or datetime.min.replace(tzinfo=UTC), int(row.get("id") or 0))
+        )
+        for row in member_memos:
+            provider = str(row.get("provider") or "unknown").strip().lower()
+            verdict = str(row.get("verdict") or "unknown").strip().lower()
+            formatted.append(_provider_vote_label(provider, verdict, row.get("validation_passed"), row.get("confidence")))
+    return tuple(dict.fromkeys(formatted))
+
+
+def _provider_vote_label(provider: str, verdict: str, validation_passed: Any, confidence: Any) -> str:
+    validation = ":invalid" if validation_passed in (False, 0, "0", "false", "False") else ""
+    band = _confidence_band(confidence)
+    confidence_suffix = f":{band}" if band else ""
+    return f"{provider}:{verdict}{validation}{confidence_suffix}"
+
+
+def _confidence_band(value: Any) -> str:
+    confidence = _num(value)
+    if confidence is None:
+        return ""
+    if confidence >= 0.75:
+        return "high_conf"
+    if confidence >= 0.55:
+        return "med_conf"
+    return "low_conf"
 
 
 async def _fetch_rows(db_path: Path) -> dict[str, list[dict[str, Any]]]:
@@ -231,6 +420,8 @@ def _build_closed_trades(rows: dict[str, list[dict[str, Any]]], *, since: dateti
         risk = risks_by_id.get(int(entry.get("risk_decision_id") or 0))
         signal_id = int(risk.get("signal_id")) if risk and risk.get("signal_id") is not None else None
         signal = signals_by_id.get(signal_id or -1)
+        risk_profile = _risk_profile_from_signal(signal, risk)
+        memo = _latest_ai_memo(memos, signal_id=signal_id)
         closed.append(
             ClosedTradeEvidence(
                 symbol=symbol,
@@ -243,8 +434,10 @@ def _build_closed_trades(rows: dict[str, list[dict[str, Any]]], *, since: dateti
                 exit_time=exit_time,
                 exit_reason=str(exit_order.get("rationale") or "unknown"),
                 ai_verdict=_ai_verdict_for_signal(memos, signal_id),
-                risk_profile=_risk_profile_from_signal(signal, risk),
+                risk_profile=risk_profile,
                 signal_id=signal_id,
+                setup_tags=_setup_tags(signal, memo, risk_profile),
+                provider_votes=_provider_votes_for_signal(memos, signal_id),
             )
         )
     return closed
@@ -305,6 +498,8 @@ def _build_opportunities(rows: dict[str, list[dict[str, Any]]], *, since: dateti
                 risk_profile=risk_profile,
                 signal_id=signal_id,
                 created_at=_parse_dt(signal.get("created_at")),
+                setup_tags=_setup_tags(signal, _latest_ai_memo(rows["ai_memos"], signal_id=signal_id), risk_profile),
+                provider_votes=_provider_votes_for_signal(rows["ai_memos"], signal_id),
             )
         )
     return opportunities
@@ -365,16 +560,43 @@ def _trade_stats(trades: list[ClosedTradeEvidence]) -> dict[str, float]:
     }
 
 
-def _render_group_stats(title: str, groups: dict[str, list[ClosedTradeEvidence]]) -> list[str]:
+def _render_group_stats(title: str, groups: dict[str, list[ClosedTradeEvidence]], *, limit: int = 8) -> list[str]:
     lines = [title]
     if not groups:
         return lines + ["- none"]
-    for name, trades in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0])):
+    for name, trades in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))[:limit]:
         stats = _trade_stats(trades)
+        sample = ", sample=thin" if int(stats["count"]) < 3 else ""
         lines.append(
             f"- {name}: n={int(stats['count'])}, P/L {_money(stats['realized_pnl'])}, "
-            f"exp/trade {_money(stats['expectancy'])}, win {stats['win_rate']:.1f}%"
+            f"exp/trade {_money(stats['expectancy'])}, win {stats['win_rate']:.1f}%{sample}"
         )
+    return lines
+
+
+def _group_trades_by_values(
+    trades: list[ClosedTradeEvidence], value_getter: Any
+) -> dict[str, list[ClosedTradeEvidence]]:
+    groups: dict[str, list[ClosedTradeEvidence]] = {}
+    for trade in trades:
+        for value in value_getter(trade):
+            groups.setdefault(str(value), []).append(trade)
+    return groups
+
+
+def _short_reason(value: str, *, limit: int = 70) -> str:
+    text = " ".join(str(value or "unknown").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _render_counts(title: str, values: list[str], *, limit: int = 8) -> list[str]:
+    lines = [title]
+    if not values:
+        return lines + ["- none"]
+    for value, count in _bucket_counts(values)[:limit]:
+        lines.append(f"- {value}: {count}")
     return lines
 
 
@@ -398,19 +620,30 @@ def render_edge_report(report: EdgeReport) -> str:
         by_profile.setdefault(trade.risk_profile, []).append(trade)
     lines.extend(_render_group_stats("By AI verdict:", by_ai))
     lines.extend(_render_group_stats("By risk profile:", by_profile))
-    lines.append("Opportunity outcomes:")
-    if opportunities:
-        for outcome, count in _bucket_counts([opportunity.outcome for opportunity in opportunities]):
-            lines.append(f"- {outcome}: {count}")
-    else:
-        lines.append("- none")
+    lines.extend(_render_group_stats("By setup tag:", _group_trades_by_values(trades, lambda trade: trade.setup_tags)))
+    lines.extend(_render_group_stats("By provider vote:", _group_trades_by_values(trades, lambda trade: trade.provider_votes)))
+    lines.extend(_render_counts("Opportunity outcomes:", [opportunity.outcome for opportunity in opportunities]))
+    blocked = [opportunity for opportunity in opportunities if opportunity.outcome != "traded"]
+    lines.extend(
+        _render_counts(
+            "Blocked pressure:",
+            [f"{opportunity.outcome}: {_short_reason(opportunity.reason)}" for opportunity in blocked],
+        )
+    )
+    lines.extend(
+        _render_counts(
+            "Opportunity setup tags:",
+            [tag for opportunity in blocked for tag in opportunity.setup_tags],
+        )
+    )
     lines.append("Recent closed trades:")
     recent = sorted(trades, key=lambda trade: trade.exit_time or datetime.min.replace(tzinfo=UTC), reverse=True)[:5]
     if recent:
         for trade in recent:
+            tags = ",".join(trade.setup_tags[:3]) if trade.setup_tags else "no-tags"
             lines.append(
                 f"- {trade.symbol}: {_money(trade.pnl)} ({_pct(trade.pnl_pct)}), "
-                f"{trade.ai_verdict}, {trade.risk_profile}, exit={trade.exit_reason}"
+                f"{trade.ai_verdict}, {trade.risk_profile}, tags={tags}, exit={trade.exit_reason}"
             )
     else:
         lines.append("- none yet")

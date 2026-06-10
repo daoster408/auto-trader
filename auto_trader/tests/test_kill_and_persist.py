@@ -3605,7 +3605,20 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
             confidence=0.74,
             source="test",
             model_tag="rules_fallback/v0",
-            features={"risk": {"risk_profile": "conservative"}},
+            features={
+                "risk": {"risk_profile": "conservative"},
+                "discovery": {
+                    "rel_volume": 2.4,
+                    "change_pct": 0.04,
+                    "spread_pct": 0.003,
+                    "distance_from_high_pct": -0.01,
+                },
+                "research_context": {
+                    "news": [{"headline": "POET wins new design customer"}],
+                    "fundamental": {"name": "POET Technologies", "market_cap": 500_000_000},
+                    "macro": {"enabled": True, "series": {"fed_funds_rate": {"value": 4.25}}},
+                },
+            },
         )
         risk_id = await log_risk_decision(
             signal_id=signal_id,
@@ -3631,7 +3644,14 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
             confidence=0.8,
             used_only_provided_data=True,
             validation_passed=True,
-            memo={"rationale": "clean setup"},
+            memo={
+                "rationale": "clean setup",
+                "provider_votes": [
+                    {"provider": "anthropic", "verdict": "approve", "confidence": 0.82, "validation_passed": True},
+                    {"provider": "openai", "verdict": "approve", "confidence": 0.74, "validation_passed": True},
+                    {"provider": "xai", "verdict": "watch", "confidence": 0.52, "validation_passed": True},
+                ],
+            },
         )
         now = datetime.now(UTC)
         mixed_day = (now - timedelta(days=10)).replace(hour=14, minute=0, second=0, microsecond=0)
@@ -3693,9 +3713,19 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
         assert trade.pnl_pct == pytest.approx(20.0)
         assert trade.ai_verdict == "multi:approve"
         assert trade.risk_profile == "aggressive"
+        assert "relvol:strong" in trade.setup_tags
+        assert "spread:tight" in trade.setup_tags
+        assert "news:present" in trade.setup_tags
+        assert "macro:ok" in trade.setup_tags
+        assert "anthropic:approve:high_conf" in trade.provider_votes
         assert "Closed trades: 1" in rendered
         assert "Realized P/L: $4.00" in rendered
         assert "- multi:approve: n=1, P/L $4.00" in rendered
+        assert "sample=thin" in rendered
+        assert "By setup tag:" in rendered
+        assert "- relvol:strong: n=1, P/L $4.00" in rendered
+        assert "By provider vote:" in rendered
+        assert "- anthropic:approve:high_conf: n=1, P/L $4.00" in rendered
 
 
 @pytest.mark.asyncio
@@ -3780,6 +3810,39 @@ async def test_edge_report_classifies_skipped_opportunities():
         assert "- ai_watch: 1" in rendered
         assert "- prefilter_blocked: 1" in rendered
         assert "- risk_blocked: 1" in rendered
+        assert "Blocked pressure:" in rendered
+        assert "- prefilter_blocked: paid AI prefilter blocked: 1" in rendered
+        assert "Opportunity setup tags:" in rendered
+        assert "- inverse_or_leveraged:" in rendered
+
+
+@pytest.mark.asyncio
+async def test_edge_report_treats_malformed_features_as_missing_evidence():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "edge_malformed_features.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        signal_id = await log_signal(
+            symbol="BADJSON",
+            thesis="legacy row has broken feature json",
+            confidence=0.4,
+            source="test",
+            model_tag="rules_fallback/v0",
+            features={"discovery": {"rel_volume": 5.0}},
+        )
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE signals SET features_json = ? WHERE id = ?", ("{bad-json", signal_id))
+            conn.commit()
+
+        report = await build_edge_report(window_days=30)
+        rendered = render_edge_report(report)
+
+        assert len(report.opportunities) == 1
+        assert "relvol:missing" in report.opportunities[0].setup_tags
+        assert "move:missing" in report.opportunities[0].setup_tags
+        assert "Opportunity setup tags:" in rendered
+        assert "- relvol:missing: 1" in rendered
 
 
 @pytest.mark.asyncio
