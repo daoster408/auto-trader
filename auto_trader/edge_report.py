@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -707,6 +708,171 @@ def render_learning_brief(report: EdgeReport) -> str:
     return "\n".join(lines)
 
 
+def _memory_group(name: str, stats: dict[str, float]) -> dict[str, Any]:
+    count = int(stats["count"])
+    return {
+        "key": name,
+        "n": count,
+        "sample": "thin" if count < 3 else "building",
+        "realized_pnl": round(float(stats["realized_pnl"]), 4),
+        "expectancy": round(float(stats["expectancy"]), 4),
+        "win_rate": round(float(stats["win_rate"]), 2),
+    }
+
+
+def _memory_group_line(row: dict[str, Any]) -> str:
+    return (
+        f"{row['key']} n={row['n']} sample={row['sample']} "
+        f"pnl={_money(float(row['realized_pnl']))} exp={_money(float(row['expectancy']))} "
+        f"win={float(row['win_rate']):.1f}%"
+    )
+
+
+def render_scoreboard_memory_context(pack: dict[str, Any]) -> str:
+    sample_label = str(pack.get("sample_label") or "thin")
+    performance = _dict(pack.get("performance"))
+    lines = [
+        "SCOREBOARD MEMORY PACK",
+        "Use as compact context only; this is observed evidence, not order authority.",
+        (
+            f"Window: {pack.get('window_days')}d; closed_trades={pack.get('closed_trade_count', 0)}; "
+            f"opportunities={pack.get('opportunity_count', 0)}; sample={sample_label}"
+        ),
+        (
+            f"Observed P/L={_money(_float(performance.get('realized_pnl')))}; "
+            f"expectancy={_money(_float(performance.get('expectancy')))}; "
+            f"win={_float(performance.get('win_rate')):.1f}%"
+        ),
+        f"Caveat: {_list(pack.get('notes'))[0] if _list(pack.get('notes')) else 'Use this to aim questions, not declare truth.'}",
+        "Positive setup evidence:",
+    ]
+    positive = _list(pack.get("positive_observed_tags"))
+    lines.extend([f"- {_memory_group_line(row)}" for row in positive[:5] if isinstance(row, dict)] or ["- none yet"])
+    lines.append("Negative setup evidence:")
+    negative = _list(pack.get("negative_observed_tags"))
+    lines.extend([f"- {_memory_group_line(row)}" for row in negative[:5] if isinstance(row, dict)] or ["- none yet"])
+    lines.append("Provider vote buckets:")
+    providers = _list(pack.get("provider_vote_outcome_buckets"))
+    lines.extend([f"- {_memory_group_line(row)}" for row in providers[:6] if isinstance(row, dict)] or ["- none yet"])
+    lines.append("Blocked pressure:")
+    blocked = _list(pack.get("blocked_pressure"))
+    lines.extend([f"- {row.get('key')}: {row.get('count')}" for row in blocked[:5] if isinstance(row, dict)] or ["- none"])
+    return "\n".join(lines)
+
+
+def build_scoreboard_memory_pack(
+    report: EdgeReport,
+    *,
+    generated_at: datetime | None = None,
+    limit: int = 5,
+) -> dict[str, Any]:
+    trades = report.closed_trades
+    opportunities = report.opportunities
+    stats = _trade_stats(trades)
+    setup_groups = _trade_groups_by_values(trades, lambda trade: trade.setup_tags)
+    provider_groups = _trade_groups_by_values(trades, lambda trade: trade.provider_votes)
+    blocked = [opportunity for opportunity in opportunities if opportunity.outcome != "traded"]
+    blocked_counts = _bucket_counts([f"{opportunity.outcome}: {_short_reason(opportunity.reason)}" for opportunity in blocked])
+
+    positive_tags = [
+        _memory_group(name, row_stats)
+        for name, _group, row_stats in sorted(
+            setup_groups,
+            key=lambda row: (row[2]["expectancy"], row[2]["realized_pnl"], row[0]),
+            reverse=True,
+        )
+        if row_stats["realized_pnl"] > 0
+    ][:limit]
+    negative_tags = [
+        _memory_group(name, row_stats)
+        for name, _group, row_stats in sorted(
+            setup_groups,
+            key=lambda row: (row[2]["expectancy"], row[2]["realized_pnl"], row[0]),
+        )
+        if row_stats["realized_pnl"] < 0
+    ][:limit]
+    provider_sorted = sorted(
+        provider_groups,
+        key=lambda row: (row[2]["realized_pnl"], row[2]["expectancy"], row[0]),
+        reverse=True,
+    )
+    provider_worst = [
+        row
+        for row in sorted(provider_groups, key=lambda row: (row[2]["realized_pnl"], row[2]["expectancy"], row[0]))
+        if row[2]["realized_pnl"] < 0
+    ]
+    provider_rows: list[dict[str, Any]] = []
+    seen_provider_keys: set[str] = set()
+    for name, _group, row_stats in [*provider_sorted[:limit], *provider_worst[:limit]]:
+        if name in seen_provider_keys:
+            continue
+        seen_provider_keys.add(name)
+        provider_rows.append(_memory_group(name, row_stats))
+
+    sample_quality = "thin" if int(stats["count"]) < 10 else "building"
+    sample_caveat = (
+        "Thin sample; use this to aim questions, not declare truth."
+        if sample_quality == "thin"
+        else "Building sample; still treat as observed evidence, not order authority."
+    )
+    generated = generated_at or datetime.now(UTC)
+    pack: dict[str, Any] = {
+        "kind": "scoreboard_memory_pack",
+        "generated_at": generated.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "window_days": report.window_days,
+        "closed_trade_count": int(stats["count"]),
+        "opportunity_count": len(opportunities),
+        "sample_label": sample_quality,
+        "sample": {
+            "closed_trades": int(stats["count"]),
+            "opportunities": len(opportunities),
+            "quality": sample_quality,
+            "caveat": sample_caveat,
+        },
+        "notes": [
+            sample_caveat,
+            "Observed evidence only; do not treat this pack as order authority.",
+            "RiskEngine remains the sizing and order-flow authority.",
+        ],
+        "performance": {
+            "realized_pnl": round(float(stats["realized_pnl"]), 4),
+            "expectancy": round(float(stats["expectancy"]), 4),
+            "win_rate": round(float(stats["win_rate"]), 2),
+            "wins": int(stats["wins"]),
+            "losses": int(stats["losses"]),
+        },
+        "positive_observed_tags": positive_tags,
+        "negative_observed_tags": negative_tags,
+        "provider_vote_outcome_buckets": provider_rows[: limit * 2],
+        "blocked_pressure": [{"key": key, "count": count} for key, count in blocked_counts[:limit]],
+    }
+    pack["prompt_context"] = render_scoreboard_memory_context(pack)
+    return pack
+
+
+def default_scoreboard_memory_pack_path(settings: Any) -> Path:
+    override = getattr(settings, "scoreboard_memory_path", None) or os.getenv("AUTO_TRADER_SCOREBOARD_MEMORY_PATH")
+    if override:
+        return Path(override)
+    db_path = Path(str(getattr(settings, "db_path", "auto_trader.db") or "auto_trader.db"))
+    root = db_path.parent if str(db_path.parent) not in {"", "."} else Path(".")
+    return root / "runtime" / "scoreboard_memory_pack.json"
+
+
+def write_scoreboard_memory_pack(pack: dict[str, Any], path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(pack, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        finally:
+            raise
+    return path
+
+
 def render_edge_report(report: EdgeReport) -> str:
     trades = report.closed_trades
     opportunities = report.opportunities
@@ -778,13 +944,41 @@ async def run_learning_brief(*, window_days: int = 7) -> str:
     return render_learning_brief(report)
 
 
+async def run_scoreboard_memory_pack(
+    *,
+    window_days: int = 7,
+    cache_path: Path | None = None,
+    write_cache: bool = False,
+) -> str:
+    settings = get_settings()
+    configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
+    report = await build_edge_report(window_days=window_days)
+    pack = build_scoreboard_memory_pack(report)
+    if write_cache:
+        write_scoreboard_memory_pack(pack, cache_path or default_scoreboard_memory_pack_path(settings))
+    return json.dumps(pack, indent=2, sort_keys=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read-only trade edge evidence report.")
     parser.add_argument("--days", type=int, default=7, help="Lookback window in days.")
     parser.add_argument("--brief", action="store_true", help="Render the learning-loop brief instead of the edge report.")
+    parser.add_argument("--memory-pack", action="store_true", help="Render compact scoreboard memory JSON for AI context.")
+    parser.add_argument("--write-cache", action="store_true", help="Write the memory pack to its cache path.")
+    parser.add_argument("--cache-path", type=Path, default=None, help="Override memory-pack cache path.")
     args = parser.parse_args()
     setup_logging("ERROR")
-    if args.brief:
+    if args.memory_pack:
+        print(
+            asyncio.run(
+                run_scoreboard_memory_pack(
+                    window_days=args.days,
+                    cache_path=args.cache_path,
+                    write_cache=args.write_cache,
+                )
+            )
+        )
+    elif args.brief:
         print(asyncio.run(run_learning_brief(window_days=args.days)))
     else:
         print(asyncio.run(run_edge_report(window_days=args.days)))

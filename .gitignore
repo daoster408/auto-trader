@@ -46,6 +46,7 @@ auto_trader/persistence/*.db
 # Logs
 logs/
 *.log
+runtime/
 
 # OS
 .DS_Store

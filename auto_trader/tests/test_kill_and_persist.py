@@ -28,7 +28,13 @@ from auto_trader.account_risk_validate import (
     validation_exit_code as account_risk_validation_exit_code,
 )
 from auto_trader.day3_validate import build_day3_validation_report, validation_exit_code
-from auto_trader.edge_report import build_edge_report, render_edge_report, render_learning_brief
+from auto_trader.edge_report import (
+    build_edge_report,
+    build_scoreboard_memory_pack,
+    render_edge_report,
+    render_learning_brief,
+    write_scoreboard_memory_pack,
+)
 from auto_trader.ai_research_preflight import (
     build_ai_research_preflight_report,
     render_ai_research_preflight,
@@ -3706,6 +3712,7 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
         report = await build_edge_report(window_days=7)
         rendered = render_edge_report(report)
         brief = render_learning_brief(report)
+        memory_pack = build_scoreboard_memory_pack(report, generated_at=now)
 
         assert len(report.closed_trades) == 1
         trade = report.closed_trades[0]
@@ -3734,6 +3741,26 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
         assert "Observed outcomes by provider vote bucket:" in brief
         assert "- anthropic:approve:high_conf: n=1, thin, P/L $4.00" in brief
         assert "Next review questions:" in brief
+        assert memory_pack["kind"] == "scoreboard_memory_pack"
+        assert memory_pack["closed_trade_count"] == 1
+        assert memory_pack["opportunity_count"] == 1
+        assert memory_pack["sample_label"] == "thin"
+        assert memory_pack["sample"]["closed_trades"] == 1
+        assert memory_pack["sample"]["quality"] == "thin"
+        assert memory_pack["performance"]["realized_pnl"] == pytest.approx(4.0)
+        positive_tags = {row["key"]: row for row in memory_pack["positive_observed_tags"]}
+        assert positive_tags["relvol:strong"]["sample"] == "thin"
+        provider_votes = {row["key"]: row for row in memory_pack["provider_vote_outcome_buckets"]}
+        assert provider_votes["anthropic:approve:high_conf"]["sample"] == "thin"
+        assert "Observed evidence only" in memory_pack["notes"][1]
+        assert "SCOREBOARD MEMORY PACK" in memory_pack["prompt_context"]
+        cache_path = Path(tmp) / "runtime" / "scoreboard_memory_pack.json"
+        written = write_scoreboard_memory_pack(memory_pack, cache_path)
+        assert written == cache_path
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        assert cached["sample"]["closed_trades"] == 1
+        assert cached["prompt_context"] == memory_pack["prompt_context"]
+        assert not list(cache_path.parent.glob("*.tmp"))
 
 
 @pytest.mark.asyncio
@@ -3811,6 +3838,7 @@ async def test_edge_report_classifies_skipped_opportunities():
         report = await build_edge_report(window_days=30)
         rendered = render_edge_report(report)
         brief = render_learning_brief(report)
+        memory_pack = build_scoreboard_memory_pack(report, generated_at=datetime(2026, 6, 10, tzinfo=UTC))
         outcomes = {opportunity.symbol: opportunity.outcome for opportunity in report.opportunities}
 
         assert outcomes["SSPE"] == "ai_watch"
@@ -3827,6 +3855,15 @@ async def test_edge_report_classifies_skipped_opportunities():
         assert "Evidence: 0 closed trades, 3 opportunities" in brief
         assert "- prefilter_blocked: paid AI prefilter blocked: 1" in brief
         assert "Sample is still thin" in brief
+        assert memory_pack["closed_trade_count"] == 0
+        assert memory_pack["opportunity_count"] == 3
+        assert memory_pack["sample_label"] == "thin"
+        assert memory_pack["sample"]["closed_trades"] == 0
+        assert memory_pack["sample"]["opportunities"] == 3
+        assert memory_pack["positive_observed_tags"] == []
+        assert memory_pack["negative_observed_tags"] == []
+        assert memory_pack["blocked_pressure"][0] == {"key": "ai_watch: AI committee verdict", "count": 1}
+        assert "Blocked pressure:" in memory_pack["prompt_context"]
 
 
 @pytest.mark.asyncio
@@ -3856,6 +3893,21 @@ async def test_edge_report_treats_malformed_features_as_missing_evidence():
         assert "move:missing" in report.opportunities[0].setup_tags
         assert "Opportunity setup tags:" in rendered
         assert "- relvol:missing: 1" in rendered
+
+
+def test_scoreboard_memory_pack_atomic_write_cleans_temp_on_replace_failure(tmp_path, monkeypatch):
+    cache_path = tmp_path / "runtime" / "scoreboard_memory_pack.json"
+
+    def fail_replace(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("auto_trader.edge_report.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        write_scoreboard_memory_pack({"kind": "scoreboard_memory_pack"}, cache_path)
+
+    assert not list(cache_path.parent.glob("*.tmp"))
+    assert not cache_path.exists()
 
 
 @pytest.mark.asyncio
