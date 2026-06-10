@@ -7341,6 +7341,9 @@ async def test_ai_entry_gate_cached_watch_tries_next_ranked_candidate(monkeypatc
     async def fake_log_signal(**kwargs):
         return next(signal_ids)
 
+    async def no_cached_lookup(**kwargs):
+        return None
+
     async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
         researched.append((intent.symbol, signal_id))
         if intent.symbol == "TNA":
@@ -7363,6 +7366,7 @@ async def test_ai_entry_gate_cached_watch_tries_next_ranked_candidate(monkeypatc
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", no_cached_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
     monkeypatch.setattr(TradingSupervisor, "_run_ai_research", fake_run_ai)
 
@@ -7388,6 +7392,360 @@ async def test_ai_entry_gate_cached_watch_tries_next_ranked_candidate(monkeypatc
     assert manager.calls[0][2] == 202
     assert researched == [("TNA", 201), ("POET", 202)]
     assert "AI entry gate blocked TNA" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_triages_viable_slate_before_paid_ai(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 5
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
+        def __init__(self):
+            self.calls = []
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            self.calls.append((intent.symbol, signal_id))
+            return {"order": {"id": "entry-best-slate", "symbol": intent.symbol}, "risk_decision": {"approved": True}}
+
+    class FakeCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+    def features(score, rel_volume):
+        return {
+            "discovery": {
+                "score": score,
+                "rel_volume": rel_volume,
+                "change_pct": 0.04,
+                "spread_pct": 0.003,
+            },
+            "research_context": {
+                "technical": {
+                    "rel_volume": rel_volume,
+                    "change_pct": 0.04,
+                    "spread_pct": 0.003,
+                    "distance_from_high_pct": -0.08,
+                },
+                "news": [{"headline": "fresh catalyst"}],
+                "fundamental": {"name": "Test Co", "market_cap": 500_000_000},
+            },
+        }
+
+    researched = []
+    signal_ids = iter([501])
+
+    async def fake_signals(adapter, max_signals=1, **kwargs):
+        assert max_signals >= 2
+        return [
+            TradeIntent(
+                symbol="WEAK",
+                side="long",
+                entry_price=10.0,
+                confidence=0.55,
+                features=features(1.0, 1.0),
+            ),
+            TradeIntent(
+                symbol="BEST",
+                side="long",
+                entry_price=11.0,
+                confidence=0.85,
+                features=features(7.0, 3.0),
+            ),
+        ]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_log_signal(**kwargs):
+        assert kwargs["symbol"] == "BEST"
+        return next(signal_ids)
+
+    async def no_cached_lookup(**kwargs):
+        return None
+
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+        researched.append((intent.symbol, signal_id))
+        return AIResearchRunResult(
+            symbol=intent.symbol,
+            verdict="approve",
+            validation_passed=True,
+            reason="ai_research_approve",
+        )
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", no_cached_lookup)
+    monkeypatch.setattr(TradingSupervisor, "_run_ai_research", fake_run_ai)
+
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=manager,
+    )
+    supervisor.research_committee = FakeCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["order"]["symbol"] == "BEST"
+    assert researched == [("BEST", 501)]
+    assert manager.calls == [("BEST", 501)]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_prefilter_blocks_first_slate_candidate_without_paid_call(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 5
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            return {"order": {"id": "entry-after-prefilter-skip", "symbol": intent.symbol}, "risk_decision": {"approved": True}}
+
+    class FakeCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+    def context(rel_volume, *, with_catalyst=True):
+        return {
+            "technical": {
+                "rel_volume": rel_volume,
+                "change_pct": 0.04,
+                "spread_pct": 0.003,
+                "distance_from_high_pct": -0.08,
+            },
+            "news": ([{"headline": "fresh catalyst"}] if with_catalyst else []),
+            "fundamental": ({"name": "Test Co", "market_cap": 500_000_000} if with_catalyst else {}),
+        }
+
+    researched = []
+    persisted_prefilters = []
+    signal_ids = iter([601, 602])
+
+    async def fake_signals(adapter, max_signals=1, **kwargs):
+        return [
+            TradeIntent(
+                symbol="TZA",
+                side="long",
+                entry_price=4.5,
+                confidence=0.9,
+                features={
+                    "discovery": {"score": 8.0, "rel_volume": 0.2, "change_pct": 0.04, "spread_pct": 0.003},
+                    "research_context": context(0.2, with_catalyst=False),
+                },
+            ),
+            TradeIntent(
+                symbol="BEST",
+                side="long",
+                entry_price=11.0,
+                confidence=0.85,
+                features={
+                    "discovery": {"score": 6.0, "rel_volume": 3.0, "change_pct": 0.04, "spread_pct": 0.003},
+                    "research_context": context(3.0),
+                },
+            ),
+        ]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_log_signal(**kwargs):
+        return next(signal_ids)
+
+    async def no_cached_lookup(**kwargs):
+        return None
+
+    async def fake_persist_prefilter(self, intent, **kwargs):
+        persisted_prefilters.append((intent.symbol, kwargs["prefilter"].reasons))
+
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+        researched.append((intent.symbol, signal_id))
+        return AIResearchRunResult(
+            symbol=intent.symbol,
+            verdict="approve",
+            validation_passed=True,
+            reason="ai_research_approve",
+        )
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", no_cached_lookup)
+    monkeypatch.setattr(TradingSupervisor, "_persist_paid_prefilter_block", fake_persist_prefilter)
+    monkeypatch.setattr(TradingSupervisor, "_run_ai_research", fake_run_ai)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    supervisor.research_committee = FakeCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["order"]["symbol"] == "BEST"
+    assert persisted_prefilters == [("TZA", ["low_relative_volume", "inverse_or_leveraged_missing_catalyst"])]
+    assert researched == [("BEST", 602)]
+
+
+@pytest.mark.asyncio
+async def test_ai_entry_gate_capacity_reject_skips_to_next_viable_candidate(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "openai"
+        ai_research_model = "gpt-5.5"
+        ai_research_max_calls_per_day = 5
+        openai_api_key = "openai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class MixedPreviewRisk:
+        def evaluate(self, intent, snapshot, *, consume_daily_counter=True):
+            assert consume_daily_counter is False
+            if intent.symbol == "FULL":
+                return RiskDecision(
+                    approved=False,
+                    reason="Symbol already has an open position",
+                    sized_quantity=None,
+                    risk_metrics={},
+                )
+            return RiskDecision(
+                approved=True,
+                reason="Passed risk gates",
+                sized_quantity=1.0,
+                risk_metrics={"projected_gross_exposure_pct": 50.0},
+            )
+
+    class FakeOrderManager:
+        risk = MixedPreviewRisk()
+
+        def __init__(self):
+            self.calls = []
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            self.calls.append((intent.symbol, signal_id))
+            return {"order": {"id": "entry-after-capacity-skip", "symbol": intent.symbol}, "risk_decision": {"approved": True}}
+
+    class FakeCommittee:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+
+    def features(score):
+        return {
+            "discovery": {"score": score, "rel_volume": 2.5, "change_pct": 0.04, "spread_pct": 0.003},
+            "research_context": {
+                "technical": {
+                    "rel_volume": 2.5,
+                    "change_pct": 0.04,
+                    "spread_pct": 0.003,
+                    "distance_from_high_pct": -0.08,
+                },
+                "news": [{"headline": "fresh catalyst"}],
+                "fundamental": {"name": "Test Co", "market_cap": 500_000_000},
+            },
+        }
+
+    researched = []
+
+    async def fake_signals(adapter, max_signals=1, **kwargs):
+        return [
+            TradeIntent(symbol="FULL", side="long", entry_price=10.0, confidence=0.9, features=features(9.0)),
+            TradeIntent(symbol="BEST", side="long", entry_price=11.0, confidence=0.85, features=features(6.0)),
+        ]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def no_cached_lookup(**kwargs):
+        return None
+
+    async def fake_log_signal(**kwargs):
+        assert kwargs["symbol"] == "BEST"
+        return 701
+
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+        researched.append((intent.symbol, signal_id))
+        return AIResearchRunResult(
+            symbol=intent.symbol,
+            verdict="approve",
+            validation_passed=True,
+            reason="ai_research_approve",
+        )
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", no_cached_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr(TradingSupervisor, "_run_ai_research", fake_run_ai)
+
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=manager,
+    )
+    supervisor.research_committee = FakeCommittee()
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=2,
+    )
+
+    assert result["order"]["symbol"] == "BEST"
+    assert researched == [("BEST", 701)]
+    assert manager.calls == [("BEST", 701)]
 
 
 @pytest.mark.asyncio
@@ -7433,6 +7791,9 @@ async def test_ai_entry_gate_systemic_failure_does_not_try_next_candidate(monkey
     async def fake_log_signal(**kwargs):
         return 301
 
+    async def no_cached_lookup(**kwargs):
+        return None
+
     async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
         researched.append(intent.symbol)
         return AIResearchRunResult(
@@ -7448,6 +7809,7 @@ async def test_ai_entry_gate_systemic_failure_does_not_try_next_candidate(monkey
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", no_cached_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
     monkeypatch.setattr(TradingSupervisor, "_run_ai_research", fake_run_ai)
 
@@ -8167,9 +8529,13 @@ async def test_entry_capacity_precheck_skips_paid_ai_when_risk_would_reject(monk
     async def exploding_log_signal(**kwargs):
         raise AssertionError("signal should not be logged when capacity preview rejects before AI")
 
+    async def no_cached_lookup(**kwargs):
+        return None
+
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", exploding_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", no_cached_lookup)
 
     supervisor = TradingSupervisor(
         settings=GateSettings(),
@@ -8232,9 +8598,13 @@ async def test_entry_capacity_preview_unavailable_blocks_before_paid_ai(monkeypa
     async def exploding_count(**kwargs):
         raise AssertionError("budget counters should not run when capacity preview is unavailable")
 
+    async def no_cached_lookup(**kwargs):
+        return None
+
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", exploding_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", no_cached_lookup)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_memos", exploding_count)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts", exploding_count)
 

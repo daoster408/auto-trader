@@ -166,6 +166,16 @@ class AIResearchRunResult:
         return self.validation_passed and self.verdict == "approve"
 
 
+@dataclass(frozen=True)
+class EntryCandidateEvaluation:
+    signal: Any
+    intent: Any
+    risk_context: dict[str, Any]
+    snapshot: Any
+    capacity_decision: RiskDecision | None
+    score: float
+
+
 def _float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -173,6 +183,32 @@ def _float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _intent_feature_number(intent: Any, name: str, *, default: float = 0.0) -> float:
+    features = _mapping(getattr(intent, "features", None))
+    discovery = _mapping(features.get("discovery"))
+    if name in discovery:
+        return _float(discovery.get(name), default)
+    return _float(features.get(name), default)
+
+
+def _entry_candidate_triage_score(intent: Any, capacity_decision: RiskDecision | None) -> float:
+    """Cheap, deterministic slate ordering before paid AI sees a candidate."""
+    discovery_score = _intent_feature_number(intent, "score")
+    confidence = _float(getattr(intent, "confidence", None))
+    rel_volume = _intent_feature_number(intent, "rel_volume", default=1.0)
+    change_pct = _intent_feature_number(intent, "change_pct")
+    spread_pct = _intent_feature_number(intent, "spread_pct", default=0.01)
+    sized_qty = _float(getattr(capacity_decision, "sized_quantity", 0.0) if capacity_decision else 0.0)
+
+    chase_penalty = max(0.0, change_pct - 0.12) * 20.0
+    spread_penalty = max(0.0, spread_pct - 0.006) * 120.0
+    return discovery_score + (confidence * 2.0) + (rel_volume * 0.35) + min(sized_qty, 10.0) * 0.01 - chase_penalty - spread_penalty
 
 
 def _now_utc() -> str:
@@ -1054,8 +1090,9 @@ class TradingSupervisor:
             default=bool(getattr(self.settings, "ai_entry_gate_enabled", False)),
         )
         last_blocked_result: dict[str, Any] | None = None
+        real_providers = real_research_providers(self.research_committee)
+        evaluations: list[EntryCandidateEvaluation] = []
         for signal in signals:
-            real_providers = real_research_providers(self.research_committee)
             cached_candidate_block = await self._same_day_candidate_ai_block(
                 signal.symbol,
                 ai_gate_enabled=ai_gate_enabled,
@@ -1078,6 +1115,15 @@ class TradingSupervisor:
                     verdict=cached_candidate_block.verdict,
                     reason=cached_candidate_block.reason,
                 )
+                if not _candidate_specific_ai_block(cached_candidate_block):
+                    await append_journal_entry(
+                        content=(
+                            f"AI entry gate blocked {signal.symbol.upper()}: {cached_candidate_block.reason}; "
+                            f"verdict={cached_candidate_block.verdict}; "
+                            f"validation_passed={cached_candidate_block.validation_passed}; signal_id=None"
+                        )
+                    )
+                    return last_blocked_result
                 continue
             risk_context = build_risk_research_context(
                 account=account,
@@ -1141,6 +1187,82 @@ class TradingSupervisor:
                     )
                 },
             )
+            if ai_gate_enabled and ai_research_enabled and real_providers:
+                prefilter = evaluate_paid_ai_prefilter(intent, settings=self.settings, risk_profile=risk_profile)
+                if prefilter.blocked:
+                    signal_id = await log_signal(
+                        symbol=intent.symbol,
+                        thesis=intent.rationale,
+                        confidence=intent.confidence,
+                        source="rules_fallback",
+                        model_tag="rules_fallback/v0",
+                        features=intent.features,
+                    )
+                    packet = build_research_packet(intent, signal_id=signal_id)
+                    await self._persist_paid_prefilter_block(
+                        intent,
+                        signal_id=signal_id,
+                        packet=packet,
+                        digest=packet_hash(packet),
+                        prefilter=prefilter,
+                        real_providers=real_providers,
+                    )
+                    await append_journal_entry(
+                        content=(
+                            f"AI entry gate blocked {intent.symbol.upper()}: "
+                            f"ai_paid_prefilter_blocked:{','.join(prefilter.reasons)}; "
+                            f"verdict=watch; validation_passed=True; signal_id={signal_id}"
+                        )
+                    )
+                    last_blocked_result = {
+                        "blocked": True,
+                        "reason": (
+                            f"AI entry gate prefilter skipped {intent.symbol.upper()}: "
+                            + ",".join(prefilter.reasons)
+                        ),
+                        "ai_gate": {
+                            "verdict": "watch",
+                            "validation_passed": True,
+                            "reason": "ai_paid_prefilter_blocked:" + ",".join(prefilter.reasons),
+                        },
+                    }
+                    log.info(
+                        "entry_slate_prefilter_skipped_candidate",
+                        symbol=intent.symbol.upper(),
+                        reasons=prefilter.reasons,
+                        score=_entry_candidate_triage_score(intent, capacity_decision),
+                    )
+                    continue
+            evaluations.append(
+                EntryCandidateEvaluation(
+                    signal=signal,
+                    intent=intent,
+                    risk_context=risk_context,
+                    snapshot=snapshot,
+                    capacity_decision=capacity_decision,
+                    score=_entry_candidate_triage_score(intent, capacity_decision),
+                )
+            )
+
+        if not evaluations:
+            return last_blocked_result
+
+        evaluations.sort(key=lambda candidate: candidate.score, reverse=True)
+        if len(evaluations) > 1:
+            log.info(
+                "entry_slate_triaged",
+                candidates=[
+                    {
+                        "symbol": candidate.intent.symbol.upper(),
+                        "score": round(candidate.score, 4),
+                    }
+                    for candidate in evaluations
+                ],
+            )
+
+        for evaluation in evaluations:
+            intent = evaluation.intent
+            snapshot = evaluation.snapshot
             signal_id = await log_signal(
                 symbol=intent.symbol,
                 thesis=intent.rationale,
@@ -1299,11 +1421,80 @@ class TradingSupervisor:
                     provider=lookup["provider"],
                     error=str(e),
                 )
-                return None
+                return AIResearchRunResult(
+                    symbol=symbol.upper(),
+                    verdict="watch",
+                    validation_passed=False,
+                    reason="ai_research_symbol_day_cache_failed",
+                    called_provider=False,
+                )
             result = _cached_candidate_block_result(symbol, cached)
             if result is not None:
                 return result
         return None
+
+    async def _persist_paid_prefilter_block(
+        self,
+        intent: Any,
+        *,
+        signal_id: int | None,
+        packet: dict[str, Any],
+        digest: str,
+        prefilter: Any,
+        real_providers: list[str],
+    ) -> None:
+        prefilter_already_logged = False
+        try:
+            prefilter_already_logged = await get_latest_ai_research_memo_for_symbol(
+                provider=PREFILTER_PROVIDER,
+                symbol=intent.symbol,
+                today_utc=True,
+                prompt_versions=(PREFILTER_PROMPT_VERSION,),
+            ) is not None
+        except Exception as e:
+            log.warning(
+                "ai_paid_prefilter_dedupe_lookup_failed",
+                symbol=intent.symbol.upper(),
+                error=str(e),
+            )
+        if not prefilter_already_logged:
+            await log_ai_research_memo(
+                signal_id=signal_id,
+                symbol=intent.symbol,
+                provider=PREFILTER_PROVIDER,
+                model_tag=PREFILTER_MODEL_TAG,
+                prompt_version=PREFILTER_PROMPT_VERSION,
+                input_hash=digest,
+                verdict="watch",
+                confidence=None,
+                used_only_provided_data=True,
+                validation_passed=True,
+                memo={
+                    "input_packet": packet,
+                    "committee": {
+                        "symbol": intent.symbol.upper(),
+                        "verdict": "watch",
+                        "confidence": None,
+                        "used_only_provided_data": True,
+                        "validation_errors": [],
+                        "judge_summary": (
+                            "Paid AI research skipped by deterministic prefilter: "
+                            + ", ".join(prefilter.reasons)
+                        ),
+                    },
+                    "prefilter": {
+                        "reasons": prefilter.reasons,
+                        "evidence": prefilter.evidence,
+                        "providers_saved": real_providers,
+                    },
+                },
+            )
+        else:
+            log.info(
+                "ai_paid_prefilter_skip_deduped",
+                symbol=intent.symbol.upper(),
+                reasons=prefilter.reasons,
+            )
 
     async def _run_ai_research(
         self,
@@ -1364,58 +1555,14 @@ class TradingSupervisor:
                 )
             prefilter = evaluate_paid_ai_prefilter(intent, settings=self.settings, risk_profile=risk_profile)
             if prefilter.blocked:
-                prefilter_already_logged = False
-                try:
-                    prefilter_already_logged = await get_latest_ai_research_memo_for_symbol(
-                        provider=PREFILTER_PROVIDER,
-                        symbol=intent.symbol,
-                        today_utc=True,
-                        prompt_versions=(PREFILTER_PROMPT_VERSION,),
-                    ) is not None
-                except Exception as e:
-                    log.warning(
-                        "ai_paid_prefilter_dedupe_lookup_failed",
-                        symbol=intent.symbol.upper(),
-                        error=str(e),
-                    )
-                if not prefilter_already_logged:
-                    await log_ai_research_memo(
-                        signal_id=signal_id,
-                        symbol=intent.symbol,
-                        provider=PREFILTER_PROVIDER,
-                        model_tag=PREFILTER_MODEL_TAG,
-                        prompt_version=PREFILTER_PROMPT_VERSION,
-                        input_hash=digest,
-                        verdict="watch",
-                        confidence=None,
-                        used_only_provided_data=True,
-                        validation_passed=True,
-                        memo={
-                            "input_packet": packet,
-                            "committee": {
-                                "symbol": intent.symbol.upper(),
-                                "verdict": "watch",
-                                "confidence": None,
-                                "used_only_provided_data": True,
-                                "validation_errors": [],
-                                "judge_summary": (
-                                    "Paid AI research skipped by deterministic prefilter: "
-                                    + ", ".join(prefilter.reasons)
-                                ),
-                            },
-                            "prefilter": {
-                                "reasons": prefilter.reasons,
-                                "evidence": prefilter.evidence,
-                                "providers_saved": real_providers,
-                            },
-                        },
-                    )
-                else:
-                    log.info(
-                        "ai_paid_prefilter_skip_deduped",
-                        symbol=intent.symbol.upper(),
-                        reasons=prefilter.reasons,
-                    )
+                await self._persist_paid_prefilter_block(
+                    intent,
+                    signal_id=signal_id,
+                    packet=packet,
+                    digest=digest,
+                    prefilter=prefilter,
+                    real_providers=real_providers,
+                )
                 log.info(
                     "ai_paid_prefilter_blocked",
                     symbol=intent.symbol.upper(),
