@@ -600,6 +600,113 @@ def _render_counts(title: str, values: list[str], *, limit: int = 8) -> list[str
     return lines
 
 
+def _trade_groups_by_values(
+    trades: list[ClosedTradeEvidence], value_getter: Any
+) -> list[tuple[str, list[ClosedTradeEvidence], dict[str, float]]]:
+    grouped = _group_trades_by_values(trades, value_getter)
+    rows = [(name, group, _trade_stats(group)) for name, group in grouped.items()]
+    return sorted(rows, key=lambda row: (row[2]["realized_pnl"], row[2]["expectancy"], row[0]), reverse=True)
+
+
+def _format_learning_group(name: str, stats: dict[str, float]) -> str:
+    sample = ", thin" if int(stats["count"]) < 3 else ""
+    return (
+        f"- {name}: n={int(stats['count'])}{sample}, P/L {_money(stats['realized_pnl'])}, "
+        f"exp {_money(stats['expectancy'])}, win {stats['win_rate']:.1f}%"
+    )
+
+
+def _learning_questions(
+    *,
+    trades: list[ClosedTradeEvidence],
+    best_tag: tuple[str, list[ClosedTradeEvidence], dict[str, float]] | None,
+    worst_tag: tuple[str, list[ClosedTradeEvidence], dict[str, float]] | None,
+    worst_provider: tuple[str, list[ClosedTradeEvidence], dict[str, float]] | None,
+    blocked_counts: list[tuple[str, int]],
+) -> list[str]:
+    questions: list[str] = []
+    if len(trades) < 10:
+        questions.append("- Sample is still thin; use this to aim experiments, not declare truth.")
+    if best_tag and best_tag[2]["realized_pnl"] > 0:
+        questions.append(f"- Review whether `{best_tag[0]}` setups deserve more candidate-triage attention after more samples.")
+    if worst_tag and worst_tag[2]["realized_pnl"] < 0:
+        questions.append(f"- Review whether `{worst_tag[0]}` setups need stronger catalysts or stricter prefilter evidence.")
+    if worst_provider and worst_provider[2]["realized_pnl"] < 0:
+        questions.append(f"- Audit observed outcomes for provider vote bucket `{worst_provider[0]}` as sample grows.")
+    if blocked_counts:
+        questions.append(f"- Review whether top blocked pressure `{blocked_counts[0][0]}` is useful filtering or excessive friction.")
+    if not questions:
+        questions.append("- Keep collecting closed trades; no obvious pressure point yet.")
+    return questions
+
+
+def render_learning_brief(report: EdgeReport) -> str:
+    trades = report.closed_trades
+    opportunities = report.opportunities
+    stats = _trade_stats(trades)
+    setup_groups = _trade_groups_by_values(trades, lambda trade: trade.setup_tags)
+    provider_groups = _trade_groups_by_values(trades, lambda trade: trade.provider_votes)
+    blocked = [opportunity for opportunity in opportunities if opportunity.outcome != "traded"]
+    blocked_counts = _bucket_counts([f"{opportunity.outcome}: {_short_reason(opportunity.reason)}" for opportunity in blocked])
+    setup_by_expectancy = sorted(
+        setup_groups,
+        key=lambda row: (row[2]["expectancy"], row[2]["realized_pnl"], row[0]),
+        reverse=True,
+    )
+    best_tags = [row for row in setup_by_expectancy if row[2]["realized_pnl"] > 0][:5]
+    worst_tags = sorted(setup_groups, key=lambda row: (row[2]["expectancy"], row[2]["realized_pnl"], row[0]))[:5]
+    provider_sorted = sorted(provider_groups, key=lambda row: (row[2]["realized_pnl"], row[2]["expectancy"], row[0]), reverse=True)
+    provider_worst = sorted(provider_groups, key=lambda row: (row[2]["realized_pnl"], row[2]["expectancy"], row[0]))
+
+    lines = [
+        "LEARNING BRIEF",
+        f"Window: last {report.window_days} days",
+        f"Evidence: {int(stats['count'])} closed trades, {len(opportunities)} opportunities",
+        f"Realized P/L: {_money(stats['realized_pnl'])}; expectancy/trade {_money(stats['expectancy'])}; win {stats['win_rate']:.1f}%",
+        f"Sample: {'thin' if int(stats['count']) < 10 else 'building'}",
+        "Setup tags with positive observed P/L:",
+    ]
+    if best_tags:
+        lines.extend(_format_learning_group(name, row_stats) for name, _group, row_stats in best_tags)
+    else:
+        lines.append("- none yet")
+    lines.append("Setup tags with negative observed P/L:")
+    weak_rendered = [row for row in worst_tags if row[2]["realized_pnl"] < 0]
+    if weak_rendered:
+        lines.extend(_format_learning_group(name, row_stats) for name, _group, row_stats in weak_rendered)
+    else:
+        lines.append("- none yet")
+    lines.append("Observed outcomes by provider vote bucket:")
+    if provider_sorted:
+        for name, _group, row_stats in provider_sorted[:3]:
+            lines.append(_format_learning_group(name, row_stats))
+        for name, _group, row_stats in provider_worst[:2]:
+            if row_stats["realized_pnl"] < 0:
+                lines.append(_format_learning_group(name, row_stats))
+    else:
+        lines.append("- none yet")
+    lines.append("Blocked pressure:")
+    if blocked_counts:
+        for value, count in blocked_counts[:5]:
+            lines.append(f"- {value}: {count}")
+    else:
+        lines.append("- none")
+    lines.append("Next review questions:")
+    best_tag = best_tags[0] if best_tags else None
+    worst_tag = weak_rendered[0] if weak_rendered else None
+    worst_provider = provider_worst[0] if provider_worst else None
+    lines.extend(
+        _learning_questions(
+            trades=trades,
+            best_tag=best_tag,
+            worst_tag=worst_tag,
+            worst_provider=worst_provider,
+            blocked_counts=blocked_counts,
+        )
+    )
+    return "\n".join(lines)
+
+
 def render_edge_report(report: EdgeReport) -> str:
     trades = report.closed_trades
     opportunities = report.opportunities
@@ -664,12 +771,23 @@ async def run_edge_report(*, window_days: int = 7) -> str:
     return render_edge_report(report)
 
 
+async def run_learning_brief(*, window_days: int = 7) -> str:
+    settings = get_settings()
+    configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
+    report = await build_edge_report(window_days=window_days)
+    return render_learning_brief(report)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read-only trade edge evidence report.")
     parser.add_argument("--days", type=int, default=7, help="Lookback window in days.")
+    parser.add_argument("--brief", action="store_true", help="Render the learning-loop brief instead of the edge report.")
     args = parser.parse_args()
     setup_logging("ERROR")
-    print(asyncio.run(run_edge_report(window_days=args.days)))
+    if args.brief:
+        print(asyncio.run(run_learning_brief(window_days=args.days)))
+    else:
+        print(asyncio.run(run_edge_report(window_days=args.days)))
 
 
 if __name__ == "__main__":

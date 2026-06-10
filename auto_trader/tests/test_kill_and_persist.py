@@ -28,7 +28,7 @@ from auto_trader.account_risk_validate import (
     validation_exit_code as account_risk_validation_exit_code,
 )
 from auto_trader.day3_validate import build_day3_validation_report, validation_exit_code
-from auto_trader.edge_report import build_edge_report, render_edge_report
+from auto_trader.edge_report import build_edge_report, render_edge_report, render_learning_brief
 from auto_trader.ai_research_preflight import (
     build_ai_research_preflight_report,
     render_ai_research_preflight,
@@ -3705,6 +3705,7 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
 
         report = await build_edge_report(window_days=7)
         rendered = render_edge_report(report)
+        brief = render_learning_brief(report)
 
         assert len(report.closed_trades) == 1
         trade = report.closed_trades[0]
@@ -3726,6 +3727,13 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
         assert "- relvol:strong: n=1, P/L $4.00" in rendered
         assert "By provider vote:" in rendered
         assert "- anthropic:approve:high_conf: n=1, P/L $4.00" in rendered
+        assert "LEARNING BRIEF" in brief
+        assert "Sample: thin" in brief
+        assert "Setup tags with positive observed P/L:" in brief
+        assert "- relvol:strong: n=1, thin, P/L $4.00" in brief
+        assert "Observed outcomes by provider vote bucket:" in brief
+        assert "- anthropic:approve:high_conf: n=1, thin, P/L $4.00" in brief
+        assert "Next review questions:" in brief
 
 
 @pytest.mark.asyncio
@@ -3802,6 +3810,7 @@ async def test_edge_report_classifies_skipped_opportunities():
 
         report = await build_edge_report(window_days=30)
         rendered = render_edge_report(report)
+        brief = render_learning_brief(report)
         outcomes = {opportunity.symbol: opportunity.outcome for opportunity in report.opportunities}
 
         assert outcomes["SSPE"] == "ai_watch"
@@ -3814,6 +3823,10 @@ async def test_edge_report_classifies_skipped_opportunities():
         assert "- prefilter_blocked: paid AI prefilter blocked: 1" in rendered
         assert "Opportunity setup tags:" in rendered
         assert "- inverse_or_leveraged:" in rendered
+        assert "LEARNING BRIEF" in brief
+        assert "Evidence: 0 closed trades, 3 opportunities" in brief
+        assert "- prefilter_blocked: paid AI prefilter blocked: 1" in brief
+        assert "Sample is still thin" in brief
 
 
 @pytest.mark.asyncio
