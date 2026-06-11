@@ -299,15 +299,26 @@ def _runtime_bool(runtime_config: dict[str, str], key: str, default: bool) -> bo
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _runtime_int(runtime_config: dict[str, str], key: str, default: int, *, minimum: int = 1, maximum: int) -> int:
+def _runtime_int(
+    runtime_config: dict[str, str],
+    key: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int | None = None,
+) -> int:
     raw = runtime_config.get(key)
     if raw is None:
-        return min(max(default, minimum), maximum)
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return min(max(default, minimum), maximum)
-    return min(max(value, minimum), maximum)
+        value = int(default)
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = int(default)
+    value = max(value, minimum)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
 
 
 def _what_happens_next(
@@ -371,7 +382,6 @@ def build_week2_launchpad_report(
         runtime_config,
         "max_new_positions_per_day",
         int(getattr(settings, "max_new_positions_per_day", 1) or 1),
-        maximum=profile.max_runtime_entries_paper if paper else int(getattr(settings, "max_new_positions_per_day", 1) or 1),
     )
     runtime_auto_entry = _runtime_bool(runtime_config, "auto_entry_enabled", bool(getattr(settings, "auto_entry_enabled", False)))
     ai_gate_enabled = _runtime_bool(runtime_config, "ai_entry_gate_enabled", bool(getattr(settings, "ai_entry_gate_enabled", False)))

@@ -41,7 +41,6 @@ class RiskProfile:
     name: RiskProfileName
     label: str
     paper_only: bool
-    max_runtime_entries_paper: int
     early_notional_cap_pct: float
     discovery: DiscoveryProfile
     paid_ai_prefilter: PaidAIPrefilterProfile
@@ -51,7 +50,6 @@ CONSERVATIVE_PROFILE = RiskProfile(
     name="conservative",
     label="Conservative",
     paper_only=False,
-    max_runtime_entries_paper=3,
     early_notional_cap_pct=0.05,
     discovery=DiscoveryProfile(
         min_price=3.0,
@@ -76,7 +74,6 @@ AGGRESSIVE_PROFILE = RiskProfile(
     name="aggressive",
     label="Aggressive",
     paper_only=True,
-    max_runtime_entries_paper=5,
     early_notional_cap_pct=0.075,
     discovery=DiscoveryProfile(
         min_price=2.0,
@@ -101,7 +98,6 @@ RISKY_PROFILE = RiskProfile(
     name="risky",
     label="Risky",
     paper_only=True,
-    max_runtime_entries_paper=8,
     early_notional_cap_pct=0.10,
     discovery=DiscoveryProfile(
         min_price=1.0,

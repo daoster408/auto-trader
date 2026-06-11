@@ -78,9 +78,8 @@ async def _runtime_risk_profile(settings: Any, *, paper: bool) -> str:
 
 
 async def _runtime_entry_cap(settings: Any, *, paper: bool, risk_profile: str) -> int:
-    maximum = _max_runtime_entries_allowed(settings, paper=paper, risk_profile=risk_profile)
     default = int(getattr(settings, "max_new_positions_per_day", 1) or 1)
-    default = min(max(default, 1), maximum)
+    default = max(default, 1)
     try:
         raw_value = await get_runtime_config_value("max_new_positions_per_day")
     except Exception as e:
@@ -93,14 +92,7 @@ async def _runtime_entry_cap(settings: Any, *, paper: bool, risk_profile: str) -
     except (TypeError, ValueError):
         log.warning("runtime_entry_cap_invalid", value=raw_value, default=default)
         return default
-    return min(max(configured, 1), maximum)
-
-
-def _max_runtime_entries_allowed(settings: Any, *, paper: bool, risk_profile: str) -> int:
-    profile = get_risk_profile(risk_profile, paper=paper)
-    if paper:
-        return profile.max_runtime_entries_paper
-    return int(getattr(settings, "max_new_positions_per_day", 1) or 1)
+    return max(configured, 1)
 
 
 async def _get_profiled_rules_signals(

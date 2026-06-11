@@ -4173,6 +4173,37 @@ def test_week2_launchpad_reports_halted_positions_and_blocks_resume():
     assert launchpad_exit_code(gates) == 1
 
 
+def test_week2_launchpad_renders_explicit_max_entries_independent_of_profile():
+    report, _gates = build_week2_launchpad_report(
+        settings=DummySupervisorSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={
+            "risk_profile": "aggressive",
+            "auto_entry_enabled": "true",
+            "ai_entry_gate_enabled": "true",
+            "max_new_positions_per_day": "100",
+        },
+        today_new_entries=7,
+        ai_calls_used=2,
+    )
+
+    assert "Risk profile: aggressive" in report
+    assert "Today new entries: 7 / 100" in report
+
+
 def test_week2_launchpad_renders_secret_safe_intelligence_readiness(tmp_path, monkeypatch):
     scoreboard_path = tmp_path / "runtime" / "scoreboard_memory_pack.json"
     guidance_path = tmp_path / "runtime" / "brain_guidance_pack.json"
@@ -5902,7 +5933,7 @@ async def test_telegram_authorized_status_reads_snapshot(monkeypatch):
             "orders": [],
             "reconciled": 0,
             "today_new_entries": 0,
-            "runtime_config": {"auto_entry_enabled": "true", "max_new_positions_per_day": "3"},
+            "runtime_config": {"auto_entry_enabled": "true", "max_new_positions_per_day": "100"},
             "errors": [],
         }
 
@@ -5913,7 +5944,7 @@ async def test_telegram_authorized_status_reads_snapshot(monkeypatch):
 
     assert "AUTO-TRADER STATUS" in update.message.replies[0]
     assert "New entries: allowed" in update.message.replies[0]
-    assert "Today new entries: 0 / 3" in update.message.replies[0]
+    assert "Today new entries: 0 / 100" in update.message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -6134,7 +6165,7 @@ def test_telegram_status_surfaces_runtime_auto_entry_disabled():
     assert "New entries: disabled by runtime config" in status
 
 
-def test_telegram_status_clamps_stale_runtime_cap_in_live_mode():
+def test_telegram_status_uses_explicit_runtime_cap_in_live_mode():
     sm = StateMachine(initial_state=SystemState.ACTIVE)
 
     class LiveAdapter:
@@ -6169,8 +6200,8 @@ def test_telegram_status_clamps_stale_runtime_cap_in_live_mode():
         }
     )
 
-    assert "Today new entries: 1 / 1" in status
-    assert "New entries: blocked by daily-entry limit" in status
+    assert "Today new entries: 1 / 3" in status
+    assert "New entries: allowed" in status
 
 
 @pytest.mark.asyncio
@@ -6231,11 +6262,15 @@ async def test_telegram_config_handler_sets_ai_entry_gate(monkeypatch):
         stored[key] = value
         return True
 
+    async def fake_values():
+        return {"risk_profile": "aggressive", "max_new_positions_per_day": "1"}
+
     async def fake_journal(**kwargs):
         journal.append(kwargs["content"])
         return 1
 
     monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
 
     bot = TelegramBot(
@@ -6270,11 +6305,15 @@ async def test_telegram_config_handler_sets_max_entries(monkeypatch):
         stored[key] = value
         return True
 
+    async def fake_values():
+        return {"risk_profile": "aggressive", "max_new_positions_per_day": "1"}
+
     async def fake_journal(**kwargs):
         journal.append(kwargs["content"])
         return 1
 
     monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
     monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
 
     bot = TelegramBot(
@@ -6291,7 +6330,207 @@ async def test_telegram_config_handler_sets_max_entries(monkeypatch):
 
     assert stored == {"max_new_positions_per_day": "3"}
     assert update.message.replies == ["Runtime max entries per day set to 3."]
-    assert journal == ["Runtime config updated: max_new_positions_per_day=3."]
+    assert journal == [
+        "Runtime config updated: max_new_positions_per_day 1->3; mode=paper; risk_profile=aggressive."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_sets_aggressive_max_entries_above_profile_cap(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+    journal = []
+
+    class PaperAdapter:
+        paper = True
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    async def fake_values():
+        return {"risk_profile": "aggressive", "max_new_positions_per_day": "5"}
+
+    async def fake_journal(**kwargs):
+        journal.append(kwargs["content"])
+        return 1
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=PaperAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["max_entries", "8"]))
+
+    assert stored == {"max_new_positions_per_day": "8"}
+    assert update.message.replies == ["Runtime max entries per day set to 8."]
+    assert journal == [
+        "Runtime config updated: max_new_positions_per_day 5->8; mode=paper; risk_profile=aggressive."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_accepts_explicit_high_max_entries(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+    journal = []
+
+    class PaperAdapter:
+        paper = True
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    async def fake_values():
+        return {"risk_profile": "aggressive", "max_new_positions_per_day": "8"}
+
+    async def fake_journal(**kwargs):
+        journal.append(kwargs["content"])
+        return 1
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=PaperAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["max_entries", "100"]))
+
+    assert stored == {"max_new_positions_per_day": "100"}
+    assert update.message.replies == ["Runtime max entries per day set to 100."]
+    assert journal == [
+        "Runtime config updated: max_new_positions_per_day 8->100; mode=paper; risk_profile=aggressive."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_rejects_non_positive_max_entries(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+
+    class PaperAdapter:
+        paper = True
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    async def fake_values():
+        return {"risk_profile": "aggressive", "max_new_positions_per_day": "5"}
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=PaperAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["max_entries", "0"]))
+
+    assert stored == {}
+    assert update.message.replies == ["Use: /config max_entries <positive integer>"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_value", ["1.5", "1e2", "ten"])
+async def test_telegram_config_handler_rejects_malformed_max_entries(monkeypatch, raw_value):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+
+    class PaperAdapter:
+        paper = True
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    async def fake_values():
+        return {"risk_profile": "aggressive", "max_new_positions_per_day": "5"}
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=PaperAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["max_entries", raw_value]))
+
+    assert stored == {}
+    assert update.message.replies == ["Use: /config max_entries <positive integer>"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_live_max_entries_is_explicit_not_profile_capped(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+    journal = []
+
+    class LiveAdapter:
+        paper = False
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    async def fake_values():
+        return {"risk_profile": "conservative", "max_new_positions_per_day": "1"}
+
+    async def fake_journal(**kwargs):
+        journal.append(kwargs["content"])
+        return 1
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.get_runtime_config_values", fake_values)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.append_journal_entry", fake_journal)
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=LiveAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["max_entries", "100"]))
+
+    assert stored == {"max_new_positions_per_day": "100"}
+    assert update.message.replies == ["Runtime max entries per day set to 100."]
+    assert journal == [
+        "Runtime config updated: max_new_positions_per_day 1->100; mode=live; risk_profile=conservative."
+    ]
 
 
 @pytest.mark.asyncio
@@ -6333,7 +6572,7 @@ async def test_telegram_config_handler_sets_paper_risk_profile(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_telegram_config_handler_clamps_entries_when_profile_tightens(monkeypatch):
+async def test_telegram_config_handler_keeps_entries_when_profile_changes(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     stored = {}
 
@@ -6366,8 +6605,8 @@ async def test_telegram_config_handler_clamps_entries_when_profile_tightens(monk
 
     await bot._config_handler(update, FakeTelegramContext(["risk_profile", "conservative"]))
 
-    assert stored == {"risk_profile": "conservative", "max_new_positions_per_day": "3"}
-    assert "Existing max entries clamped to 3." in update.message.replies[0]
+    assert stored == {"risk_profile": "conservative"}
+    assert "Max entries remain independently set to 8." in update.message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -11577,7 +11816,7 @@ async def test_supervisor_auto_entry_uses_runtime_entry_cap(monkeypatch):
 
     async def fake_runtime_config_value(key):
         if key == "max_new_positions_per_day":
-            return "8"
+            return "100"
         return None
 
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
@@ -11599,7 +11838,7 @@ async def test_supervisor_auto_entry_uses_runtime_entry_cap(monkeypatch):
 
     assert result.entry_result["order"]["id"] == "entry-runtime-cap"
     assert manager.snapshots[0].today_new_entries == 1
-    assert manager.snapshots[0].max_new_positions_per_day == 3
+    assert manager.snapshots[0].max_new_positions_per_day == 100
 
 
 @pytest.mark.asyncio

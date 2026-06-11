@@ -427,7 +427,7 @@ class TelegramBot:
             "max_new_positions_per_day",
             default=int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1),
         )
-        max_positions = min(max(max_positions, 1), self._max_runtime_entries_allowed(risk_profile))
+        max_positions = max(max_positions, 1)
         account_tradable = (
             account.get("status") == "CONNECTED"
             and "active" in str(account.get("account_status", "")).lower()
@@ -475,7 +475,6 @@ class TelegramBot:
             "max_new_positions_per_day",
             default=int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1),
             minimum=1,
-            maximum=self._max_runtime_entries_allowed(risk_profile),
         )
         auto_entry_source = "runtime" if "auto_entry_enabled" in values else "env default"
         max_positions_source = "runtime" if "max_new_positions_per_day" in values else "env default"
@@ -496,7 +495,7 @@ class TelegramBot:
                 "Use: /config auto_entry on | /config auto_entry off",
                 "     /config ai_gate on | /config ai_gate off",
                 "     /config risk_profile conservative | aggressive | risky",
-                f"     /config max_entries 1-{self._max_runtime_entries_allowed(risk_profile)}",
+                "     /config max_entries <positive integer>",
             ]
         )
 
@@ -512,15 +511,6 @@ class TelegramBot:
         except Exception as e:
             log.warning("runtime_config_values_unavailable", error=str(e))
             return {}
-
-    def _max_runtime_entries_allowed(self, risk_profile: str | None = None) -> int:
-        profile = get_risk_profile(
-            risk_profile or getattr(self.risk.settings, "risk_profile", "conservative"),
-            paper=bool(getattr(self.adapter, "paper", False)),
-        )
-        if bool(getattr(self.adapter, "paper", False)):
-            return profile.max_runtime_entries_paper
-        return int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1)
 
     def _build_report_message(self, snapshot: dict[str, Any]) -> str:
         account = snapshot.get("account") or {}
@@ -687,12 +677,11 @@ class TelegramBot:
             return
         if len(args) != 2:
             values = await self._runtime_values_or_empty()
-            risk_profile = self._risk_profile_from_values(values)
             await update.message.reply_text(
                 "Use: /config auto_entry on | /config auto_entry off; "
                 "/config ai_gate on | /config ai_gate off; "
                 "/config risk_profile conservative|aggressive|risky; "
-                f"/config max_entries 1-{self._max_runtime_entries_allowed(risk_profile)}"
+                "/config max_entries <positive integer>"
             )
             return
         key = args[0]
@@ -751,22 +740,12 @@ class TelegramBot:
                 "max_new_positions_per_day",
                 default=int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1),
             )
-            max_allowed = self._max_runtime_entries_allowed(profile.name)
-            clamped_max: int | None = None
-            if existing_max > max_allowed:
-                max_persisted = await set_runtime_config_value("max_new_positions_per_day", str(max_allowed))
-                if not max_persisted:
-                    await update.message.reply_text(
-                        "Runtime risk profile updated, but entry cap clamp failed. Check /config before trading."
-                    )
-                    return
-                clamped_max = max_allowed
             await append_journal_entry(content=f"Runtime config updated: risk_profile={profile.name}.")
             note = " Risky is paper-only and cannot bypass hard brakes." if profile.name == "risky" else ""
-            clamp_note = f" Existing max entries clamped to {clamped_max}." if clamped_max is not None else ""
+            entry_note = f" Max entries remain independently set to {existing_max}."
             await update.message.reply_text(
                 f"Runtime risk profile set to {profile.name}. "
-                f"Max paper entries now 1-{self._max_runtime_entries_allowed(profile.name)}.{clamp_note}{note}"
+                f"Max entries can be set independently with /config max_entries <positive integer>.{entry_note}{note}"
             )
             log.warning(
                 "runtime_risk_profile_updated",
@@ -777,22 +756,31 @@ class TelegramBot:
         if key in {"max_entries", "max_new_positions_per_day", "daily_entries"}:
             values = await self._runtime_values_or_empty()
             risk_profile = self._risk_profile_from_values(values)
+            old_entries = _runtime_int_from_values(
+                values,
+                "max_new_positions_per_day",
+                default=int(getattr(self.risk.settings, "max_new_positions_per_day", 1) or 1),
+            )
             try:
                 max_entries = int(raw_value)
             except ValueError:
-                await update.message.reply_text(
-                    f"Use: /config max_entries 1-{self._max_runtime_entries_allowed(risk_profile)}"
-                )
+                await update.message.reply_text("Use: /config max_entries <positive integer>")
                 return
-            max_allowed = self._max_runtime_entries_allowed(risk_profile)
-            if max_entries < 1 or max_entries > max_allowed:
-                await update.message.reply_text(f"Use: /config max_entries 1-{max_allowed}")
+            if max_entries < 1:
+                await update.message.reply_text("Use: /config max_entries <positive integer>")
                 return
             persisted = await set_runtime_config_value("max_new_positions_per_day", str(max_entries))
             if not persisted:
                 await update.message.reply_text("Runtime config update failed. Entry cap unchanged.")
                 return
-            await append_journal_entry(content=f"Runtime config updated: max_new_positions_per_day={max_entries}.")
+            mode = "paper" if bool(getattr(self.adapter, "paper", False)) else "live"
+            await append_journal_entry(
+                content=(
+                    "Runtime config updated: "
+                    f"max_new_positions_per_day {old_entries}->{max_entries}; "
+                    f"mode={mode}; risk_profile={risk_profile}."
+                )
+            )
             await update.message.reply_text(f"Runtime max entries per day set to {max_entries}.")
             log.warning(
                 "runtime_max_entries_updated",
@@ -804,7 +792,7 @@ class TelegramBot:
             "Use: /config auto_entry on | /config auto_entry off; "
             "/config ai_gate on | /config ai_gate off; "
             "/config risk_profile conservative|aggressive|risky; "
-            f"/config max_entries 1-{self._max_runtime_entries_allowed()}"
+            "/config max_entries <positive integer>"
         )
 
     async def _unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
