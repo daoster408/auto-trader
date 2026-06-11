@@ -30,6 +30,7 @@ from auto_trader.persistence.db import (
     count_ai_postmortem_escalation_chargeable_attempts,
     count_ai_research_chargeable_attempts,
     count_entry_orders_since,
+    get_entry_pressure_counts_since,
     get_pending_exits,
     get_runtime_config_values,
     init_db,
@@ -47,7 +48,9 @@ OPEN_ORDER_STATUSES = {
     "held",
     "partially_filled",
 }
+ENTRY_ORDER_SIDES = {"buy", "long"}
 MAX_POSTMORTEM_READINESS_BYTES = 32_000
+PREFILTER_PROMPT_VERSION = "ai_paid_prefilter/v0"
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,26 @@ class IntelligenceReadiness:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class EntryPressure:
+    since_label: str
+    signal_count: int | None
+    signal_symbols: int | None
+    latest_signal_symbol: str | None
+    prefilter_blocks: int
+    ai_approve: int
+    ai_watch: int
+    ai_reject: int
+    ai_invalid: int
+    risk_approved: int
+    risk_blocked: int
+    top_risk_block: str | None
+    latest_entry_symbol: str | None
+    latest_entry_status: str | None
+    likely_blocker: str
+    error: str | None = None
+
+
 def _float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -112,6 +135,10 @@ def _open_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _open_orders(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [order for order in orders if _status(order.get("status")) in OPEN_ORDER_STATUSES]
+
+
+def _entry_open_orders(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [order for order in orders if _status(order.get("side")) in ENTRY_ORDER_SIDES]
 
 
 def _format_position(position: dict[str, Any]) -> str:
@@ -292,6 +319,187 @@ def _render_intelligence_readiness(readiness: IntelligenceReadiness) -> list[str
     return lines
 
 
+def _risk_block_bucket(reason: Any) -> str:
+    text = str(reason or "").lower()
+    if "open position" in text or "already has" in text or "duplicate" in text:
+        return "duplicate/open-position guard"
+    if "daily" in text or "max new" in text or "max open" in text or "position limit" in text:
+        return "entry capacity limit"
+    if "gross exposure" in text or "exposure" in text:
+        return "gross exposure limit"
+    if "buying power" in text or "cash" in text:
+        return "cash/buying power"
+    if "halt" in text or "paused" in text:
+        return "system state guard"
+    return "other RiskEngine block"
+
+
+def _entry_pressure_from_counts(
+    *,
+    counts: dict[str, Any] | None,
+    since_label: str,
+    system_state: SystemState,
+    account_tradable: bool,
+    market_open: bool | None,
+    runtime_auto_entry: bool,
+    ai_gate_enabled: bool,
+    open_positions: list[dict[str, Any]],
+    open_orders: list[dict[str, Any]],
+    today_new_entries: int | None,
+    max_entries: int,
+    ai_calls_used: int | None,
+    max_ai_calls: int,
+    errors: list[str],
+) -> EntryPressure:
+    if counts is None:
+        return EntryPressure(
+            since_label=since_label,
+            signal_count=None,
+            signal_symbols=None,
+            latest_signal_symbol=None,
+            prefilter_blocks=0,
+            ai_approve=0,
+            ai_watch=0,
+            ai_reject=0,
+            ai_invalid=0,
+            risk_approved=0,
+            risk_blocked=0,
+            top_risk_block=None,
+            latest_entry_symbol=None,
+            latest_entry_status=None,
+            likely_blocker="entry-pressure data unavailable",
+            error="entry-pressure counts unavailable",
+        )
+
+    signals = counts.get("signals") if isinstance(counts.get("signals"), dict) else {}
+    latest_signal = signals.get("latest") if isinstance(signals.get("latest"), dict) else None
+    memos = counts.get("memos") if isinstance(counts.get("memos"), list) else []
+    risk_decisions = counts.get("risk_decisions") if isinstance(counts.get("risk_decisions"), list) else []
+    latest_order = counts.get("latest_entry_order") if isinstance(counts.get("latest_entry_order"), dict) else None
+
+    prefilter_blocks = 0
+    ai_approve = 0
+    ai_watch = 0
+    ai_reject = 0
+    ai_invalid = 0
+    for row in memos:
+        if not isinstance(row, dict):
+            continue
+        amount = int(row.get("count") or 0)
+        verdict = str(row.get("verdict") or "").lower()
+        prompt_version = str(row.get("prompt_version") or "")
+        validation_passed = bool(row.get("validation_passed"))
+        if prompt_version == PREFILTER_PROMPT_VERSION:
+            if verdict in {"watch", "reject"}:
+                prefilter_blocks += amount
+            continue
+        if not validation_passed:
+            ai_invalid += amount
+        elif verdict == "approve":
+            ai_approve += amount
+        elif verdict == "reject":
+            ai_reject += amount
+        else:
+            ai_watch += amount
+
+    risk_approved = 0
+    risk_block_buckets: dict[str, int] = {}
+    for row in risk_decisions:
+        if not isinstance(row, dict):
+            continue
+        amount = int(row.get("count") or 0)
+        if bool(row.get("approved")):
+            risk_approved += amount
+        else:
+            bucket = _risk_block_bucket(row.get("reason"))
+            risk_block_buckets[bucket] = risk_block_buckets.get(bucket, 0) + amount
+    risk_blocked = sum(risk_block_buckets.values())
+    top_risk_block = None
+    if risk_block_buckets:
+        top_risk_block = sorted(risk_block_buckets.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+    likely = "capacity exists; waiting for next candidate"
+    if errors:
+        likely = "snapshot/API issue"
+    elif system_state == SystemState.HALTED:
+        likely = "system is HALTED"
+    elif not account_tradable:
+        likely = "broker/account not tradable"
+    elif market_open is not True:
+        likely = "regular market closed"
+    elif not runtime_auto_entry:
+        likely = "auto-entry disabled"
+    elif len(open_positions) >= max_entries:
+        likely = "open-position capacity full"
+    elif today_new_entries is not None and today_new_entries >= max_entries:
+        likely = "daily entry capacity full"
+    elif open_orders:
+        likely = "open entry order pending"
+    elif ai_gate_enabled and ai_calls_used is not None and max_ai_calls <= 0:
+        likely = "AI research budget disabled"
+    elif ai_gate_enabled and ai_calls_used is not None and max_ai_calls > 0 and ai_calls_used >= max_ai_calls:
+        likely = "AI research budget exhausted"
+    elif int(signals.get("count") or 0) <= 0:
+        likely = "no persisted candidates in window"
+    elif prefilter_blocks > 0 and prefilter_blocks >= max(ai_watch + ai_reject + ai_invalid, 1):
+        likely = "paid prefilter blocking weak candidates"
+    elif ai_watch + ai_reject + ai_invalid > ai_approve:
+        likely = "AI gate mostly watch/reject/invalid"
+    elif risk_blocked > risk_approved and risk_blocked > 0:
+        likely = f"RiskEngine blocks dominate ({top_risk_block or 'risk block'})"
+    elif latest_order:
+        likely = "recent entry exists; monitor outcome"
+
+    return EntryPressure(
+        since_label=since_label,
+        signal_count=int(signals.get("count") or 0),
+        signal_symbols=int(signals.get("symbols") or 0),
+        latest_signal_symbol=_symbol(latest_signal.get("symbol")) if latest_signal else None,
+        prefilter_blocks=prefilter_blocks,
+        ai_approve=ai_approve,
+        ai_watch=ai_watch,
+        ai_reject=ai_reject,
+        ai_invalid=ai_invalid,
+        risk_approved=risk_approved,
+        risk_blocked=risk_blocked,
+        top_risk_block=top_risk_block,
+        latest_entry_symbol=_symbol(latest_order.get("symbol")) if latest_order else None,
+        latest_entry_status=str(latest_order.get("status") or "") if latest_order else None,
+        likely_blocker=likely,
+    )
+
+
+def _render_entry_pressure(pressure: EntryPressure, *, open_positions: list[dict[str, Any]], max_entries: int) -> list[str]:
+    lines = [
+        "Entry pressure:",
+        "- Best-effort diagnostic only; RiskEngine remains order authority.",
+        f"- Window: {pressure.since_label}",
+        f"- Capacity: {len(open_positions)} open / {max_entries} configured",
+    ]
+    if pressure.error:
+        lines.append(f"- Data: {pressure.error}")
+    else:
+        latest_signal = f"; latest {pressure.latest_signal_symbol}" if pressure.latest_signal_symbol else ""
+        lines.append(
+            f"- Candidates: {pressure.signal_count} signal(s), "
+            f"{pressure.signal_symbols} symbol(s){latest_signal}"
+        )
+        lines.append(
+            "- Pipeline blocks: "
+            f"prefilter {pressure.prefilter_blocks}, "
+            f"AI watch/reject/invalid {pressure.ai_watch}/{pressure.ai_reject}/{pressure.ai_invalid}, "
+            f"AI approve {pressure.ai_approve}"
+        )
+        risk_detail = f"; top {pressure.top_risk_block}" if pressure.top_risk_block else ""
+        lines.append(
+            f"- RiskEngine: {pressure.risk_approved} approved, {pressure.risk_blocked} blocked{risk_detail}"
+        )
+        if pressure.latest_entry_symbol:
+            lines.append(f"- Latest entry: {pressure.latest_entry_symbol}, {pressure.latest_entry_status or 'unknown'}")
+    lines.append(f"- Likely blocker: {pressure.likely_blocker}")
+    return lines
+
+
 def _runtime_bool(runtime_config: dict[str, str], key: str, default: bool) -> bool:
     raw = runtime_config.get(key)
     if raw is None:
@@ -373,6 +581,8 @@ def build_week2_launchpad_report(
     today_new_entries: int | None,
     ai_calls_used: int | None,
     intelligence_readiness: IntelligenceReadiness | None = None,
+    entry_pressure_counts: dict[str, Any] | None = None,
+    entry_pressure_error: str | None = None,
     errors: list[str] | None = None,
 ) -> tuple[str, list[LaunchpadGate]]:
     snapshot_errors = errors or []
@@ -389,6 +599,7 @@ def build_week2_launchpad_report(
     providers = selected_research_providers(settings)
     open_positions = _open_positions(positions)
     active_open_orders = _open_orders(open_orders)
+    active_entry_open_orders = _entry_open_orders(active_open_orders)
     market_open = clock.get("is_open")
     account_tradable = (
         account.get("status") == "CONNECTED"
@@ -411,13 +622,48 @@ def build_week2_launchpad_report(
         account_tradable=account_tradable,
         market_open=market_open,
         open_positions=open_positions,
-        open_orders=active_open_orders,
+        open_orders=active_entry_open_orders,
         runtime_auto_entry=runtime_auto_entry,
         ai_gate_enabled=ai_gate_enabled,
         today_new_entries=today_new_entries,
         max_entries=max_entries,
         errors=snapshot_errors,
     )
+    entry_pressure = _entry_pressure_from_counts(
+        counts=entry_pressure_counts,
+        since_label="today since local midnight",
+        system_state=system_state,
+        account_tradable=account_tradable,
+        market_open=market_open,
+        runtime_auto_entry=runtime_auto_entry,
+        ai_gate_enabled=ai_gate_enabled,
+        open_positions=open_positions,
+        open_orders=active_entry_open_orders,
+        today_new_entries=today_new_entries,
+        max_entries=max_entries,
+        ai_calls_used=ai_calls_used,
+        max_ai_calls=max_ai_calls,
+        errors=snapshot_errors,
+    )
+    if entry_pressure_error:
+        entry_pressure = EntryPressure(
+            since_label=entry_pressure.since_label,
+            signal_count=None,
+            signal_symbols=None,
+            latest_signal_symbol=None,
+            prefilter_blocks=0,
+            ai_approve=0,
+            ai_watch=0,
+            ai_reject=0,
+            ai_invalid=0,
+            risk_approved=0,
+            risk_blocked=0,
+            top_risk_block=None,
+            latest_entry_symbol=None,
+            latest_entry_status=None,
+            likely_blocker="entry-pressure data unavailable",
+            error="entry-pressure counts unavailable",
+        )
 
     gates = [
         LaunchpadGate("oracle/broker snapshots", "PASS" if not snapshot_errors else "FAIL", "; ".join(snapshot_errors) if snapshot_errors else "all read-only snapshots loaded"),
@@ -461,6 +707,8 @@ def build_week2_launchpad_report(
         lines.extend(f"- {_symbol(item.get('symbol'))}: {item.get('status') or 'pending'}, reason {item.get('reason') or 'n/a'}" for item in pending_exits)
     else:
         lines.append("- none")
+    lines.append("")
+    lines.extend(_render_entry_pressure(entry_pressure, open_positions=open_positions, max_entries=max_entries))
     if intelligence_readiness is not None:
         lines.append("")
         lines.extend(_render_intelligence_readiness(intelligence_readiness))
@@ -515,8 +763,9 @@ async def run_week2_launchpad() -> tuple[str, list[LaunchpadGate]]:
     except Exception as exc:
         runtime_config = {}
         errors.append(f"runtime config unavailable: {exc}")
+    today_start_utc = _today_start_utc(settings)
     try:
-        today_new_entries = await count_entry_orders_since(_today_start_utc(settings))
+        today_new_entries = await count_entry_orders_since(today_start_utc)
     except Exception as exc:
         today_new_entries = None
         errors.append(f"entry count unavailable: {exc}")
@@ -538,6 +787,12 @@ async def run_week2_launchpad() -> tuple[str, list[LaunchpadGate]]:
         postmortem_budget_used=postmortem_calls_used,
         escalation_budget_used=escalation_calls_used,
     )
+    entry_pressure_counts: dict[str, Any] | None = None
+    entry_pressure_error: str | None = None
+    try:
+        entry_pressure_counts = await get_entry_pressure_counts_since(today_start_utc)
+    except Exception:
+        entry_pressure_error = "entry-pressure counts unavailable"
 
     return build_week2_launchpad_report(
         settings=settings,
@@ -552,6 +807,8 @@ async def run_week2_launchpad() -> tuple[str, list[LaunchpadGate]]:
         today_new_entries=today_new_entries,
         ai_calls_used=ai_calls_used,
         intelligence_readiness=intelligence_readiness,
+        entry_pressure_counts=entry_pressure_counts,
+        entry_pressure_error=entry_pressure_error,
         errors=errors,
     )
 

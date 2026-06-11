@@ -189,6 +189,10 @@ class DummySupervisorSettings(DummySettings):
     fred_api_key = None
 
 
+class DummyAiBudgetSupervisorSettings(DummySupervisorSettings):
+    ai_research_max_calls_per_day = 20
+
+
 class DummyDay3Settings:
     alpaca_paper = True
     auto_entry_enabled = False
@@ -4202,6 +4206,296 @@ def test_week2_launchpad_renders_explicit_max_entries_independent_of_profile():
 
     assert "Risk profile: aggressive" in report
     assert "Today new entries: 7 / 100" in report
+
+
+def test_week2_launchpad_entry_pressure_shows_ai_blocks():
+    report, _gates = build_week2_launchpad_report(
+        settings=DummyAiBudgetSupervisorSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[{"symbol": "EWM", "qty": 1, "market_value": 30, "unrealized_pl": 0}],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={
+            "risk_profile": "aggressive",
+            "auto_entry_enabled": "true",
+            "ai_entry_gate_enabled": "true",
+            "max_new_positions_per_day": "10",
+        },
+        today_new_entries=5,
+        ai_calls_used=12,
+        entry_pressure_counts={
+            "signals": {"count": 6, "symbols": 3, "latest": {"symbol": "TNA"}},
+            "memos": [
+                {
+                    "prompt_version": "ai_paid_prefilter/v0",
+                    "verdict": "watch",
+                    "validation_passed": True,
+                    "count": 5,
+                },
+                {
+                    "prompt_version": "ai_research_aggregate/v1",
+                    "verdict": "watch",
+                    "validation_passed": True,
+                    "count": 4,
+                },
+                {
+                    "prompt_version": "ai_research_aggregate/v1",
+                    "verdict": "approve",
+                    "validation_passed": True,
+                    "count": 1,
+                },
+            ],
+            "risk_decisions": [],
+            "latest_entry_order": None,
+        },
+    )
+
+    assert "Entry pressure:" in report
+    assert "Capacity: 1 open / 10 configured" in report
+    assert "Candidates: 6 signal(s), 3 symbol(s); latest TNA" in report
+    assert "Pipeline blocks: prefilter 5, AI watch/reject/invalid 4/0/0, AI approve 1" in report
+    assert "Likely blocker: paid prefilter blocking weak candidates" in report
+
+
+def test_week2_launchpad_entry_pressure_shows_ai_budget_disabled():
+    report, _gates = build_week2_launchpad_report(
+        settings=DummySupervisorSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={
+            "risk_profile": "aggressive",
+            "auto_entry_enabled": "true",
+            "ai_entry_gate_enabled": "true",
+            "max_new_positions_per_day": "10",
+        },
+        today_new_entries=0,
+        ai_calls_used=0,
+        entry_pressure_counts={
+            "signals": {"count": 3, "symbols": 3, "latest": {"symbol": "POET"}},
+            "memos": [],
+            "risk_decisions": [],
+            "latest_entry_order": None,
+        },
+    )
+
+    assert "AI paid budget: 0 / 0" in report
+    assert "Likely blocker: AI research budget disabled" in report
+
+
+def test_week2_launchpad_entry_pressure_shows_capacity_full():
+    report, _gates = build_week2_launchpad_report(
+        settings=DummyAiBudgetSupervisorSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[
+            {"symbol": "EWM", "qty": 1, "market_value": 30, "unrealized_pl": 0},
+            {"symbol": "VNO", "qty": 1, "market_value": 30, "unrealized_pl": 0},
+        ],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={
+            "risk_profile": "aggressive",
+            "auto_entry_enabled": "true",
+            "ai_entry_gate_enabled": "true",
+            "max_new_positions_per_day": "2",
+        },
+        today_new_entries=1,
+        ai_calls_used=0,
+        entry_pressure_counts={
+            "signals": {"count": 2, "symbols": 2, "latest": {"symbol": "POET"}},
+            "memos": [],
+            "risk_decisions": [],
+            "latest_entry_order": None,
+        },
+    )
+
+    assert "Capacity: 2 open / 2 configured" in report
+    assert "Likely blocker: open-position capacity full" in report
+
+
+def test_week2_launchpad_entry_pressure_only_entry_orders_block_entry_pressure():
+    report, _gates = build_week2_launchpad_report(
+        settings=DummyAiBudgetSupervisorSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[
+            {"symbol": "EWM", "side": "sell", "qty": 1, "status": "accepted", "broker_order_id": "sell-close"},
+        ],
+        pending_exits=[],
+        runtime_config={
+            "risk_profile": "aggressive",
+            "auto_entry_enabled": "true",
+            "ai_entry_gate_enabled": "true",
+            "max_new_positions_per_day": "10",
+        },
+        today_new_entries=0,
+        ai_calls_used=0,
+        entry_pressure_counts={
+            "signals": {"count": 2, "symbols": 2, "latest": {"symbol": "POET"}},
+            "memos": [],
+            "risk_decisions": [],
+            "latest_entry_order": None,
+        },
+    )
+
+    assert "Open orders:\n- EWM: sell 1.000000, accepted, id sell-clo" in report
+    assert "Likely blocker: open entry order pending" not in report
+    assert "Likely blocker: capacity exists; waiting for next candidate" in report
+
+    report, _gates = build_week2_launchpad_report(
+        settings=DummyAiBudgetSupervisorSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[
+            {"symbol": "POET", "side": "buy", "qty": 1, "status": "accepted", "broker_order_id": "buy-entry"},
+        ],
+        pending_exits=[],
+        runtime_config={
+            "risk_profile": "aggressive",
+            "auto_entry_enabled": "true",
+            "ai_entry_gate_enabled": "true",
+            "max_new_positions_per_day": "10",
+        },
+        today_new_entries=0,
+        ai_calls_used=0,
+        entry_pressure_counts={
+            "signals": {"count": 2, "symbols": 2, "latest": {"symbol": "POET"}},
+            "memos": [],
+            "risk_decisions": [],
+            "latest_entry_order": None,
+        },
+    )
+
+    assert "Likely blocker: open entry order pending" in report
+
+
+def test_week2_launchpad_entry_pressure_shows_no_recent_candidates():
+    report, _gates = build_week2_launchpad_report(
+        settings=DummyAiBudgetSupervisorSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={
+            "risk_profile": "aggressive",
+            "auto_entry_enabled": "true",
+            "ai_entry_gate_enabled": "true",
+            "max_new_positions_per_day": "10",
+        },
+        today_new_entries=0,
+        ai_calls_used=0,
+        entry_pressure_counts={
+            "signals": {"count": 0, "symbols": 0, "latest": None},
+            "memos": [],
+            "risk_decisions": [],
+            "latest_entry_order": None,
+        },
+    )
+
+    assert "Candidates: 0 signal(s), 0 symbol(s)" in report
+    assert "Likely blocker: no persisted candidates in window" in report
+
+
+def test_week2_launchpad_entry_pressure_redacts_raw_risk_reason():
+    report, _gates = build_week2_launchpad_report(
+        settings=DummyAiBudgetSupervisorSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={
+            "risk_profile": "aggressive",
+            "auto_entry_enabled": "true",
+            "ai_entry_gate_enabled": "true",
+            "max_new_positions_per_day": "10",
+        },
+        today_new_entries=0,
+        ai_calls_used=0,
+        entry_pressure_counts={
+            "signals": {"count": 4, "symbols": 4, "latest": {"symbol": "SSPE"}},
+            "memos": [],
+            "risk_decisions": [
+                {"approved": False, "reason": "secret-risk-value", "count": 3},
+                {"approved": True, "reason": "Passed v1 risk gates", "count": 1},
+            ],
+            "latest_entry_order": {"symbol": "POET", "status": "filled"},
+        },
+    )
+
+    assert "secret-risk-value" not in report
+    assert "RiskEngine: 1 approved, 3 blocked; top other RiskEngine block" in report
+    assert "Likely blocker: RiskEngine blocks dominate (other RiskEngine block)" in report
 
 
 def test_week2_launchpad_renders_secret_safe_intelligence_readiness(tmp_path, monkeypatch):

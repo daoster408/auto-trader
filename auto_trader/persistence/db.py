@@ -658,6 +658,107 @@ async def count_entry_orders_since(start_utc_iso: str) -> int:
             raise
 
 
+async def get_entry_pressure_counts_since(start_utc_iso: str) -> dict[str, Any]:
+    """Return bounded structured counts for read-only entry-pressure diagnostics."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                signal_cur = await db.execute(
+                    """
+                    SELECT COUNT(*) AS count, COUNT(DISTINCT upper(symbol)) AS symbols
+                    FROM signals
+                    WHERE datetime(created_at) >= datetime(?)
+                    """,
+                    (start_utc_iso,),
+                )
+                signal_row = await signal_cur.fetchone()
+
+                latest_signal_cur = await db.execute(
+                    """
+                    SELECT id, created_at, symbol, source, model_tag
+                    FROM signals
+                    WHERE datetime(created_at) >= datetime(?)
+                    ORDER BY datetime(created_at) DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (start_utc_iso,),
+                )
+                latest_signal = await latest_signal_cur.fetchone()
+
+                memo_cur = await db.execute(
+                    """
+                    SELECT prompt_version, lower(verdict) AS verdict, validation_passed, COUNT(*) AS count
+                    FROM ai_research_memos
+                    WHERE datetime(created_at) >= datetime(?)
+                    GROUP BY prompt_version, lower(verdict), validation_passed
+                    ORDER BY count DESC, prompt_version ASC, verdict ASC
+                    LIMIT 12
+                    """,
+                    (start_utc_iso,),
+                )
+                memo_rows = await memo_cur.fetchall()
+
+                risk_cur = await db.execute(
+                    """
+                    SELECT approved, reason, COUNT(*) AS count
+                    FROM risk_decisions
+                    WHERE datetime(created_at) >= datetime(?)
+                    GROUP BY approved, reason
+                    ORDER BY count DESC, id DESC
+                    LIMIT 8
+                    """,
+                    (start_utc_iso,),
+                )
+                risk_rows = await risk_cur.fetchall()
+
+                latest_order_cur = await db.execute(
+                    """
+                    SELECT symbol, side, status, submitted_at, filled_at
+                    FROM orders
+                    WHERE datetime(COALESCE(submitted_at, filled_at, '')) >= datetime(?)
+                      AND lower(side) IN ('long', 'buy')
+                    ORDER BY datetime(COALESCE(submitted_at, filled_at, '')) DESC, rowid DESC
+                    LIMIT 1
+                    """,
+                    (start_utc_iso,),
+                )
+                latest_order = await latest_order_cur.fetchone()
+
+                return {
+                    "since_utc": start_utc_iso,
+                    "signals": {
+                        "count": int(signal_row["count"] if signal_row else 0),
+                        "symbols": int(signal_row["symbols"] if signal_row else 0),
+                        "latest": dict(latest_signal) if latest_signal else None,
+                    },
+                    "memos": [
+                        {
+                            "prompt_version": row["prompt_version"],
+                            "verdict": row["verdict"],
+                            "validation_passed": bool(row["validation_passed"]),
+                            "count": int(row["count"]),
+                        }
+                        for row in memo_rows
+                    ],
+                    "risk_decisions": [
+                        {
+                            "approved": bool(row["approved"]),
+                            "reason": row["reason"],
+                            "count": int(row["count"]),
+                        }
+                        for row in risk_rows
+                    ],
+                    "latest_entry_order": dict(latest_order) if latest_order else None,
+                }
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("entry_pressure_counts_failed", error=str(e))
+            raise
+
+
 async def update_account_risk_state(
     *,
     equity: float,
