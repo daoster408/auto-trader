@@ -358,6 +358,14 @@ Before keeping auto-exit enabled unattended:
 - Confirm pending exits are visible in Telegram and clear after the broker position disappears.
 - Confirm shutdown behavior is understood for the run target.
 
+Optional stagnation exit:
+
+- `POSITION_STAGNATION_EXIT_ENABLED=false` by default.
+- When enabled, the supervisor can close dead-money positions after `POSITION_STAGNATION_MIN_HOLD_DAYS` if P/L remains between `POSITION_STAGNATION_MIN_PNL_PCT` and `POSITION_STAGNATION_MAX_PNL_PCT`, relative volume is at or below `POSITION_STAGNATION_MAX_REL_VOLUME`, and the daily range is at or below `POSITION_STAGNATION_MAX_DAILY_RANGE_PCT`.
+- Stagnation evaluation only runs during regular market hours after the configured last-risk-sweep time, default `12:55` in `REPORT_TIMEZONE`, to avoid early-session volume/range false positives.
+- The rule is deterministic and does not call AI.
+- Missing, stale, or timestampless Alpaca snapshot, relative-volume, or daily-range data means hold; do not sell on incomplete stagnation evidence.
+
 Before enabling auto-entry:
 
 - Complete at least one paper burn-in session with stable Telegram visibility.

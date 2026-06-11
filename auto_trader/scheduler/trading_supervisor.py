@@ -65,6 +65,7 @@ log = get_logger("auto_trader.scheduler.trading_supervisor")
 ENTRY_CANDIDATE_EVAL_LIMIT = 10
 AI_ENTRY_GATE_CANDIDATE_BLOCK_VERDICTS = {"watch", "reject"}
 AI_HIGH_EXPOSURE_UNANIMOUS_REASON = "projected gross exposure exceeds unanimous AI threshold"
+STAGNATION_SNAPSHOT_MAX_AGE_MINUTES = 20
 
 
 async def _runtime_risk_profile(settings: Any, *, paper: bool) -> str:
@@ -187,6 +188,43 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _position_stagnation_features(snapshot: dict[str, Any]) -> dict[str, float]:
+    daily = _mapping(snapshot.get("dailyBar"))
+    prev = _mapping(snapshot.get("prevDailyBar"))
+    latest_trade = _mapping(snapshot.get("latestTrade"))
+    latest_quote = _mapping(snapshot.get("latestQuote"))
+    timestamps = [
+        _parse_dt(latest_trade.get("t")),
+        _parse_dt(latest_quote.get("t")),
+        _parse_dt(daily.get("t")),
+    ]
+    fresh_after = datetime.now(UTC) - timedelta(minutes=STAGNATION_SNAPSHOT_MAX_AGE_MINUTES)
+    if not any(ts is not None and ts >= fresh_after for ts in timestamps):
+        return {}
+
+    price = _float(latest_trade.get("p")) or _float(daily.get("c"))
+    high = _float(daily.get("h"), default=None)
+    low = _float(daily.get("l"), default=None)
+    volume = _float(daily.get("v"), default=None)
+    prev_volume = _float(prev.get("v"), default=None)
+
+    features: dict[str, float] = {}
+    if volume is not None and prev_volume is not None and prev_volume > 0:
+        features["rel_volume"] = volume / prev_volume
+    if price > 0 and high is not None and low is not None and high >= low:
+        features["daily_range_pct"] = (high - low) / price * 100.0
+    return features
+
+
+def _stagnation_time_gate_open(settings: Any, clock: dict[str, Any] | None, local_now: datetime) -> bool:
+    if not _regular_market_open(clock):
+        return False
+    sweep_hour = int(getattr(settings, "last_risk_sweep_hour", 12))
+    sweep_minute = int(getattr(settings, "last_risk_sweep_minute", 55))
+    stagnation_start = local_now.replace(hour=sweep_hour, minute=sweep_minute, second=0, microsecond=0)
+    return local_now >= stagnation_start
 
 
 def _intent_feature_number(intent: Any, name: str, *, default: float = 0.0) -> float:
@@ -808,6 +846,8 @@ class TradingSupervisor:
             "pnl_pct": pnl_pct,
             "trailing_drawdown_pct": trailing_drawdown_pct,
             "entry_age_days": position.get("entry_age_days"),
+            "stagnation_rel_volume": position.get("stagnation_rel_volume"),
+            "stagnation_daily_range_pct": position.get("stagnation_daily_range_pct"),
         }
 
         max_loss_pct = float(self.settings.position_max_loss_pct)
@@ -823,6 +863,24 @@ class TradingSupervisor:
         entry_age_days = position.get("entry_age_days")
         if entry_age_days is not None and float(entry_age_days) >= max_hold_days:
             return ExitDecision(symbol=symbol, should_exit=True, reason="position max hold reached", metrics=metrics)
+        stagnation_enabled = bool(getattr(self.settings, "position_stagnation_exit_enabled", False))
+        if stagnation_enabled and entry_age_days is not None:
+            min_hold_days = float(getattr(self.settings, "position_stagnation_min_hold_days", 2.0))
+            min_pnl_pct = float(getattr(self.settings, "position_stagnation_min_pnl_pct", -2.0))
+            max_pnl_pct = float(getattr(self.settings, "position_stagnation_max_pnl_pct", 3.0))
+            max_rel_volume = float(getattr(self.settings, "position_stagnation_max_rel_volume", 0.8))
+            max_daily_range_pct = float(getattr(self.settings, "position_stagnation_max_daily_range_pct", 1.5))
+            rel_volume = _float(position.get("stagnation_rel_volume"), default=None)
+            daily_range_pct = _float(position.get("stagnation_daily_range_pct"), default=None)
+            if (
+                float(entry_age_days) >= min_hold_days
+                and min_pnl_pct <= pnl_pct <= max_pnl_pct
+                and rel_volume is not None
+                and rel_volume <= max_rel_volume
+                and daily_range_pct is not None
+                and daily_range_pct <= max_daily_range_pct
+            ):
+                return ExitDecision(symbol=symbol, should_exit=True, reason="position stagnation exit", metrics=metrics)
         return ExitDecision(symbol=symbol, should_exit=False, reason="hold", metrics=metrics)
 
     async def _sync_persisted_pending_exits(self, open_symbols: set[str]) -> None:
@@ -1878,6 +1936,10 @@ class TradingSupervisor:
                 marker=f"{self._alert_local_date()}:{','.join(sorted(symbol.lower() for symbol in open_symbols))}",
             )
 
+        stagnation_enabled = bool(getattr(self.settings, "position_stagnation_exit_enabled", False))
+        if stagnation_enabled:
+            stagnation_enabled = _stagnation_time_gate_open(self.settings, clock, local_now)
+        stagnation_candidates: list[dict[str, Any]] = []
         for position in open_positions:
             try:
                 entry = await get_latest_entry_order_for_symbol(str(position.get("symbol", "")))
@@ -1888,11 +1950,36 @@ class TradingSupervisor:
             except Exception as e:
                 errors.append(f"entry age unavailable for {position.get('symbol')}: {e}")
             decision = self.evaluate_exit_rules(position)
+            if stagnation_enabled and not decision.should_exit:
+                stagnation_candidates.append(position)
+                continue
             exit_decisions.append(decision)
             try:
                 await self._execute_exit_if_enabled(decision, clock=clock)
             except Exception as e:
                 errors.append(f"exit execution failed for {decision.symbol}: {e}")
+
+        if stagnation_candidates:
+            stagnation_symbols = sorted(str(p.get("symbol", "")).upper() for p in stagnation_candidates if p.get("symbol"))
+            try:
+                snapshots = await self.adapter.get_stock_snapshots(stagnation_symbols)
+                for position in stagnation_candidates:
+                    symbol = str(position.get("symbol", "")).upper()
+                    features = _position_stagnation_features(_mapping(snapshots.get(symbol)))
+                    if "rel_volume" in features:
+                        position["stagnation_rel_volume"] = features["rel_volume"]
+                    if "daily_range_pct" in features:
+                        position["stagnation_daily_range_pct"] = features["daily_range_pct"]
+            except Exception as e:
+                log.warning("stagnation_features_unavailable", symbols=stagnation_symbols, error=str(e))
+
+            for position in stagnation_candidates:
+                decision = self.evaluate_exit_rules(position)
+                exit_decisions.append(decision)
+                try:
+                    await self._execute_exit_if_enabled(decision, clock=clock)
+                except Exception as e:
+                    errors.append(f"exit execution failed for {decision.symbol}: {e}")
 
         if last_risk_sweep_due and positions_snapshot_ok and not errors:
             self._mark_last_risk_sweep_complete(local_now)

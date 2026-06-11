@@ -103,7 +103,7 @@ from auto_trader.intelligence.ai_paid_prefilter import evaluate_paid_ai_prefilte
 import auto_trader.intelligence.rules_fallback as rules_fallback
 from auto_trader.intelligence.rules_fallback import DiscoveryCandidate, get_simple_rules_signals
 from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_shutdown, _should_emergency_halt_on_shutdown
-from auto_trader.scheduler.trading_supervisor import AIResearchRunResult, TradingSupervisor
+from auto_trader.scheduler.trading_supervisor import AIResearchRunResult, TradingSupervisor, _position_stagnation_features
 from auto_trader.persistence.db import (
     append_journal_entry,
     consume_planned_maintenance_shutdown,
@@ -163,6 +163,12 @@ class DummySupervisorSettings(DummySettings):
     position_take_profit_pct = 8.0
     position_trailing_stop_pct = 6.0
     position_max_hold_days = 10
+    position_stagnation_exit_enabled = False
+    position_stagnation_min_hold_days = 2.0
+    position_stagnation_min_pnl_pct = -2.0
+    position_stagnation_max_pnl_pct = 3.0
+    position_stagnation_max_rel_volume = 0.8
+    position_stagnation_max_daily_range_pct = 1.5
     report_timezone = "America/Los_Angeles"
     ai_research_enabled = False
     ai_entry_gate_enabled = False
@@ -354,6 +360,39 @@ def test_single_instance_lock_rejects_duplicate_for_same_db():
         finally:
             first_handle.close()
             lock_path.unlink(missing_ok=True)
+
+
+def test_settings_rejects_inverted_stagnation_pnl_band():
+    with pytest.raises(ValidationError, match="POSITION_STAGNATION_MIN_PNL_PCT"):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            POSITION_STAGNATION_MIN_PNL_PCT=4.0,
+            POSITION_STAGNATION_MAX_PNL_PCT=3.0,
+        )
+
+
+def test_stagnation_features_require_recent_timestamp():
+    old_ts = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    snapshot = {
+        "latestTrade": {"p": 101.0, "t": old_ts},
+        "dailyBar": {"h": 101.4, "l": 100.5, "c": 101.0, "v": 350_000},
+        "prevDailyBar": {"v": 1_000_000},
+    }
+
+    assert _position_stagnation_features(snapshot) == {}
+
+
+def test_stagnation_features_require_any_timestamp():
+    snapshot = {
+        "latestTrade": {"p": 101.0},
+        "dailyBar": {"h": 101.4, "l": 100.5, "c": 101.0, "v": 350_000},
+        "prevDailyBar": {"v": 1_000_000},
+    }
+
+    assert _position_stagnation_features(snapshot) == {}
 
 
 def test_day3_validation_waits_when_position_open_and_pending_exit_present():
@@ -6530,6 +6569,238 @@ async def test_supervisor_reconciles_and_dry_run_exit_signal(monkeypatch):
     assert any("EXIT SIGNAL (dry run): AMPX" in message for message in notifications)
 
 
+@pytest.mark.asyncio
+async def test_supervisor_stagnation_exit_uses_open_position_snapshot(monkeypatch):
+    class StagnationSettings(DummySupervisorSettings):
+        position_stagnation_exit_enabled = True
+        last_risk_sweep_hour = 0
+        last_risk_sweep_minute = 0
+
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    notifications = []
+    fresh_ts = datetime.now(UTC).isoformat()
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "buying_power": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca", "next_close": "2026-06-04T20:00:00+00:00"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return [
+                {
+                    "symbol": "AMPX",
+                    "qty": 1,
+                    "market_value": 101.0,
+                    "unrealized_pl": 1.0,
+                    "cost_basis": 100.0,
+                }
+            ]
+
+        async def get_stock_snapshots(self, symbols):
+            assert symbols == ["AMPX"]
+            return {
+                "AMPX": {
+                    "latestTrade": {"p": 101.0, "t": fresh_ts},
+                    "dailyBar": {"h": 101.4, "l": 100.5, "c": 101.0, "v": 350_000},
+                    "prevDailyBar": {"v": 1_000_000},
+                }
+            }
+
+    async def fake_reconcile(orders):
+        return len(orders)
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        submitted_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        return {"symbol": symbol, "submitted_at": submitted_at}
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    supervisor = TradingSupervisor(
+        settings=StagnationSettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=object(),
+        notifier=fake_notify,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.exit_decisions[0].should_exit is True
+    assert result.exit_decisions[0].reason == "position stagnation exit"
+    assert result.exit_decisions[0].metrics["stagnation_rel_volume"] == pytest.approx(0.35)
+    assert result.exit_decisions[0].metrics["stagnation_daily_range_pct"] == pytest.approx(0.8911, rel=0.001)
+    assert any("EXIT SIGNAL (dry run): AMPX" in message for message in notifications)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stagnation_snapshot_does_not_delay_hard_exit(monkeypatch):
+    class StagnationSettings(DummySupervisorSettings):
+        position_stagnation_exit_enabled = True
+
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    notifications = []
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "buying_power": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca", "next_close": "2026-06-04T20:00:00+00:00"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return [
+                {
+                    "symbol": "AMPX",
+                    "qty": 1,
+                    "market_value": 94.0,
+                    "unrealized_pl": -6.0,
+                    "cost_basis": 100.0,
+                }
+            ]
+
+        async def get_stock_snapshots(self, symbols):
+            raise AssertionError("hard exits must not wait on stagnation snapshots")
+
+    async def fake_reconcile(orders):
+        return len(orders)
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        submitted_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        return {"symbol": symbol, "submitted_at": submitted_at}
+
+    async def fake_notify(message):
+        notifications.append(message)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    supervisor = TradingSupervisor(
+        settings=StagnationSettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=object(),
+        notifier=fake_notify,
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.exit_decisions[0].should_exit is True
+    assert result.exit_decisions[0].reason == "position max loss reached"
+    assert any("EXIT SIGNAL (dry run): AMPX" in message for message in notifications)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stagnation_time_gate_holds_before_window(monkeypatch):
+    class StagnationSettings(DummySupervisorSettings):
+        position_stagnation_exit_enabled = True
+
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "buying_power": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca", "next_close": "2026-06-04T20:00:00+00:00"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return [
+                {
+                    "symbol": "AMPX",
+                    "qty": 1,
+                    "market_value": 101.0,
+                    "unrealized_pl": 1.0,
+                    "cost_basis": 100.0,
+                }
+            ]
+
+        async def get_stock_snapshots(self, symbols):
+            raise AssertionError("pre-gate stagnation holds must not fetch snapshots")
+
+    async def fake_reconcile(orders):
+        return len(orders)
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        submitted_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        return {"symbol": symbol, "submitted_at": submitted_at}
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor._stagnation_time_gate_open", lambda *args: False)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    supervisor = TradingSupervisor(
+        settings=StagnationSettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=object(),
+    )
+
+    result = await supervisor.tick_once()
+
+    assert result.exit_decisions[0].should_exit is False
+    assert result.exit_decisions[0].reason == "hold"
+
+
 def test_supervisor_exit_rule_blocks_max_hold():
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     supervisor = TradingSupervisor(
@@ -6552,6 +6823,210 @@ def test_supervisor_exit_rule_blocks_max_hold():
 
     assert decision.should_exit is True
     assert decision.reason == "position max hold reached"
+
+
+def test_supervisor_stagnation_exit_disabled_holds():
+    class StagnationSettings(DummySupervisorSettings):
+        position_stagnation_exit_enabled = False
+
+    supervisor = TradingSupervisor(
+        settings=StagnationSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+
+    decision = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 101.0,
+            "unrealized_pl": 1.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 3.0,
+            "stagnation_rel_volume": 0.4,
+            "stagnation_daily_range_pct": 0.8,
+        }
+    )
+
+    assert decision.should_exit is False
+    assert decision.reason == "hold"
+
+
+def test_supervisor_stagnation_exit_requires_min_hold_and_market_features():
+    class StagnationSettings(DummySupervisorSettings):
+        position_stagnation_exit_enabled = True
+
+    supervisor = TradingSupervisor(
+        settings=StagnationSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+
+    fresh = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 101.0,
+            "unrealized_pl": 1.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 1.5,
+            "stagnation_rel_volume": 0.4,
+            "stagnation_daily_range_pct": 0.8,
+        }
+    )
+    missing_features = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 101.0,
+            "unrealized_pl": 1.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 3.0,
+        }
+    )
+
+    assert fresh.should_exit is False
+    assert fresh.reason == "hold"
+    assert missing_features.should_exit is False
+    assert missing_features.reason == "hold"
+
+
+def test_supervisor_stagnation_exit_blocks_dead_money_position():
+    class StagnationSettings(DummySupervisorSettings):
+        position_stagnation_exit_enabled = True
+
+    supervisor = TradingSupervisor(
+        settings=StagnationSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+
+    decision = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 101.0,
+            "unrealized_pl": 1.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 3.0,
+            "stagnation_rel_volume": 0.4,
+            "stagnation_daily_range_pct": 0.8,
+        }
+    )
+
+    assert decision.should_exit is True
+    assert decision.reason == "position stagnation exit"
+    assert decision.metrics["stagnation_rel_volume"] == 0.4
+    assert decision.metrics["stagnation_daily_range_pct"] == 0.8
+
+
+def test_supervisor_stagnation_exit_holds_active_or_working_position():
+    class StagnationSettings(DummySupervisorSettings):
+        position_stagnation_exit_enabled = True
+
+    supervisor = TradingSupervisor(
+        settings=StagnationSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+
+    working = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 104.0,
+            "unrealized_pl": 4.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 3.0,
+            "stagnation_rel_volume": 0.4,
+            "stagnation_daily_range_pct": 0.8,
+        }
+    )
+    active_volume = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 101.0,
+            "unrealized_pl": 1.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 3.0,
+            "stagnation_rel_volume": 1.2,
+            "stagnation_daily_range_pct": 0.8,
+        }
+    )
+    active_range = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 101.0,
+            "unrealized_pl": 1.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 3.0,
+            "stagnation_rel_volume": 0.4,
+            "stagnation_daily_range_pct": 2.4,
+        }
+    )
+
+    assert working.should_exit is False
+    assert active_volume.should_exit is False
+    assert active_range.should_exit is False
+
+
+def test_supervisor_stagnation_exit_does_not_override_hard_exits():
+    class StagnationSettings(DummySupervisorSettings):
+        position_stagnation_exit_enabled = True
+
+    supervisor = TradingSupervisor(
+        settings=StagnationSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+
+    loss = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 94.0,
+            "unrealized_pl": -6.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 3.0,
+            "stagnation_rel_volume": 0.4,
+            "stagnation_daily_range_pct": 0.8,
+        }
+    )
+    profit = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "AMPX",
+            "qty": 1,
+            "market_value": 109.0,
+            "unrealized_pl": 9.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 3.0,
+            "stagnation_rel_volume": 0.4,
+            "stagnation_daily_range_pct": 0.8,
+        }
+    )
+    max_hold = supervisor.evaluate_exit_rules(
+        {
+            "symbol": "MAXH",
+            "qty": 1,
+            "market_value": 101.0,
+            "unrealized_pl": 1.0,
+            "cost_basis": 100.0,
+            "entry_age_days": 10.1,
+            "stagnation_rel_volume": 0.4,
+            "stagnation_daily_range_pct": 0.8,
+        }
+    )
+
+    assert loss.reason == "position max loss reached"
+    assert profit.reason == "position take profit reached"
+    assert max_hold.reason == "position max hold reached"
 
 
 def test_supervisor_last_risk_sweep_window_runs_once():

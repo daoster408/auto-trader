@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     position_take_profit_pct: float = Field(8.0, alias="POSITION_TAKE_PROFIT_PCT")
     position_trailing_stop_pct: float = Field(6.0, ge=0.0, alias="POSITION_TRAILING_STOP_PCT")
     position_max_hold_days: int = Field(10, ge=1, alias="POSITION_MAX_HOLD_DAYS")
+    position_stagnation_exit_enabled: bool = Field(False, alias="POSITION_STAGNATION_EXIT_ENABLED")
+    position_stagnation_min_hold_days: float = Field(2.0, ge=1.0, alias="POSITION_STAGNATION_MIN_HOLD_DAYS")
+    position_stagnation_min_pnl_pct: float = Field(-2.0, alias="POSITION_STAGNATION_MIN_PNL_PCT")
+    position_stagnation_max_pnl_pct: float = Field(3.0, alias="POSITION_STAGNATION_MAX_PNL_PCT")
+    position_stagnation_max_rel_volume: float = Field(0.8, ge=0.0, alias="POSITION_STAGNATION_MAX_REL_VOLUME")
+    position_stagnation_max_daily_range_pct: float = Field(
+        1.5,
+        ge=0.0,
+        alias="POSITION_STAGNATION_MAX_DAILY_RANGE_PCT",
+    )
 
     report_timezone: str = Field("America/Los_Angeles", alias="REPORT_TIMEZONE")
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field("INFO", alias="LOG_LEVEL")
@@ -115,6 +125,8 @@ class Settings(BaseSettings):
     def validate_shutdown_flatten_safety(self) -> "Settings":
         if not self.alpaca_paper and not self.shutdown_flatten_on_exit:
             raise ValueError("SHUTDOWN_FLATTEN_ON_EXIT=false is only allowed in Alpaca paper mode")
+        if self.position_stagnation_min_pnl_pct > self.position_stagnation_max_pnl_pct:
+            raise ValueError("POSITION_STAGNATION_MIN_PNL_PCT must be <= POSITION_STAGNATION_MAX_PNL_PCT")
         return self
 
 
