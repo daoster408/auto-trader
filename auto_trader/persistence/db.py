@@ -25,7 +25,14 @@ log = get_logger("auto_trader.persistence.db")
 _DB_PATH: Path = Path("auto_trader.db")
 _DB_LOCK = asyncio.Lock()  # single writer guarantee (simple & cheap for v1)
 CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = ("ai_research_committee/v0", "ai_research_failure/v0")
-CHARGEABLE_AI_POSTMORTEM_PROMPT_VERSIONS = ("ai_postmortem_review/v0", "ai_postmortem_failure/v0")
+CHARGEABLE_AI_POSTMORTEM_PROMPT_VERSIONS = (
+    "ai_postmortem_review/v0",
+    "ai_postmortem_failure/v0",
+)
+CHARGEABLE_AI_POSTMORTEM_ESCALATION_PROMPT_VERSIONS = (
+    "ai_postmortem_escalation/v0",
+    "ai_postmortem_escalation_failure/v0",
+)
 
 
 def _utc_iso(dt: datetime) -> str:
@@ -494,11 +501,44 @@ async def count_ai_postmortem_chargeable_attempts(
     today_utc: bool = False,
 ) -> int | None:
     """Count real-provider AI postmortem attempts against the separate postmortem budget."""
+    return await _count_ai_postmortem_chargeable_attempts(
+        CHARGEABLE_AI_POSTMORTEM_PROMPT_VERSIONS,
+        provider=provider,
+        input_hash=input_hash,
+        today_utc=today_utc,
+        log_event="ai_postmortem_chargeable_attempt_count_failed",
+    )
+
+
+async def count_ai_postmortem_escalation_chargeable_attempts(
+    *,
+    provider: str | None = None,
+    input_hash: str | None = None,
+    today_utc: bool = False,
+) -> int | None:
+    """Count Fable/escalation-style postmortem attempts against the escalation cap."""
+    return await _count_ai_postmortem_chargeable_attempts(
+        CHARGEABLE_AI_POSTMORTEM_ESCALATION_PROMPT_VERSIONS,
+        provider=provider,
+        input_hash=input_hash,
+        today_utc=today_utc,
+        log_event="ai_postmortem_escalation_chargeable_attempt_count_failed",
+    )
+
+
+async def _count_ai_postmortem_chargeable_attempts(
+    prompt_versions: tuple[str, ...],
+    *,
+    provider: str | None,
+    input_hash: str | None,
+    today_utc: bool,
+    log_event: str,
+) -> int | None:
     conditions: list[str] = [
         "provider NOT IN (?, ?)",
-        f"prompt_version IN ({','.join('?' for _ in CHARGEABLE_AI_POSTMORTEM_PROMPT_VERSIONS)})",
+        f"prompt_version IN ({','.join('?' for _ in prompt_versions)})",
     ]
-    params: list[Any] = ["shadow", "multi", *CHARGEABLE_AI_POSTMORTEM_PROMPT_VERSIONS]
+    params: list[Any] = ["shadow", "multi", *prompt_versions]
     if provider is not None:
         conditions.append("provider = ?")
         params.append(str(provider))
@@ -523,7 +563,7 @@ async def count_ai_postmortem_chargeable_attempts(
                 await db.close()
         except Exception as e:
             log.error(
-                "ai_postmortem_chargeable_attempt_count_failed",
+                log_event,
                 provider=provider,
                 input_hash=input_hash,
                 error=str(e),

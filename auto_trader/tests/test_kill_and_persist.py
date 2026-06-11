@@ -49,12 +49,20 @@ from auto_trader.ai_research_preflight import (
 import auto_trader.ai_research_smoke as ai_research_smoke
 import auto_trader.ai_entry_gate_rehearsal as ai_entry_gate_rehearsal
 from auto_trader.ai_postmortem_review import (
+    AI_POSTMORTEM_ESCALATION_PROMPT_VERSION,
     AI_POSTMORTEM_PROMPT_VERSION,
+    MAX_POSTMORTEM_ESCALATION_CONTEXT_CHARS,
+    DeepSeekPostmortemProvider,
     PostmortemProviderMemo,
     build_ai_postmortem_pack,
+    build_postmortem_escalation_packet,
+    create_postmortem_providers,
+    postmortem_escalation_attempt_hash,
     postmortem_attempt_hash,
     postmortem_packet_hash,
     run_ai_postmortem_review,
+    selected_postmortem_providers,
+    _maybe_run_postmortem_escalation,
 )
 from auto_trader.ai_entry_gate_rehearsal import run_ai_entry_gate_rehearsal, render_ai_entry_gate_rehearsal
 from auto_trader.ai_rehearsal_batch import run_ai_rehearsal_batch, render_ai_rehearsal_batch
@@ -1538,24 +1546,46 @@ class _PostmortemSettings:
         self.ai_research_model = "fake-postmortem"
         self.ai_research_openai_model = "fake-postmortem"
         self.ai_research_timeout_seconds = 1.0
+        self.ai_postmortem_providers = ""
+        self.ai_postmortem_model = ""
+        self.ai_postmortem_openai_model = ""
+        self.ai_postmortem_xai_model = ""
+        self.ai_postmortem_anthropic_model = ""
+        self.ai_postmortem_gemini_model = ""
+        self.ai_postmortem_deepseek_model = ""
+        self.ai_postmortem_escalation_enabled = False
+        self.ai_postmortem_escalation_provider = "anthropic"
+        self.ai_postmortem_escalation_model = ""
+        self.ai_postmortem_escalation_max_calls_per_day = 0
+        self.openai_api_key = ""
+        self.xai_api_key = ""
+        self.anthropic_api_key = ""
+        self.gemini_api_key = ""
+        self.deepseek_api_key = ""
 
 
 class _FakePostmortemProvider:
-    provider = "openai"
-    model_tag = "openai/fake-postmortem"
-
-    def __init__(self, *, valid: bool = True) -> None:
+    def __init__(self, *, valid: bool = True, provider: str = "openai", model_tag: str = "openai/fake-postmortem") -> None:
         self.valid = valid
+        self.provider = provider
+        self.model_tag = model_tag
         self.calls = 0
 
-    async def review(self, packet):
+    async def review(
+        self,
+        packet,
+        *,
+        prompt_version=AI_POSTMORTEM_PROMPT_VERSION,
+        failure_prompt_version="ai_postmortem_failure/v0",
+        instructions="",
+    ):
         self.calls += 1
         digest = postmortem_packet_hash(packet)
         if not self.valid:
             return PostmortemProviderMemo(
                 provider=self.provider,
                 model_tag=self.model_tag,
-                prompt_version=AI_POSTMORTEM_PROMPT_VERSION,
+                prompt_version=prompt_version,
                 input_hash=digest,
                 used_only_provided_data=False,
                 validation_passed=False,
@@ -1573,7 +1603,7 @@ class _FakePostmortemProvider:
         return PostmortemProviderMemo(
             provider=self.provider,
             model_tag=self.model_tag,
-            prompt_version=AI_POSTMORTEM_PROMPT_VERSION,
+            prompt_version=prompt_version,
             input_hash=digest,
             used_only_provided_data=True,
             validation_passed=True,
@@ -1685,6 +1715,75 @@ async def test_ai_postmortem_run_paid_requires_second_confirmation(tmp_path):
     assert result.pack["paid_called"] is False
 
 
+def test_postmortem_provider_list_is_explicit_and_independent_from_live_ai(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    settings.ai_research_providers = "anthropic,openai,xai"
+    settings.ai_postmortem_providers = ""
+
+    assert selected_postmortem_providers(settings) == []
+    assert create_postmortem_providers(settings) == []
+
+    settings.ai_postmortem_providers = "gemini,deepseek"
+    settings.ai_postmortem_gemini_model = "gemini-pro-review"
+    settings.ai_postmortem_deepseek_model = "deepseek-v4-pro"
+    settings.gemini_api_key = "gemini-key"
+    settings.deepseek_api_key = "deepseek-key"
+
+    providers = create_postmortem_providers(settings)
+
+    assert selected_postmortem_providers(settings) == ["gemini", "deepseek"]
+    assert [provider.provider for provider in providers] == ["gemini", "deepseek"]
+    assert settings.ai_research_providers == "anthropic,openai,xai"
+
+
+def test_deepseek_postmortem_provider_extracts_json_response():
+    provider = DeepSeekPostmortemProvider("key", model="deepseek-v4-pro", timeout_seconds=1)
+
+    output = provider._extract_output(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "used_only_provided_data": True,
+                                "lessons": ["Cheap outside reviewer found a pattern."],
+                                "edge_hypotheses": [],
+                                "budget_leaks": [],
+                                "provider_notes": [],
+                                "operator_recommendations": [],
+                                "judge_summary": "valid",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+    )
+
+    assert output["used_only_provided_data"] is True
+    assert output["lessons"] == ["Cheap outside reviewer found a pattern."]
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_missing_deepseek_key_writes_invalid_artifact(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    settings.ai_postmortem_providers = "deepseek"
+    settings.ai_postmortem_deepseek_model = "deepseek-v4-pro"
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    assert result.path == Path(settings.ai_postmortem_path)
+    assert result.path.exists()
+    assert result.pack["status"] == "invalid"
+    assert result.pack["paid_called"] is False
+    assert "postmortem provider setup failed" in result.pack["reason"]
+
+
 @pytest.mark.asyncio
 async def test_ai_postmortem_dedupes_provider_model_window_hash(tmp_path):
     settings = _PostmortemSettings(tmp_path, max_calls=3)
@@ -1719,8 +1818,9 @@ async def test_ai_postmortem_dedupes_provider_model_window_hash(tmp_path):
 @pytest.mark.asyncio
 async def test_ai_postmortem_provider_setup_failure_writes_invalid_artifact(tmp_path):
     settings = _PostmortemSettings(tmp_path, max_calls=1)
-    settings.ai_research_openai_model = ""
-    settings.ai_research_model = ""
+    settings.ai_postmortem_providers = "openai"
+    settings.ai_postmortem_openai_model = ""
+    settings.ai_postmortem_model = ""
 
     result = await run_ai_postmortem_review(
         settings=settings,
@@ -1756,6 +1856,228 @@ async def test_ai_postmortem_provider_failure_counts_separate_budget(tmp_path):
     assert result.pack["status"] == "invalid"
     assert result.pack["chargeable_calls"]["after"] == 1
     assert result.pack["provider_results"][0]["prompt_version"] == "ai_postmortem_failure/v0"
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_escalation_disabled_by_default_does_not_call_reviewer(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _FakePostmortemProvider()
+    reviewer = _FakePostmortemProvider(provider="anthropic", model_tag="anthropic/claude-fable-5")
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        escalation_provider=reviewer,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    assert provider.calls == 1
+    assert reviewer.calls == 0
+    assert "escalation_review" not in result.pack
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_force_escalation_requires_separate_budget(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _FakePostmortemProvider()
+    reviewer = _FakePostmortemProvider(provider="anthropic", model_tag="anthropic/claude-fable-5")
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        escalation_provider=reviewer,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+        force_escalation=True,
+    )
+
+    assert reviewer.calls == 0
+    assert result.pack["escalation_review"]["status"] == "not_run"
+    assert "ESCALATION_MAX_CALLS" in result.pack["escalation_review"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_force_escalation_requires_fresh_base_memo(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=0)
+    reviewer = _FakePostmortemProvider(provider="anthropic", model_tag="anthropic/claude-fable-5")
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[],
+        escalation_provider=reviewer,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+        force_escalation=True,
+        max_escalation_calls=1,
+    )
+
+    escalation = result.pack["escalation_review"]
+    assert reviewer.calls == 0
+    assert escalation["status"] == "not_run"
+    assert escalation["paid_called"] is False
+    assert "fresh base provider memo" in escalation["reason"]
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_auto_escalation_requires_fresh_base_memo(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=0)
+    settings.ai_postmortem_escalation_enabled = True
+    reviewer = _FakePostmortemProvider(provider="anthropic", model_tag="anthropic/claude-fable-5")
+
+    escalation = await _maybe_run_postmortem_escalation(
+        settings=settings,
+        provider=reviewer,
+        packet={
+            "window_days": 7,
+            "closed_trades": [{"symbol": "LOSS", "pnl_pct": -6.5}],
+            "missed_or_blocked_opportunities": [],
+            "closed_trade_count": 1,
+            "opportunity_count": 0,
+        },
+        evidence_hash="evidence",
+        provider_memos=[],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+        force_escalation=False,
+        max_escalation_calls=1,
+    )
+
+    assert reviewer.calls == 0
+    assert escalation is not None
+    assert escalation["status"] == "not_run"
+    assert escalation["paid_called"] is False
+    assert escalation["trigger_reasons"] == ["material_loss"]
+    assert "fresh base provider memo" in escalation["reason"]
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_force_escalation_writes_reviewer_metrics(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _FakePostmortemProvider()
+    reviewer = _FakePostmortemProvider(provider="anthropic", model_tag="anthropic/claude-fable-5")
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        escalation_provider=reviewer,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+        force_escalation=True,
+        max_escalation_calls=1,
+    )
+
+    escalation = result.pack["escalation_review"]
+    assert reviewer.calls == 1
+    assert escalation["status"] == "completed"
+    assert escalation["provider_result"]["prompt_version"] == AI_POSTMORTEM_ESCALATION_PROMPT_VERSION
+    assert escalation["trigger_reasons"] == ["operator_forced"]
+    assert escalation["paid_called"] is True
+    assert escalation["chargeable_calls"]["before"] == 0
+    assert escalation["chargeable_calls"]["after"] == 1
+    assert escalation["escalation_novel_lesson_count"] == 0
+    assert "Escalation review:" in result.pack["prompt_guidance"]
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_escalation_dedupes_provider_model_role_hash(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=5)
+    provider = _FakePostmortemProvider()
+    reviewer = _FakePostmortemProvider(provider="anthropic", model_tag="anthropic/claude-fable-5")
+
+    first = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        escalation_provider=reviewer,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+        force_paid=True,
+        force_escalation=True,
+        max_escalation_calls=2,
+    )
+    second = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        escalation_provider=reviewer,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+        force_paid=True,
+        force_escalation=True,
+        max_escalation_calls=2,
+    )
+
+    assert first.pack["escalation_review"]["status"] == "completed"
+    assert second.pack["escalation_review"]["status"] == "deduped"
+    assert second.pack["escalation_review"]["paid_called"] is False
+    assert reviewer.calls == 1
+    escalation_hash = postmortem_escalation_attempt_hash(
+        evidence_hash=first.pack["input_hash"],
+        base_result_hash=first.pack["escalation_review"]["provider_result"]["input_hash"],
+        provider=reviewer.provider,
+        model_tag=reviewer.model_tag,
+        window_days=7,
+        trigger_reasons=["operator_forced"],
+    )
+    assert escalation_hash
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_invalid_escalation_output_is_not_merged(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _FakePostmortemProvider()
+    reviewer = _FakePostmortemProvider(valid=False, provider="anthropic", model_tag="anthropic/claude-fable-5")
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        escalation_provider=reviewer,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+        force_escalation=True,
+        max_escalation_calls=1,
+    )
+
+    escalation = result.pack["escalation_review"]
+    assert escalation["status"] == "invalid"
+    assert escalation["highest_confidence_lessons"] == []
+    assert "Escalation review:" not in result.pack["prompt_guidance"]
+
+
+def test_ai_postmortem_escalation_packet_enforces_context_cap():
+    long_text = "x" * 2_000
+    memo = PostmortemProviderMemo(
+        provider="openai",
+        model_tag="openai/fake-postmortem",
+        prompt_version=AI_POSTMORTEM_PROMPT_VERSION,
+        input_hash="base",
+        used_only_provided_data=True,
+        validation_passed=True,
+        output={
+            "used_only_provided_data": True,
+            "lessons": [f"lesson {idx} {long_text}" for idx in range(10)],
+            "edge_hypotheses": [f"edge {idx} {long_text}" for idx in range(10)],
+            "budget_leaks": [f"leak {idx} {long_text}" for idx in range(10)],
+            "provider_notes": [f"note {idx} {long_text}" for idx in range(10)],
+            "operator_recommendations": [f"recommendation {idx} {long_text}" for idx in range(10)],
+            "judge_summary": "valid",
+        },
+    )
+
+    packet = build_postmortem_escalation_packet(
+        packet={
+            "window_days": 7,
+            "closed_trade_count": 6,
+            "opportunity_count": 6,
+            "closed_trades": [{"symbol": f"T{idx}", "pnl_pct": -6.0, "note": long_text} for idx in range(6)],
+            "missed_or_blocked_opportunities": [{"symbol": f"B{idx}", "reason": long_text} for idx in range(6)],
+        },
+        evidence_hash="evidence",
+        provider_memos=[memo],
+        trigger_reasons=["material_loss", "provider_disagreement"],
+    )
+
+    assert len(json.dumps(packet, sort_keys=True, default=str)) <= MAX_POSTMORTEM_ESCALATION_CONTEXT_CHARS
+    assert packet["context_truncated"] is True
 
 
 def test_brain_guidance_pack_includes_compact_ai_postmortem_only():
@@ -7586,13 +7908,28 @@ def test_settings_accepts_optional_brain_review_paths():
         AUTO_TRADER_BRAIN_REVIEW_DIR="/tmp/brain",
         AUTO_TRADER_BRAIN_GUIDANCE_PATH="/tmp/brain/brain_guidance_pack.json",
         AUTO_TRADER_AI_POSTMORTEM_PATH="/tmp/brain/ai_postmortem_pack.json",
+        AI_POSTMORTEM_PROVIDERS="gemini,deepseek",
+        AI_POSTMORTEM_GEMINI_MODEL="gemini-pro-review",
+        AI_POSTMORTEM_DEEPSEEK_MODEL="deepseek-v4-pro",
         AI_POSTMORTEM_MAX_CALLS_PER_DAY=1,
+        AI_POSTMORTEM_ESCALATION_ENABLED=True,
+        AI_POSTMORTEM_ESCALATION_PROVIDER="anthropic",
+        AI_POSTMORTEM_ESCALATION_MODEL="claude-fable-5",
+        AI_POSTMORTEM_ESCALATION_MAX_CALLS_PER_DAY=1,
+        DEEPSEEK_API_KEY="deepseek-key",
     )
 
     assert settings.brain_review_dir == "/tmp/brain"
     assert settings.brain_guidance_path == "/tmp/brain/brain_guidance_pack.json"
     assert settings.ai_postmortem_path == "/tmp/brain/ai_postmortem_pack.json"
+    assert settings.ai_postmortem_providers == "gemini,deepseek"
+    assert settings.ai_postmortem_gemini_model == "gemini-pro-review"
+    assert settings.ai_postmortem_deepseek_model == "deepseek-v4-pro"
     assert settings.ai_postmortem_max_calls_per_day == 1
+    assert settings.ai_postmortem_escalation_enabled is True
+    assert settings.ai_postmortem_escalation_model == "claude-fable-5"
+    assert settings.ai_postmortem_escalation_max_calls_per_day == 1
+    assert settings.deepseek_api_key == "deepseek-key"
 
 
 async def test_brain_guidance_path_from_env_file_writes_and_loads_same_file(tmp_path, monkeypatch):

@@ -306,6 +306,15 @@ def render_brain_guidance_prompt_context(pack: dict[str, Any]) -> str:
         for leak in postmortem.get("budget_leaks") or []:
             if isinstance(leak, str) and leak.strip():
                 lines.append(f"- paid-budget leak: {leak}")
+        escalation = postmortem.get("escalation_review")
+        if isinstance(escalation, dict) and escalation.get("status") == "completed":
+            lines.append("AI POSTMORTEM ESCALATION REVIEW:")
+            for lesson in escalation.get("highest_confidence_lessons") or []:
+                if isinstance(lesson, str) and lesson.strip():
+                    lines.append(f"- reviewer lesson: {lesson}")
+            for note in escalation.get("provider_quality_notes") or []:
+                if isinstance(note, str) and note.strip():
+                    lines.append(f"- reviewer note: {note}")
     lines.append("If review context conflicts with the current packet, explain the conflict and judge the current packet.")
     return "\n".join(lines)
 
@@ -432,7 +441,7 @@ def _compact_review_for_guidance(pack: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_postmortem_for_guidance(pack: dict[str, Any]) -> dict[str, Any]:
-    return {
+    compact = {
         "kind": pack.get("kind"),
         "status": pack.get("status"),
         "generated_at": pack.get("generated_at"),
@@ -443,6 +452,16 @@ def _compact_postmortem_for_guidance(pack: dict[str, Any]) -> dict[str, Any]:
         "budget_leaks": _bounded_text_list(pack.get("budget_leaks"), limit=3),
         "operator_recommendations": _bounded_dict_list(pack.get("operator_recommendations"), limit=3),
     }
+    escalation = pack.get("escalation_review")
+    if isinstance(escalation, dict) and escalation.get("status") == "completed":
+        compact["escalation_review"] = {
+            "status": escalation.get("status"),
+            "trigger_reasons": _bounded_text_list(escalation.get("trigger_reasons"), limit=4),
+            "highest_confidence_lessons": _bounded_text_list(escalation.get("highest_confidence_lessons"), limit=3),
+            "provider_quality_notes": _bounded_text_list(escalation.get("provider_quality_notes"), limit=3),
+            "operator_recommendations": _bounded_dict_list(escalation.get("operator_recommendations"), limit=2),
+        }
+    return compact
 
 
 def _bounded_text_list(value: Any, *, limit: int) -> list[str]:

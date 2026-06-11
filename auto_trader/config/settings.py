@@ -86,11 +86,23 @@ class Settings(BaseSettings):
     ai_research_est_output_tokens: int = Field(2000, ge=0, alias="AI_RESEARCH_EST_OUTPUT_TOKENS")
     ai_research_input_price_per_mtok: float = Field(5.0, ge=0.0, alias="AI_RESEARCH_INPUT_PRICE_PER_MTOK")
     ai_research_output_price_per_mtok: float = Field(25.0, ge=0.0, alias="AI_RESEARCH_OUTPUT_PRICE_PER_MTOK")
+    ai_postmortem_providers: str = Field("", alias="AI_POSTMORTEM_PROVIDERS")
+    ai_postmortem_model: str = Field("", alias="AI_POSTMORTEM_MODEL")
+    ai_postmortem_openai_model: str = Field("", alias="AI_POSTMORTEM_OPENAI_MODEL")
+    ai_postmortem_xai_model: str = Field("", alias="AI_POSTMORTEM_XAI_MODEL")
+    ai_postmortem_anthropic_model: str = Field("", alias="AI_POSTMORTEM_ANTHROPIC_MODEL")
+    ai_postmortem_gemini_model: str = Field("", alias="AI_POSTMORTEM_GEMINI_MODEL")
+    ai_postmortem_deepseek_model: str = Field("", alias="AI_POSTMORTEM_DEEPSEEK_MODEL")
     ai_postmortem_max_calls_per_day: int = Field(0, ge=0, alias="AI_POSTMORTEM_MAX_CALLS_PER_DAY")
+    ai_postmortem_escalation_enabled: bool = Field(False, alias="AI_POSTMORTEM_ESCALATION_ENABLED")
+    ai_postmortem_escalation_provider: str = Field("anthropic", alias="AI_POSTMORTEM_ESCALATION_PROVIDER")
+    ai_postmortem_escalation_model: str = Field("", alias="AI_POSTMORTEM_ESCALATION_MODEL")
+    ai_postmortem_escalation_max_calls_per_day: int = Field(0, ge=0, alias="AI_POSTMORTEM_ESCALATION_MAX_CALLS_PER_DAY")
     openai_api_key: str | None = Field(None, alias="OPENAI_API_KEY")
     anthropic_api_key: str | None = Field(None, alias="ANTHROPIC_API_KEY")
     xai_api_key: str | None = Field(None, alias="XAI_API_KEY")
     gemini_api_key: str | None = Field(None, alias="GEMINI_API_KEY")
+    deepseek_api_key: str | None = Field(None, alias="DEEPSEEK_API_KEY")
 
     model_config = {
         "env_file": ".env",
