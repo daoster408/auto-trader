@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
+from telegram.error import NetworkError
 
 from auto_trader.core.models import SystemState, KillResult, RiskDecision, TradeIntent
 from auto_trader.account_risk_validate import (
@@ -5303,6 +5304,152 @@ async def test_telegram_shutdown_tolerates_already_stopped_updater():
 
     assert app.stop_calls == 1
     assert app.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_telegram_polling_network_failure_retries_without_halt(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stop_event = asyncio.Event()
+    apps = []
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.TELEGRAM_POLLING_RETRY_INITIAL_SECONDS", 0.01)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.TELEGRAM_POLLING_RETRY_MAX_SECONDS", 0.01)
+
+    class FakeUpdater:
+        def __init__(self, app_index):
+            self.app_index = app_index
+            self.start_calls = 0
+            self.stop_calls = 0
+
+        async def start_polling(self, **kwargs):
+            self.start_calls += 1
+            assert kwargs["bootstrap_retries"] == -1
+            assert kwargs["allowed_updates"]
+            assert callable(kwargs["error_callback"])
+            if self.app_index == 0:
+                raise NetworkError("Temporary failure in name resolution")
+            stop_event.set()
+            return asyncio.Queue()
+
+        async def stop(self):
+            self.stop_calls += 1
+
+    class FakeApp:
+        def __init__(self, app_index):
+            self.updater = FakeUpdater(app_index)
+            self.initialize_calls = 0
+            self.start_calls = 0
+            self.stop_calls = 0
+            self.shutdown_calls = 0
+
+        async def initialize(self):
+            self.initialize_calls += 1
+
+        async def start(self):
+            self.start_calls += 1
+
+        async def stop(self):
+            self.stop_calls += 1
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+
+    def fake_build():
+        app = FakeApp(len(apps))
+        apps.append(app)
+        bot.app = app
+        return app
+
+    monkeypatch.setattr(bot, "build", fake_build)
+
+    await asyncio.wait_for(bot.run(stop_event=stop_event), timeout=1.0)
+
+    assert sm.state == SystemState.ACTIVE
+    assert len(apps) == 2
+    assert apps[0].updater.start_calls == 1
+    assert apps[0].updater.stop_calls == 1
+    assert apps[0].stop_calls == 1
+    assert apps[0].shutdown_calls == 1
+    assert apps[1].updater.start_calls == 1
+    assert apps[1].updater.stop_calls == 1
+    assert apps[1].stop_calls == 1
+    assert apps[1].shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_telegram_polling_stop_event_during_retry_backoff_exits_cleanly(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stop_event = asyncio.Event()
+    apps = []
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.TELEGRAM_POLLING_RETRY_INITIAL_SECONDS", 0.5)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.TELEGRAM_POLLING_RETRY_MAX_SECONDS", 0.5)
+
+    class FakeUpdater:
+        def __init__(self):
+            self.start_calls = 0
+            self.stop_calls = 0
+
+        async def start_polling(self, **kwargs):
+            self.start_calls += 1
+            asyncio.get_running_loop().call_soon(stop_event.set)
+            raise NetworkError("Temporary failure in name resolution")
+
+        async def stop(self):
+            self.stop_calls += 1
+
+    class FakeApp:
+        def __init__(self):
+            self.updater = FakeUpdater()
+            self.initialize_calls = 0
+            self.start_calls = 0
+            self.stop_calls = 0
+            self.shutdown_calls = 0
+
+        async def initialize(self):
+            self.initialize_calls += 1
+
+        async def start(self):
+            self.start_calls += 1
+
+        async def stop(self):
+            self.stop_calls += 1
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+    )
+
+    def fake_build():
+        app = FakeApp()
+        apps.append(app)
+        bot.app = app
+        return app
+
+    monkeypatch.setattr(bot, "build", fake_build)
+
+    await asyncio.wait_for(bot.run(stop_event=stop_event), timeout=1.0)
+
+    assert sm.state == SystemState.ACTIVE
+    assert len(apps) == 1
+    assert apps[0].updater.start_calls == 1
+    assert apps[0].updater.stop_calls == 1
+    assert apps[0].stop_calls == 1
+    assert apps[0].shutdown_calls == 1
 
 
 def test_telegram_status_surfaces_warnings():

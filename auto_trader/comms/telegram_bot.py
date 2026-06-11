@@ -14,6 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from telegram import Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -44,6 +45,8 @@ from auto_trader.utils.retry import retry_kill_critical
 log = get_logger("auto_trader.comms.telegram_bot")
 
 MAX_EDGE_REPORT_DAYS = 90
+TELEGRAM_POLLING_RETRY_INITIAL_SECONDS = 2.0
+TELEGRAM_POLLING_RETRY_MAX_SECONDS = 60.0
 
 
 def _money(value: Any) -> str:
@@ -219,6 +222,15 @@ class TelegramBot:
         self.app: Application | None = None
         self._shutdown_lock = asyncio.Lock()
         self._shutdown_complete = False
+
+    @staticmethod
+    def _is_expected_lifecycle_runtime_error(error: RuntimeError) -> bool:
+        message = str(error).lower()
+        return "not running" in message or "not initialized" in message
+
+    @staticmethod
+    def _is_retryable_polling_error(error: BaseException) -> bool:
+        return isinstance(error, (NetworkError, TimedOut, OSError, ConnectionError, TimeoutError))
 
     @staticmethod
     def _parse_allowed_ids(raw: str | list[int] | None) -> set[int]:
@@ -823,6 +835,61 @@ class TelegramBot:
         self.app = app
         return app
 
+    def _polling_error_callback(self, error: Exception) -> None:
+        log.warning(
+            "telegram_polling_transport_error",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+
+    async def _teardown_app_for_reconnect(self) -> None:
+        """Best-effort per-attempt cleanup before rebuilding a fresh Application."""
+        app = self.app
+        if not app:
+            return
+        log.warning("telegram_polling_reconnect_teardown_started")
+        if app.updater:
+            try:
+                await app.updater.stop()
+            except RuntimeError as e:
+                if not self._is_expected_lifecycle_runtime_error(e):
+                    log.warning("telegram_reconnect_updater_stop_failed", error=str(e))
+                else:
+                    log.info("telegram_reconnect_updater_already_stopped", error=str(e))
+            except Exception as e:
+                log.warning("telegram_reconnect_updater_stop_failed", error=str(e))
+        try:
+            await app.stop()
+        except RuntimeError as e:
+            if not self._is_expected_lifecycle_runtime_error(e):
+                log.warning("telegram_reconnect_app_stop_failed", error=str(e))
+            else:
+                log.info("telegram_reconnect_app_already_stopped", error=str(e))
+        except Exception as e:
+            log.warning("telegram_reconnect_app_stop_failed", error=str(e))
+        try:
+            await app.shutdown()
+        except RuntimeError as e:
+            if not self._is_expected_lifecycle_runtime_error(e):
+                log.warning("telegram_reconnect_app_shutdown_failed", error=str(e))
+            else:
+                log.info("telegram_reconnect_app_already_shutdown", error=str(e))
+        except Exception as e:
+            log.warning("telegram_reconnect_app_shutdown_failed", error=str(e))
+        self.app = None
+        self._shutdown_complete = False
+        log.warning("telegram_polling_reconnect_teardown_complete")
+
+    async def _sleep_until_retry_or_stop(self, stop_event: asyncio.Event | None, delay_seconds: float) -> bool:
+        if not stop_event:
+            await asyncio.sleep(delay_seconds)
+            return False
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay_seconds)
+            return True
+        except TimeoutError:
+            return False
+
     async def shutdown(self) -> None:
         """Graceful stop for signal handlers. Highest priority cleanup."""
         async with self._shutdown_lock:
@@ -835,29 +902,70 @@ class TelegramBot:
                     try:
                         await self.app.updater.stop()
                     except RuntimeError as e:
-                        if "not running" not in str(e).lower():
+                        if not self._is_expected_lifecycle_runtime_error(e):
                             raise
                         log.warning("telegram_updater_already_stopped", error=str(e))
-                await self.app.stop()
+                try:
+                    await self.app.stop()
+                except RuntimeError as e:
+                    if not self._is_expected_lifecycle_runtime_error(e):
+                        raise
+                    log.warning("telegram_app_already_stopped", error=str(e))
                 await self.app.shutdown()
             self._shutdown_complete = True
             log.info("telegram_bot_stopped")
 
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
         """Start polling. Integrates with external stop_event for clean shutdown."""
-        if not self.app:
-            self.build()
-        log.info("telegram_bot_starting_polling", kill_priority="absolute")
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        log.info("bot_polling_active_kill_live")
-
-        if stop_event:
-            await stop_event.wait()
-            await self.shutdown()
-        else:
-            # legacy fallback (should not happen in prod)
-            import asyncio
-            while True:
-                await asyncio.sleep(3600)
+        retry_delay = TELEGRAM_POLLING_RETRY_INITIAL_SECONDS
+        while not (stop_event and stop_event.is_set()):
+            if not self.app:
+                self.build()
+            assert self.app is not None
+            self._shutdown_complete = False
+            try:
+                log.info("telegram_bot_starting_polling", kill_priority="absolute")
+                await self.app.initialize()
+                await self.app.start()
+                await self.app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    bootstrap_retries=-1,
+                    error_callback=self._polling_error_callback,
+                )
+                log.info("bot_polling_active_kill_live")
+                retry_delay = TELEGRAM_POLLING_RETRY_INITIAL_SECONDS
+                if stop_event:
+                    await stop_event.wait()
+                    await self.shutdown()
+                    return
+                while True:
+                    await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                if stop_event and stop_event.is_set():
+                    log.info("telegram_polling_stopped_after_stop_event", error=str(e))
+                    await self.shutdown()
+                    return
+                if not self._is_retryable_polling_error(e):
+                    log.exception(
+                        "telegram_polling_non_retryable_failure",
+                        error_type=type(e).__name__,
+                        error=str(e),
+                    )
+                    raise
+                log.warning(
+                    "telegram_polling_failed_retrying",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    retry_delay_seconds=retry_delay,
+                    kill_priority="os_signal_still_active_telegram_reconnecting",
+                )
+                await self._teardown_app_for_reconnect()
+                if await self._sleep_until_retry_or_stop(stop_event, retry_delay):
+                    await self.shutdown()
+                    return
+                retry_delay = min(retry_delay * 2, TELEGRAM_POLLING_RETRY_MAX_SECONDS)
+        await self.shutdown()
