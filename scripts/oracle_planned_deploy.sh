@@ -60,6 +60,7 @@ rsync -az --delete --no-owner --no-group \
   --exclude .venv \
   --exclude .env \
   --exclude auto_trader.db \
+  --exclude runtime \
   --exclude ssh-key-2026-06-03.key \
   --exclude __pycache__ \
   --exclude '*.pyc' \
