@@ -71,7 +71,7 @@ from auto_trader.ai_research_smoke import run_ai_research_smoke
 from auto_trader.ai_research_smoke import render_ai_research_smoke
 from auto_trader.friday_recovery_check import build_friday_recovery_report, recovery_exit_code
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
-from auto_trader.week2_launchpad import build_week2_launchpad_report, launchpad_exit_code
+from auto_trader.week2_launchpad import build_intelligence_readiness, build_week2_launchpad_report, launchpad_exit_code
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.risk_profile import get_risk_profile
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
@@ -4171,6 +4171,237 @@ def test_week2_launchpad_reports_halted_positions_and_blocks_resume():
     assert "TZA: qty" in report
     assert "UVXY: qty" in report
     assert launchpad_exit_code(gates) == 1
+
+
+def test_week2_launchpad_renders_secret_safe_intelligence_readiness(tmp_path, monkeypatch):
+    scoreboard_path = tmp_path / "runtime" / "scoreboard_memory_pack.json"
+    guidance_path = tmp_path / "runtime" / "brain_guidance_pack.json"
+    postmortem_path = tmp_path / "runtime" / "ai_postmortem_pack.json"
+    scoreboard_path.parent.mkdir(parents=True)
+    generated_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    scoreboard_path.write_text(
+        json.dumps({"kind": "scoreboard_memory_pack", "generated_at": generated_at}),
+        encoding="utf-8",
+    )
+    guidance_path.write_text(
+        json.dumps({"kind": "brain_guidance_pack", "generated_at": generated_at}),
+        encoding="utf-8",
+    )
+    postmortem_path.write_text(
+        json.dumps(
+            {
+                "kind": "ai_postmortem_pack",
+                "generated_at": generated_at,
+                "status": "completed",
+                "paid_called": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class IntelSettings(DummySupervisorSettings):
+        db_path = str(tmp_path / "auto_trader.db")
+        scoreboard_memory_path = str(scoreboard_path)
+        brain_guidance_path = str(guidance_path)
+        ai_postmortem_path = str(postmortem_path)
+        fred_api_key = "fred-secret-value"
+        ai_postmortem_providers = "anthropic,openai"
+        ai_postmortem_anthropic_model = "claude-opus-4-8"
+        ai_postmortem_openai_model = "gpt-5.5"
+        ai_postmortem_model = ""
+        ai_postmortem_max_calls_per_day = 5
+        ai_postmortem_escalation_enabled = True
+        ai_postmortem_escalation_provider = "anthropic"
+        ai_postmortem_escalation_model = "claude-fable-5"
+        ai_postmortem_escalation_max_calls_per_day = 1
+        openai_api_key = "openai-secret-value"
+        anthropic_api_key = "anthropic-secret-value"
+        xai_api_key = "xai-secret-value"
+        gemini_api_key = "gemini-secret-value"
+        deepseek_api_key = "deepseek-secret-value"
+        resume_token = "resume-secret-value"
+
+    def fail_provider_factory(*_args, **_kwargs):
+        raise AssertionError("readiness panel must not instantiate postmortem providers")
+
+    def fail_fred_constructor(*_args, **_kwargs):
+        raise AssertionError("readiness panel must not construct FredClient")
+
+    monkeypatch.setattr("auto_trader.ai_postmortem_review.create_postmortem_providers", fail_provider_factory)
+    monkeypatch.setattr("auto_trader.ai_postmortem_review.create_postmortem_escalation_provider", fail_provider_factory)
+    monkeypatch.setattr("auto_trader.intelligence.fred_client.FredClient", fail_fred_constructor)
+
+    readiness = build_intelligence_readiness(IntelSettings(), postmortem_budget_used=2, escalation_budget_used=0)
+    report, _gates = build_week2_launchpad_report(
+        settings=IntelSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={"auto_entry_enabled": "true", "ai_entry_gate_enabled": "true"},
+        today_new_entries=0,
+        ai_calls_used=3,
+        intelligence_readiness=readiness,
+    )
+
+    assert "Intelligence readiness:" in report
+    assert "FRED macro key: present" in report
+    assert "Postmortem providers: anthropic, openai" in report
+    assert "anthropic=claude-opus-4-8" in report
+    assert "openai=gpt-5.5" in report
+    assert "Postmortem budget: 2 / 5" in report
+    assert "Fable/escalation: armed; anthropic/claude-fable-5; budget 0 / 1" in report
+    assert f"Scoreboard memory: ready, generated {generated_at}" in report
+    assert f"Brain guidance: ready, generated {generated_at}" in report
+    assert f"AI postmortem: ready, generated {generated_at}, status=completed, paid_called=True" in report
+    assert "fred-secret-value" not in report
+    assert "openai-secret-value" not in report
+    assert "anthropic-secret-value" not in report
+    assert "xai-secret-value" not in report
+    assert "gemini-secret-value" not in report
+    assert "deepseek-secret-value" not in report
+    assert "resume-secret-value" not in report
+
+
+def test_week2_launchpad_intelligence_readiness_handles_missing_caches(tmp_path):
+    class IntelSettings(DummySupervisorSettings):
+        db_path = str(tmp_path / "auto_trader.db")
+        fred_api_key = None
+        ai_postmortem_providers = ""
+        ai_postmortem_model = ""
+        ai_postmortem_max_calls_per_day = 0
+        ai_postmortem_escalation_enabled = False
+        ai_postmortem_escalation_provider = "anthropic"
+        ai_postmortem_escalation_model = "claude-fable-5"
+        ai_postmortem_escalation_max_calls_per_day = 1
+
+    readiness = build_intelligence_readiness(IntelSettings(), postmortem_budget_used=None, escalation_budget_used=None)
+    report, _gates = build_week2_launchpad_report(
+        settings=IntelSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={},
+        today_new_entries=0,
+        ai_calls_used=0,
+        intelligence_readiness=readiness,
+    )
+
+    assert "FRED macro key: missing" in report
+    assert "Postmortem providers: none" in report
+    assert "Postmortem budget: unavailable / 0" in report
+    assert "Fable/escalation: off; anthropic/claude-fable-5; budget unavailable / 1" in report
+    assert "Scoreboard memory: missing" in report
+    assert "Brain guidance: missing" in report
+    assert "AI postmortem: missing" in report
+
+
+def test_week2_launchpad_intelligence_readiness_redacts_invalid_cache_kind(tmp_path):
+    postmortem_path = tmp_path / "runtime" / "ai_postmortem_pack.json"
+    postmortem_path.parent.mkdir(parents=True)
+    postmortem_path.write_text(
+        json.dumps({"kind": "secret-kind-value", "generated_at": datetime.now(UTC).isoformat()}),
+        encoding="utf-8",
+    )
+
+    class IntelSettings(DummySupervisorSettings):
+        db_path = str(tmp_path / "auto_trader.db")
+        ai_postmortem_path = str(postmortem_path)
+        ai_postmortem_providers = ""
+        ai_postmortem_model = ""
+        ai_postmortem_max_calls_per_day = 0
+        ai_postmortem_escalation_enabled = False
+        ai_postmortem_escalation_provider = "anthropic"
+        ai_postmortem_escalation_model = "claude-fable-5"
+        ai_postmortem_escalation_max_calls_per_day = 1
+
+    readiness = build_intelligence_readiness(IntelSettings(), postmortem_budget_used=0, escalation_budget_used=0)
+    report, _gates = build_week2_launchpad_report(
+        settings=IntelSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={},
+        today_new_entries=0,
+        ai_calls_used=0,
+        intelligence_readiness=readiness,
+    )
+
+    assert "AI postmortem: invalid" in report
+    assert "unexpected cache kind" in report
+    assert "secret-kind-value" not in report
+
+
+def test_week2_launchpad_intelligence_readiness_redacts_provider_config_errors(tmp_path):
+    class IntelSettings(DummySupervisorSettings):
+        db_path = str(tmp_path / "auto_trader.db")
+        fred_api_key = "fred-secret-value"
+        ai_postmortem_providers = "secret-provider-value"
+        ai_postmortem_model = ""
+        ai_postmortem_max_calls_per_day = 0
+        ai_postmortem_escalation_enabled = False
+        ai_postmortem_escalation_provider = "anthropic"
+        ai_postmortem_escalation_model = "claude-fable-5"
+        ai_postmortem_escalation_max_calls_per_day = 1
+
+    readiness = build_intelligence_readiness(IntelSettings(), postmortem_budget_used=0, escalation_budget_used=0)
+    report, _gates = build_week2_launchpad_report(
+        settings=IntelSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={},
+        today_new_entries=0,
+        ai_calls_used=0,
+        intelligence_readiness=readiness,
+    )
+
+    assert "readiness error: readiness build failed" in report
+    assert "secret-provider-value" not in report
+    assert "fred-secret-value" not in report
 
 
 @pytest.mark.asyncio

@@ -3,18 +3,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from auto_trader.ai_postmortem_review import (
+    default_ai_postmortem_path,
+    postmortem_model_for_provider,
+    selected_postmortem_providers,
+)
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
+from auto_trader.brain_review import default_brain_guidance_path
 from auto_trader.config.settings import get_settings
 from auto_trader.core.models import SystemState
 from auto_trader.core.risk_profile import get_risk_profile
+from auto_trader.edge_report import default_scoreboard_memory_pack_path
 from auto_trader.intelligence.ai_committee import selected_research_providers
+from auto_trader.intelligence.brain_guidance import load_brain_guidance_context
+from auto_trader.intelligence.scoreboard_memory import load_scoreboard_memory_context
 from auto_trader.persistence.db import (
     configure_db_path,
+    count_ai_postmortem_chargeable_attempts,
+    count_ai_postmortem_escalation_chargeable_attempts,
     count_ai_research_chargeable_attempts,
     count_entry_orders_since,
     get_pending_exits,
@@ -34,6 +47,7 @@ OPEN_ORDER_STATUSES = {
     "held",
     "partially_filled",
 }
+MAX_POSTMORTEM_READINESS_BYTES = 32_000
 
 
 @dataclass(frozen=True)
@@ -41,6 +55,31 @@ class LaunchpadGate:
     name: str
     status: str
     detail: str
+
+
+@dataclass(frozen=True)
+class CacheReadiness:
+    label: str
+    status: str
+    path: Path
+    generated_at: str | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class IntelligenceReadiness:
+    fred_key_present: bool
+    postmortem_providers: list[str]
+    postmortem_models: dict[str, str]
+    postmortem_budget_used: int | None
+    postmortem_budget_max: int
+    escalation_enabled: bool
+    escalation_provider: str
+    escalation_model: str
+    escalation_budget_used: int | None
+    escalation_budget_max: int
+    caches: list[CacheReadiness]
+    error: str | None = None
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -98,6 +137,159 @@ def _today_start_utc(settings: Any) -> str:
     local_now = datetime.now(timezone)
     local_day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     return local_day_start.astimezone(UTC).isoformat()
+
+
+def _cache_from_context(label: str, path: Path, context: dict[str, Any]) -> CacheReadiness:
+    status = str(context.get("status") or "missing")
+    rendered_status = "ready" if status == "loaded" else status
+    detail = str(context.get("error") or "") or None
+    return CacheReadiness(
+        label=label,
+        status=rendered_status,
+        path=path,
+        generated_at=str(context.get("generated_at") or "") or None,
+        detail=detail,
+    )
+
+
+def _readiness_cache(
+    path: Path,
+    *,
+    label: str,
+    expected_kind: str,
+    max_bytes: int = MAX_POSTMORTEM_READINESS_BYTES,
+) -> CacheReadiness:
+    try:
+        if not path.exists():
+            return CacheReadiness(label=label, status="missing", path=path, detail="cache file not found")
+        size = path.stat().st_size
+        if size > max_bytes:
+            return CacheReadiness(
+                label=label,
+                status="oversized",
+                path=path,
+                detail=f"cache size {size} exceeds max {max_bytes}",
+            )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return CacheReadiness(label=label, status="malformed", path=path, detail="cache JSON is malformed")
+    except Exception:
+        return CacheReadiness(label=label, status="error", path=path, detail="cache read failed")
+    if not isinstance(payload, dict):
+        return CacheReadiness(label=label, status="invalid", path=path, detail="cache root is not an object")
+    if payload.get("kind") != expected_kind:
+        return CacheReadiness(
+            label=label,
+            status="invalid",
+            path=path,
+            generated_at=str(payload.get("generated_at") or "") or None,
+            detail="unexpected cache kind",
+        )
+    detail = None
+    if label == "AI postmortem":
+        status = str(payload.get("status") or "unknown")
+        paid_called = payload.get("paid_called")
+        detail = f"status={status}, paid_called={paid_called}"
+    return CacheReadiness(
+        label=label,
+        status="ready",
+        path=path,
+        generated_at=str(payload.get("generated_at") or "") or None,
+        detail=detail,
+    )
+
+
+def build_intelligence_readiness(
+    settings: Any,
+    *,
+    postmortem_budget_used: int | None = None,
+    escalation_budget_used: int | None = None,
+) -> IntelligenceReadiness:
+    try:
+        providers = selected_postmortem_providers(settings)
+        models = {provider: postmortem_model_for_provider(settings, provider) for provider in providers}
+        scoreboard_path = default_scoreboard_memory_pack_path(settings)
+        guidance_path = default_brain_guidance_path(settings)
+        caches = [
+            _cache_from_context(
+                "Scoreboard memory",
+                scoreboard_path,
+                load_scoreboard_memory_context(path=scoreboard_path),
+            ),
+            _cache_from_context(
+                "Brain guidance",
+                guidance_path,
+                load_brain_guidance_context(path=guidance_path),
+            ),
+            _readiness_cache(
+                default_ai_postmortem_path(settings),
+                label="AI postmortem",
+                expected_kind="ai_postmortem_pack",
+            ),
+        ]
+        return IntelligenceReadiness(
+            fred_key_present=bool(getattr(settings, "fred_api_key", None)),
+            postmortem_providers=providers,
+            postmortem_models=models,
+            postmortem_budget_used=postmortem_budget_used,
+            postmortem_budget_max=int(getattr(settings, "ai_postmortem_max_calls_per_day", 0) or 0),
+            escalation_enabled=bool(getattr(settings, "ai_postmortem_escalation_enabled", False)),
+            escalation_provider=str(getattr(settings, "ai_postmortem_escalation_provider", "") or ""),
+            escalation_model=str(getattr(settings, "ai_postmortem_escalation_model", "") or ""),
+            escalation_budget_used=escalation_budget_used,
+            escalation_budget_max=int(getattr(settings, "ai_postmortem_escalation_max_calls_per_day", 0) or 0),
+            caches=caches,
+        )
+    except Exception:
+        return IntelligenceReadiness(
+            fred_key_present=bool(getattr(settings, "fred_api_key", None)),
+            postmortem_providers=[],
+            postmortem_models={},
+            postmortem_budget_used=postmortem_budget_used,
+            postmortem_budget_max=int(getattr(settings, "ai_postmortem_max_calls_per_day", 0) or 0),
+            escalation_enabled=bool(getattr(settings, "ai_postmortem_escalation_enabled", False)),
+            escalation_provider=str(getattr(settings, "ai_postmortem_escalation_provider", "") or ""),
+            escalation_model=str(getattr(settings, "ai_postmortem_escalation_model", "") or ""),
+            escalation_budget_used=escalation_budget_used,
+            escalation_budget_max=int(getattr(settings, "ai_postmortem_escalation_max_calls_per_day", 0) or 0),
+            caches=[],
+            error="readiness build failed",
+        )
+
+
+def _budget_text(used: int | None, maximum: int) -> str:
+    return f"{'unavailable' if used is None else used} / {maximum}"
+
+
+def _render_intelligence_readiness(readiness: IntelligenceReadiness) -> list[str]:
+    providers = ", ".join(readiness.postmortem_providers) if readiness.postmortem_providers else "none"
+    model_parts = [
+        f"{provider}={readiness.postmortem_models.get(provider) or 'unset'}"
+        for provider in readiness.postmortem_providers
+    ]
+    lines = [
+        "Intelligence readiness:",
+        f"- FRED macro key: {'present' if readiness.fred_key_present else 'missing'}",
+        f"- Postmortem providers: {providers}",
+    ]
+    if model_parts:
+        lines.append(f"- Postmortem models: {', '.join(model_parts)}")
+    lines.append(f"- Postmortem budget: {_budget_text(readiness.postmortem_budget_used, readiness.postmortem_budget_max)}")
+    escalation_state = "armed" if readiness.escalation_enabled else "off"
+    escalation_label = readiness.escalation_provider or "unset"
+    if readiness.escalation_model:
+        escalation_label = f"{escalation_label}/{readiness.escalation_model}"
+    lines.append(
+        f"- Fable/escalation: {escalation_state}; {escalation_label}; "
+        f"budget {_budget_text(readiness.escalation_budget_used, readiness.escalation_budget_max)}"
+    )
+    for cache in readiness.caches:
+        generated = f", generated {cache.generated_at}" if cache.generated_at else ""
+        detail = f", {cache.detail}" if cache.detail else ""
+        lines.append(f"- {cache.label}: {cache.status}{generated}{detail}; path {cache.path}")
+    if readiness.error:
+        lines.append(f"- readiness error: {readiness.error}")
+    return lines
 
 
 def _runtime_bool(runtime_config: dict[str, str], key: str, default: bool) -> bool:
@@ -169,6 +361,7 @@ def build_week2_launchpad_report(
     runtime_config: dict[str, str],
     today_new_entries: int | None,
     ai_calls_used: int | None,
+    intelligence_readiness: IntelligenceReadiness | None = None,
     errors: list[str] | None = None,
 ) -> tuple[str, list[LaunchpadGate]]:
     snapshot_errors = errors or []
@@ -258,6 +451,9 @@ def build_week2_launchpad_report(
         lines.extend(f"- {_symbol(item.get('symbol'))}: {item.get('status') or 'pending'}, reason {item.get('reason') or 'n/a'}" for item in pending_exits)
     else:
         lines.append("- none")
+    if intelligence_readiness is not None:
+        lines.append("")
+        lines.extend(_render_intelligence_readiness(intelligence_readiness))
     return "\n".join(lines), gates
 
 
@@ -319,6 +515,19 @@ async def run_week2_launchpad() -> tuple[str, list[LaunchpadGate]]:
     except Exception as exc:
         ai_calls_used = None
         errors.append(f"AI budget count unavailable: {exc}")
+    try:
+        postmortem_calls_used = await count_ai_postmortem_chargeable_attempts(provider=None, today_utc=True)
+    except Exception:
+        postmortem_calls_used = None
+    try:
+        escalation_calls_used = await count_ai_postmortem_escalation_chargeable_attempts(provider=None, today_utc=True)
+    except Exception:
+        escalation_calls_used = None
+    intelligence_readiness = build_intelligence_readiness(
+        settings,
+        postmortem_budget_used=postmortem_calls_used,
+        escalation_budget_used=escalation_calls_used,
+    )
 
     return build_week2_launchpad_report(
         settings=settings,
@@ -332,6 +541,7 @@ async def run_week2_launchpad() -> tuple[str, list[LaunchpadGate]]:
         runtime_config=runtime_config,
         today_new_entries=today_new_entries,
         ai_calls_used=ai_calls_used,
+        intelligence_readiness=intelligence_readiness,
         errors=errors,
     )
 
