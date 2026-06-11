@@ -4,12 +4,12 @@ Operational notes for supervised paper-trading runs. Keep live-money changes exp
 
 ## Current Mode
 
-- Day 2 paper burn-in is supervised paper mode.
+- Week 2 is the paper evidence phase: let the Oracle runner trade, then use scoreboard/postmortem evidence to prove whether the AI gate adds edge before live money.
 - As of 2026-06-03 09:35 PDT, Oracle VM is the single active paper runner.
 - The laptop bot is stopped; do not start it unless intentionally migrating back from Oracle.
 - `AUTO_ENTRY_ENABLED=false` is the service env default. Runtime Telegram config can override it in SQLite; trust `/status` and `/config` for the effective active-runner entry state.
 - `AUTO_EXIT_ENABLED=true` is enabled on the active runner after close-path hardening approval.
-- AMPX and POET paper lifecycles are complete; current expected open positions are none.
+- Current positions, open orders, runtime max entries, AI gate state, and AI budget usage are live operational state; check `/status`, `/config`, or the Week 2 launchpad instead of trusting a static doc snapshot.
 - `/kill` remains the emergency path: cancel all orders, flatten all positions, and persist `HALTED`.
 - RiskEngine remains the only path to any order.
 
@@ -62,7 +62,7 @@ For supervised laptop burn-in, `SHUTDOWN_FLATTEN_ON_EXIT=false` is allowed only 
 
 The preferred always-on deployment is a small Linux host using systemd. Oracle Always Free ARM is the default target; Raspberry Pi is acceptable for experimentation if power, network, clock sync, and uptime are reliable.
 
-Current Oracle VM stance: Oracle is the active paper runner. The service is active and enabled, with `AUTO_ENTRY_ENABLED=false`, `AUTO_EXIT_ENABLED=true`, `ALPACA_PAPER=true`, `MAX_NEW_POSITIONS_PER_DAY=1`, and `SHUTDOWN_FLATTEN_ON_EXIT=true`. Runtime Telegram config may promote paper-only entry controls without editing `.env`; as of Day 3, `auto_entry_enabled=true` and `max_new_positions_per_day=3` are runtime values, not service env defaults.
+Current Oracle VM stance: Oracle is the active paper runner. The service is active and enabled, with paper mode and safe shutdown semantics in `.env`; runtime Telegram config may promote entry controls without editing `.env`. Treat `/config`, `/status`, and the Week 2 launchpad as the source of truth for effective `auto_entry_enabled`, `ai_entry_gate_enabled`, `risk_profile`, and `max_new_positions_per_day`.
 
 Only one active bot host should poll Telegram and trade the paper account at a time. The local single-instance lock protects one SQLite DB path on one machine; it does not coordinate across a laptop and Oracle VM. If Oracle is started with the same Telegram token and Alpaca account while the laptop bot is also running, cross-host duplicate polling and duplicate trading decisions are possible.
 
@@ -408,7 +408,7 @@ On Oracle:
 ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_week2_launchpad.sh
 ```
 
-The launchpad reads service/broker state through the configured environment and prints bot state, account status, market clock, positions, open orders, pending exits, risk profile, runtime auto-entry, runtime AI gate, paid AI budget usage, resume eligibility, and the next expected bot behavior. It does not submit, cancel, reconcile, resume, or call paid AI providers.
+The launchpad reads service/broker state through the configured environment and prints bot state, account status, market clock, positions, open orders, pending exits, risk profile, runtime auto-entry, runtime AI gate, paid AI budget usage, resume eligibility, entry-pressure diagnostics, and the next expected bot behavior. Entry pressure is best-effort and read-only: it summarizes persisted candidates, prefilter blocks, AI watch/reject/invalid/approve counts, RiskEngine blocks, latest entry, capacity, and the likely blocker. It does not submit, cancel, reconcile, resume, or call paid AI providers.
 
 For Sunday-night or premarket candidate learning without orders, run the AI rehearsal batch:
 

@@ -3,6 +3,8 @@
 ## Iron-Clad Reviewer/Optimizer Rule
 
 - For any non-trivial AUTO-TRADER code change, send the intended delta to the standing Reviewer and standing Optimizer threads before implementation starts.
+- Architect and Engineer are working roles in the current Codex thread, not standing background threads. Use an "Architect hat" design pass inline when useful, then implement as Engineer.
+- Reviewer and Optimizer do not own product/design decisions. Their job is to review implementation deltas for safety, correctness, reliability, and maintainability.
 - Reuse the existing standing Reviewer and Optimizer threads for the trading day. Do not create new Reviewer/Optimizer threads unless the existing thread is unavailable, wedged, or unsafe to reuse.
 - After implementation, send the actual diff, verification output, and commit/deploy state back to the same Reviewer and Optimizer.
 - If either returns `BLOCK` or `APPROVE WITH CHANGES`, apply the required fixes before moving to the next feature, then resend to the same threads for re-review.
