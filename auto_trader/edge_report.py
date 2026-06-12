@@ -20,6 +20,20 @@ from auto_trader.utils.logging import setup_logging
 
 ENTRY_SIDES = {"buy", "long"}
 EXIT_SIDES = {"sell", "close", "sell_short", "buy_to_cover"}
+HUMAN_SAMPLE_MIN_TRADES = 10
+GROUP_SAMPLE_MIN_TRADES = 3
+MISSING_TAG_PREFIXES = (
+    "fundamental:missing",
+    "macro:missing",
+    "move:missing",
+    "news:missing",
+    "profile:unknown",
+    "relvol:missing",
+    "spread:missing",
+)
+SAFE_PROVIDER_NAMES = {"anthropic", "deepseek", "gemini", "multi", "openai", "prefilter", "shadow", "unknown", "xai"}
+SAFE_VERDICTS = {"approve", "reject", "unknown", "watch"}
+SAFE_PROVIDER_ANNOTATIONS = {"high_conf", "invalid", "low_conf", "med_conf"}
 
 
 @dataclass(frozen=True)
@@ -601,6 +615,284 @@ def _render_counts(title: str, values: list[str], *, limit: int = 8) -> list[str
     return lines
 
 
+def _is_missing_or_unknown_tag(tag: str) -> bool:
+    return any(tag == prefix for prefix in MISSING_TAG_PREFIXES)
+
+
+def _is_ai_approved(verdict: str) -> bool:
+    return str(verdict or "").lower().endswith(":approve")
+
+
+def _human_sample_label(count: int) -> str:
+    return "thin" if count < HUMAN_SAMPLE_MIN_TRADES else "building"
+
+
+def _human_group_stats(label: str, trades: list[ClosedTradeEvidence]) -> str:
+    stats = _trade_stats(trades)
+    sample = "thin" if int(stats["count"]) < GROUP_SAMPLE_MIN_TRADES else "building"
+    return (
+        f"- {label}: n={int(stats['count'])}, P/L {_money(stats['realized_pnl'])}, "
+        f"exp/trade {_money(stats['expectancy'])}, win {stats['win_rate']:.1f}%, sample={sample}"
+    )
+
+
+def _outcome_label(outcome: str) -> str:
+    labels = {
+        "traded": "Traded",
+        "ai_approve": "AI approved but no order",
+        "ai_watch": "AI said watch",
+        "ai_reject": "AI rejected",
+        "prefilter_blocked": "Paid prefilter blocked before AI spend",
+        "risk_blocked": "RiskEngine blocked",
+        "candidate_only": "Candidate logged only",
+    }
+    return labels.get(outcome, outcome.replace("_", " ").title())
+
+
+def _blocker_label(outcome: str, reason: str) -> str:
+    text = str(reason or "").lower()
+    if outcome == "prefilter_blocked":
+        return "Paid prefilter blocked weak setup"
+    if outcome == "ai_watch":
+        return "AI committee said watch"
+    if outcome == "ai_approve":
+        return "AI approved but no order followed"
+    if outcome == "ai_reject":
+        return "AI committee rejected"
+    if outcome == "candidate_only":
+        return "Candidate logged but did not reach order"
+    if outcome == "risk_blocked":
+        if "open position" in text or "already has" in text or "duplicate" in text:
+            return "RiskEngine: already holding symbol"
+        if "gross exposure" in text or "exposure" in text:
+            return "RiskEngine: gross exposure cap"
+        if "daily" in text or "max new" in text or "position limit" in text:
+            return "RiskEngine: entry capacity limit"
+        if "buying power" in text or "cash" in text:
+            return "RiskEngine: cash/buying power"
+        if "halt" in text or "paused" in text:
+            return "RiskEngine: system state guard"
+        return "RiskEngine: other block"
+    return _short_reason(reason, limit=40)
+
+
+def _exit_label(reason: str) -> str:
+    text = str(reason or "").strip().lower()
+    if text == "broker_reconciliation":
+        return "broker matched filled exit (administrative)"
+    if "take profit" in text:
+        return "take profit"
+    if "max loss" in text or "stop loss" in text:
+        return "max loss / stop"
+    if "trailing" in text:
+        return "trailing stop"
+    if "stagnation" in text:
+        return "stagnation exit"
+    if "max hold" in text:
+        return "max hold"
+    return _short_reason(reason or "unknown", limit=42)
+
+
+def _tag_label(tag: str) -> str:
+    labels = {
+        "relvol:low": "low relative volume",
+        "relvol:normal": "normal relative volume",
+        "relvol:strong": "strong relative volume",
+        "relvol:hot": "hot relative volume",
+        "move:cold": "cold move",
+        "move:tradable": "tradable move",
+        "move:extended": "extended move",
+        "move:parabolic": "parabolic move",
+        "spread:tight": "tight spread",
+        "spread:workable": "workable spread",
+        "spread:wide": "wide spread",
+        "news:present": "news present",
+        "fundamental:present": "fundamentals present",
+        "macro:ok": "macro context present",
+        "macro:error": "macro context error",
+        "near_high": "near high",
+        "inverse_or_leveraged": "inverse/leveraged",
+        "profile:aggressive": "aggressive profile",
+        "profile:conservative": "conservative profile",
+        "profile:risky": "risky profile",
+    }
+    return labels.get(tag, tag.replace(":", " ").replace("_", " "))
+
+
+def _safe_provider_vote_label(label: str) -> str:
+    parts = [part.strip().lower() for part in str(label or "").split(":") if part.strip()]
+    if not parts:
+        return "provider:unknown"
+    provider = parts[0] if parts[0] in SAFE_PROVIDER_NAMES else "provider"
+    verdict = parts[1] if len(parts) > 1 and parts[1] in SAFE_VERDICTS else "unknown"
+    annotations = [part for part in parts[2:] if part in SAFE_PROVIDER_ANNOTATIONS]
+    return ":".join([provider, verdict, *annotations])
+
+
+def _render_candidate_funnel(opportunities: list[OpportunityEvidence]) -> list[str]:
+    lines = ["Candidate funnel:"]
+    counts = dict(_bucket_counts([opportunity.outcome for opportunity in opportunities]))
+    ordered = ["traded", "ai_approve", "ai_watch", "ai_reject", "prefilter_blocked", "risk_blocked", "candidate_only"]
+    for outcome in ordered:
+        if outcome in counts:
+            lines.append(f"- {_outcome_label(outcome)}: {counts[outcome]}")
+    for outcome, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        if outcome not in ordered:
+            lines.append(f"- {_outcome_label(outcome)}: {count}")
+    if len(lines) == 1:
+        lines.append("- none")
+    return lines
+
+
+def _blocked_pressure_counts(opportunities: list[OpportunityEvidence]) -> list[tuple[str, int]]:
+    blocked = [opportunity for opportunity in opportunities if opportunity.outcome != "traded"]
+    return _bucket_counts([_blocker_label(opportunity.outcome, opportunity.reason) for opportunity in blocked])
+
+
+def _render_main_blockers(opportunities: list[OpportunityEvidence], *, limit: int = 5) -> list[str]:
+    lines = ["Main blockers:"]
+    blocked_counts = _blocked_pressure_counts(opportunities)
+    if not blocked_counts:
+        return lines + ["- none"]
+    for label, count in blocked_counts[:limit]:
+        lines.append(f"- {label}: {count}")
+    return lines
+
+
+def _render_signal_quality_notes(trades: list[ClosedTradeEvidence], opportunities: list[OpportunityEvidence]) -> list[str]:
+    lines = ["Signal quality notes:"]
+    trade_tags = [tag for trade in trades for tag in trade.setup_tags]
+    opportunity_tags_all = [tag for opportunity in opportunities for tag in opportunity.setup_tags]
+    missing_count = sum(1 for tag in [*trade_tags, *opportunity_tags_all] if _is_missing_or_unknown_tag(tag))
+    setup_groups = [
+        row
+        for row in _trade_groups_by_values(trades, lambda trade: [tag for tag in trade.setup_tags if not _is_missing_or_unknown_tag(tag)])
+        if int(row[2]["count"]) > 0
+    ]
+    positive = [row for row in setup_groups if row[2]["realized_pnl"] > 0]
+    negative = [row for row in setup_groups if row[2]["realized_pnl"] < 0]
+    positive.sort(key=lambda row: (row[2]["expectancy"], row[2]["realized_pnl"], row[0]), reverse=True)
+    negative.sort(key=lambda row: (row[2]["expectancy"], row[2]["realized_pnl"], row[0]))
+    if positive:
+        rendered = ", ".join(f"{_tag_label(name)} ({int(stats['count'])})" for name, _group, stats in positive[:4])
+        lines.append(f"- Helpful so far: {rendered}")
+    else:
+        lines.append("- Helpful so far: none yet")
+    if negative:
+        rendered = ", ".join(f"{_tag_label(name)} ({int(stats['count'])})" for name, _group, stats in negative[:3])
+        lines.append(f"- Dragging so far: {rendered}")
+    else:
+        lines.append("- Dragging so far: none yet")
+    if missing_count:
+        lines.append(f"- Missing/unknown data tags hidden from detail: {missing_count}")
+    opportunity_tags = [tag for tag in opportunity_tags_all if not _is_missing_or_unknown_tag(tag)]
+    common = _bucket_counts(opportunity_tags)[:4]
+    if common:
+        lines.append("- Common candidate tags: " + ", ".join(f"{_tag_label(tag)} ({count})" for tag, count in common))
+    return lines
+
+
+def _render_ai_edge_check(trades: list[ClosedTradeEvidence]) -> list[str]:
+    approved = [trade for trade in trades if _is_ai_approved(trade.ai_verdict)]
+    other = [trade for trade in trades if not _is_ai_approved(trade.ai_verdict)]
+    lines = ["AI edge check:"]
+    lines.append(_human_group_stats("AI-approved trades", approved))
+    lines.append(_human_group_stats("Other/no-AI trades", other))
+    approved_stats = _trade_stats(approved)
+    other_stats = _trade_stats(other)
+    if len(trades) < HUMAN_SAMPLE_MIN_TRADES or len(approved) < GROUP_SAMPLE_MIN_TRADES or len(other) < GROUP_SAMPLE_MIN_TRADES:
+        lines.append("- Read: too thin to judge; keep collecting closed trades before declaring edge.")
+    elif approved_stats["expectancy"] > other_stats["expectancy"]:
+        lines.append("- Read: AI-approved trades are ahead so far.")
+    elif approved_stats["expectancy"] < other_stats["expectancy"]:
+        lines.append("- Read: AI-approved trades are lagging so far.")
+    else:
+        lines.append("- Read: AI-approved and other trades are roughly tied so far.")
+    provider_groups = [
+        row
+        for row in _trade_groups_by_values(trades, lambda trade: trade.provider_votes)
+        if int(row[2]["count"]) >= GROUP_SAMPLE_MIN_TRADES
+    ]
+    if provider_groups:
+        provider_groups.sort(key=lambda row: (row[2]["expectancy"], row[2]["realized_pnl"], row[0]), reverse=True)
+        lines.append(
+            "- Provider vote buckets with enough sample: "
+            + ", ".join(f"{_safe_provider_vote_label(name)} n={int(stats['count'])}" for name, _group, stats in provider_groups[:3])
+        )
+    else:
+        lines.append("- Provider vote detail: collapsed until each bucket has at least 3 closed trades.")
+    return lines
+
+
+def _summary_lines(trades: list[ClosedTradeEvidence], opportunities: list[OpportunityEvidence], stats: dict[str, float]) -> list[str]:
+    approved = [trade for trade in trades if _is_ai_approved(trade.ai_verdict)]
+    other = [trade for trade in trades if not _is_ai_approved(trade.ai_verdict)]
+    approved_stats = _trade_stats(approved)
+    other_stats = _trade_stats(other)
+    sample = _human_sample_label(len(trades))
+    lines = ["Read me first:"]
+    if trades:
+        lines.append(f"- Evidence sample is {sample}: {len(trades)} closed trades in this window.")
+    else:
+        lines.append("- No closed trades yet; this is candidate pressure only.")
+    if len(trades) < HUMAN_SAMPLE_MIN_TRADES or len(approved) < GROUP_SAMPLE_MIN_TRADES or len(other) < GROUP_SAMPLE_MIN_TRADES:
+        lines.append("- AI edge is not proven yet; approved vs non-approved samples are still thin.")
+    elif approved_stats["expectancy"] > other_stats["expectancy"]:
+        lines.append(
+            f"- AI-approved trades are ahead so far: {_money(approved_stats['expectancy'])} vs "
+            f"{_money(other_stats['expectancy'])} expectancy."
+        )
+    else:
+        lines.append(
+            f"- AI-approved trades are not ahead yet: {_money(approved_stats['expectancy'])} vs "
+            f"{_money(other_stats['expectancy'])} expectancy."
+        )
+    blocked_counts = _blocked_pressure_counts(opportunities)
+    if blocked_counts:
+        lines.append(f"- Biggest pressure: {blocked_counts[0][0]} ({blocked_counts[0][1]}).")
+    elif opportunities:
+        lines.append("- Biggest pressure: none; all observed opportunities traded.")
+    else:
+        lines.append("- Biggest pressure: no opportunity evidence in this window.")
+    if stats["expectancy"] > 0:
+        lines.append("- Scorecard is positive so far, but edge graduation needs more trades.")
+    elif trades:
+        lines.append("- Scorecard is flat/negative so far; keep watching what the AI blocks vs approves.")
+    return lines
+
+
+def _render_recent_trades(trades: list[ClosedTradeEvidence]) -> list[str]:
+    lines = ["Recent closed trades:"]
+    recent = sorted(trades, key=lambda trade: trade.exit_time or datetime.min.replace(tzinfo=UTC), reverse=True)[:5]
+    if not recent:
+        return lines + ["- none yet"]
+    for trade in recent:
+        useful_tags = [_tag_label(tag) for tag in trade.setup_tags if not _is_missing_or_unknown_tag(tag)]
+        tags = ", ".join(useful_tags[:3]) if useful_tags else "no strong tags"
+        lines.append(
+            f"- {trade.symbol}: {_money(trade.pnl)} ({_pct(trade.pnl_pct)}), "
+            f"AI={trade.ai_verdict}, profile={trade.risk_profile}, tags={tags}, exit={_exit_label(trade.exit_reason)}"
+        )
+    return lines
+
+
+def _render_next_read(trades: list[ClosedTradeEvidence], opportunities: list[OpportunityEvidence], stats: dict[str, float]) -> list[str]:
+    lines = ["Next read:"]
+    if not trades:
+        lines.append("- Need closed trades before judging edge.")
+        return lines
+    if len(trades) < HUMAN_SAMPLE_MIN_TRADES:
+        lines.append("- Keep the experiment running; sample is too thin for live-money conclusions.")
+    elif stats["expectancy"] <= 0:
+        lines.append("- Focus the next review on weak tags and whether AI blocks are filtering enough bad ideas.")
+    else:
+        lines.append("- Compare AI-approved trades against watch/reject/no-AI outcomes as the sample grows.")
+    blocked_counts = _blocked_pressure_counts(opportunities)
+    if blocked_counts:
+        lines.append(f"- Watch whether `{blocked_counts[0][0]}` is useful filtering or excessive friction.")
+    return lines
+
+
 def _trade_groups_by_values(
     trades: list[ClosedTradeEvidence], value_getter: Any
 ) -> list[tuple[str, list[ClosedTradeEvidence], dict[str, float]]]:
@@ -880,53 +1172,31 @@ def render_edge_report(report: EdgeReport) -> str:
     lines = [
         "EDGE REPORT",
         f"Window: last {report.window_days} days",
-        f"Closed trades: {int(stats['count'])}",
-        f"Realized P/L: {_money(stats['realized_pnl'])}",
-        f"Expectancy/trade: {_money(stats['expectancy'])}",
-        f"Win rate: {stats['win_rate']:.1f}% ({int(stats['wins'])}W/{int(stats['losses'])}L)",
-        f"Avg win/loss: {_money(stats['avg_win'])} / {_money(stats['avg_loss'])}",
+        "",
     ]
-    by_ai: dict[str, list[ClosedTradeEvidence]] = {}
-    by_profile: dict[str, list[ClosedTradeEvidence]] = {}
-    for trade in trades:
-        by_ai.setdefault(trade.ai_verdict, []).append(trade)
-        by_profile.setdefault(trade.risk_profile, []).append(trade)
-    lines.extend(_render_group_stats("By AI verdict:", by_ai))
-    lines.extend(_render_group_stats("By risk profile:", by_profile))
-    lines.extend(_render_group_stats("By setup tag:", _group_trades_by_values(trades, lambda trade: trade.setup_tags)))
-    lines.extend(_render_group_stats("By provider vote:", _group_trades_by_values(trades, lambda trade: trade.provider_votes)))
-    lines.extend(_render_counts("Opportunity outcomes:", [opportunity.outcome for opportunity in opportunities]))
-    blocked = [opportunity for opportunity in opportunities if opportunity.outcome != "traded"]
+    lines.extend(_summary_lines(trades, opportunities, stats))
     lines.extend(
-        _render_counts(
-            "Blocked pressure:",
-            [f"{opportunity.outcome}: {_short_reason(opportunity.reason)}" for opportunity in blocked],
-        )
+        [
+            "",
+            "Scorecard:",
+            f"- Closed trades: {int(stats['count'])}",
+            f"- Realized P/L: {_money(stats['realized_pnl'])}",
+            f"- Expectancy/trade: {_money(stats['expectancy'])}",
+            f"- Win rate: {stats['win_rate']:.1f}% ({int(stats['wins'])}W/{int(stats['losses'])}L)",
+            f"- Avg win/loss: {_money(stats['avg_win'])} / {_money(stats['avg_loss'])}",
+        ]
     )
-    lines.extend(
-        _render_counts(
-            "Opportunity setup tags:",
-            [tag for opportunity in blocked for tag in opportunity.setup_tags],
-        )
-    )
-    lines.append("Recent closed trades:")
-    recent = sorted(trades, key=lambda trade: trade.exit_time or datetime.min.replace(tzinfo=UTC), reverse=True)[:5]
-    if recent:
-        for trade in recent:
-            tags = ",".join(trade.setup_tags[:3]) if trade.setup_tags else "no-tags"
-            lines.append(
-                f"- {trade.symbol}: {_money(trade.pnl)} ({_pct(trade.pnl_pct)}), "
-                f"{trade.ai_verdict}, {trade.risk_profile}, tags={tags}, exit={trade.exit_reason}"
-            )
-    else:
-        lines.append("- none yet")
-    lines.append("Next pressure:")
-    if not trades:
-        lines.append("- Need closed trades. Run aggressive paper until the report has outcomes, not vibes.")
-    elif stats["expectancy"] <= 0:
-        lines.append("- Negative/flat expectancy. Demote weak setup tags and force better candidates.")
-    else:
-        lines.append("- Positive expectancy. Keep sample growing and compare AI-approved vs non-approved paths.")
+    sections = [
+        _render_ai_edge_check(trades),
+        _render_candidate_funnel(opportunities),
+        _render_main_blockers(opportunities),
+        _render_signal_quality_notes(trades, opportunities),
+        _render_recent_trades(trades),
+        _render_next_read(trades, opportunities, stats),
+    ]
+    for section in sections:
+        lines.append("")
+        lines.extend(section)
     return "\n".join(lines)
 
 

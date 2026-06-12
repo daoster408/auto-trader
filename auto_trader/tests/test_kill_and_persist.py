@@ -30,6 +30,8 @@ from auto_trader.account_risk_validate import (
 )
 from auto_trader.day3_validate import build_day3_validation_report, validation_exit_code
 from auto_trader.edge_report import (
+    ClosedTradeEvidence,
+    EdgeReport,
     build_edge_report,
     build_scoreboard_memory_pack,
     render_edge_report,
@@ -5348,7 +5350,7 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
                 "submitted_at": (now - timedelta(hours=1)).isoformat(),
                 "filled_at": (now - timedelta(hours=1) + timedelta(seconds=1)).isoformat(),
             },
-            rationale="take profit reached",
+            rationale="broker_reconciliation",
         )
 
         report = await build_edge_report(window_days=7)
@@ -5368,14 +5370,20 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
         assert "news:present" in trade.setup_tags
         assert "macro:ok" in trade.setup_tags
         assert "anthropic:approve:high_conf" in trade.provider_votes
+        assert "Read me first:" in rendered
+        assert "AI edge is not proven yet" in rendered
+        assert "Scorecard:" in rendered
         assert "Closed trades: 1" in rendered
         assert "Realized P/L: $4.00" in rendered
-        assert "- multi:approve: n=1, P/L $4.00" in rendered
+        assert "AI edge check:" in rendered
+        assert "- AI-approved trades: n=1, P/L $4.00" in rendered
         assert "sample=thin" in rendered
-        assert "By setup tag:" in rendered
-        assert "- relvol:strong: n=1, P/L $4.00" in rendered
-        assert "By provider vote:" in rendered
-        assert "- anthropic:approve:high_conf: n=1, P/L $4.00" in rendered
+        assert "Provider vote detail: collapsed until each bucket has at least 3 closed trades." in rendered
+        assert "- anthropic:approve:high_conf: n=1, P/L $4.00" not in rendered
+        assert "Signal quality notes:" in rendered
+        assert "strong relative volume" in rendered
+        assert "exit=broker matched filled exit (administrative)" in rendered
+        assert "broker_reconciliation" not in rendered
         assert "LEARNING BRIEF" in brief
         assert "Sample: thin" in brief
         assert "Setup tags with positive observed P/L:" in brief
@@ -5433,6 +5441,28 @@ async def test_edge_report_classifies_skipped_opportunities():
             memo={"rationale": "wait for cleaner setup"},
         )
 
+        approve_signal_id = await log_signal(
+            symbol="ABCD",
+            thesis="approved but no order yet",
+            confidence=0.7,
+            source="test",
+            model_tag="rules_fallback/v0",
+            features={"risk": {"risk_profile": "aggressive"}},
+        )
+        await log_ai_research_memo(
+            signal_id=approve_signal_id,
+            symbol="ABCD",
+            provider="multi",
+            model_tag="multi/v1",
+            prompt_version="test",
+            input_hash="abcd-hash",
+            verdict="approve",
+            confidence=0.7,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"rationale": "approved but no order followed"},
+        )
+
         prefilter_signal_id = await log_signal(
             symbol="TZA",
             thesis="high volatility candidate",
@@ -5484,28 +5514,65 @@ async def test_edge_report_classifies_skipped_opportunities():
         outcomes = {opportunity.symbol: opportunity.outcome for opportunity in report.opportunities}
 
         assert outcomes["SSPE"] == "ai_watch"
+        assert outcomes["ABCD"] == "ai_approve"
         assert outcomes["TZA"] == "prefilter_blocked"
         assert outcomes["GLL"] == "risk_blocked"
-        assert "- ai_watch: 1" in rendered
-        assert "- prefilter_blocked: 1" in rendered
-        assert "- risk_blocked: 1" in rendered
-        assert "Blocked pressure:" in rendered
-        assert "- prefilter_blocked: paid AI prefilter blocked: 1" in rendered
-        assert "Opportunity setup tags:" in rendered
-        assert "- inverse_or_leveraged:" in rendered
+        assert "Candidate funnel:" in rendered
+        assert "- AI approved but no order: 1" in rendered
+        assert "- AI said watch: 1" in rendered
+        assert "- Paid prefilter blocked before AI spend: 1" in rendered
+        assert "- RiskEngine blocked: 1" in rendered
+        assert "Main blockers:" in rendered
+        assert "- AI approved but no order followed: 1" in rendered
+        assert "- Paid prefilter blocked weak setup: 1" in rendered
+        assert "- RiskEngine: entry capacity limit: 1" in rendered
+        assert "Signal quality notes:" in rendered
+        assert "inverse/leveraged" in rendered
+        assert "Missing/unknown data tags hidden from detail:" in rendered
         assert "LEARNING BRIEF" in brief
-        assert "Evidence: 0 closed trades, 3 opportunities" in brief
+        assert "Evidence: 0 closed trades, 4 opportunities" in brief
         assert "- prefilter_blocked: paid AI prefilter blocked: 1" in brief
         assert "Sample is still thin" in brief
         assert memory_pack["closed_trade_count"] == 0
-        assert memory_pack["opportunity_count"] == 3
+        assert memory_pack["opportunity_count"] == 4
         assert memory_pack["sample_label"] == "thin"
         assert memory_pack["sample"]["closed_trades"] == 0
-        assert memory_pack["sample"]["opportunities"] == 3
+        assert memory_pack["sample"]["opportunities"] == 4
         assert memory_pack["positive_observed_tags"] == []
         assert memory_pack["negative_observed_tags"] == []
-        assert memory_pack["blocked_pressure"][0] == {"key": "ai_watch: AI committee verdict", "count": 1}
+        blocked_pressure = {row["key"]: row["count"] for row in memory_pack["blocked_pressure"]}
+        assert blocked_pressure["ai_approve: AI committee verdict"] == 1
+        assert blocked_pressure["ai_watch: AI committee verdict"] == 1
         assert "Blocked pressure:" in memory_pack["prompt_context"]
+
+
+def test_edge_report_sanitizes_provider_vote_labels_in_human_report():
+    now = datetime.now(UTC)
+    trades = [
+        ClosedTradeEvidence(
+            symbol=f"TST{index}",
+            qty=1.0,
+            entry_price=10.0,
+            exit_price=11.0,
+            pnl=1.0,
+            pnl_pct=10.0,
+            entry_time=now - timedelta(days=1, minutes=index),
+            exit_time=now - timedelta(minutes=index),
+            exit_reason="take profit reached",
+            ai_verdict="multi:approve",
+            risk_profile="aggressive",
+            signal_id=index,
+            setup_tags=("relvol:strong",),
+            provider_votes=("evil-provider:approve:secret-token:high_conf",),
+        )
+        for index in range(3)
+    ]
+
+    rendered = render_edge_report(EdgeReport(window_days=14, closed_trades=trades, opportunities=[]))
+
+    assert "provider:approve:high_conf n=3" in rendered
+    assert "evil-provider" not in rendered
+    assert "secret-token" not in rendered
 
 
 @pytest.mark.asyncio
@@ -5533,8 +5600,9 @@ async def test_edge_report_treats_malformed_features_as_missing_evidence():
         assert len(report.opportunities) == 1
         assert "relvol:missing" in report.opportunities[0].setup_tags
         assert "move:missing" in report.opportunities[0].setup_tags
-        assert "Opportunity setup tags:" in rendered
-        assert "- relvol:missing: 1" in rendered
+        assert "Signal quality notes:" in rendered
+        assert "Missing/unknown data tags hidden from detail:" in rendered
+        assert "- relvol:missing: 1" not in rendered
 
 
 def test_scoreboard_memory_pack_atomic_write_cleans_temp_on_replace_failure(tmp_path, monkeypatch):
