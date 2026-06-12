@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.error import HTTPError
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -56,6 +57,7 @@ from auto_trader.ai_postmortem_review import (
     AI_POSTMORTEM_PROMPT_VERSION,
     MAX_POSTMORTEM_ESCALATION_CONTEXT_CHARS,
     DeepSeekPostmortemProvider,
+    OpenAIPostmortemProvider,
     PostmortemProviderMemo,
     build_ai_postmortem_pack,
     build_postmortem_escalation_packet,
@@ -1668,6 +1670,116 @@ class _FakePostmortemProvider:
         )
 
 
+class _RateLimitedThenValidPostmortemProvider(_FakePostmortemProvider):
+    def __init__(
+        self,
+        *,
+        retry_after_seconds: float = 0.0,
+        provider: str = "openai",
+        model_tag: str = "openai/fake-postmortem",
+    ) -> None:
+        super().__init__(provider=provider, model_tag=model_tag)
+        self.retry_after_seconds = retry_after_seconds
+
+    async def review(
+        self,
+        packet,
+        *,
+        prompt_version=AI_POSTMORTEM_PROMPT_VERSION,
+        failure_prompt_version="ai_postmortem_failure/v0",
+        instructions="",
+    ):
+        if self.calls == 0:
+            self.calls += 1
+            digest = postmortem_packet_hash(packet)
+            return PostmortemProviderMemo(
+                provider=self.provider,
+                model_tag=self.model_tag,
+                prompt_version=failure_prompt_version,
+                input_hash=digest,
+                used_only_provided_data=True,
+                validation_passed=False,
+                output={
+                    "used_only_provided_data": True,
+                    "lessons": [],
+                    "edge_hypotheses": [],
+                    "budget_leaks": [],
+                    "provider_notes": [],
+                    "operator_recommendations": [],
+                    "judge_summary": "Provider failed during explicit postmortem review.",
+                    "validation_errors": [
+                        "ai_postmortem_provider_failed",
+                        "ai_postmortem_provider_rate_limited",
+                    ],
+                    "error_type": "rate_limited",
+                    "http_status": 429,
+                    "retry_after_seconds": self.retry_after_seconds,
+                    "retryable": True,
+                },
+                error="HTTP Error 429: Too Many Requests",
+            )
+        return await super().review(
+            packet,
+            prompt_version=prompt_version,
+            failure_prompt_version=failure_prompt_version,
+            instructions=instructions,
+        )
+
+
+class _AlwaysFailingPostmortemProvider(_FakePostmortemProvider):
+    def __init__(
+        self,
+        *,
+        error_type: str,
+        http_status: int | None,
+        retryable: bool,
+        retry_after_seconds: float | None = None,
+        validation_error: str = "ai_postmortem_provider_failed",
+        provider: str = "openai",
+        model_tag: str = "openai/fake-postmortem",
+    ) -> None:
+        super().__init__(valid=False, provider=provider, model_tag=model_tag)
+        self.error_type = error_type
+        self.http_status = http_status
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+        self.validation_error = validation_error
+
+    async def review(
+        self,
+        packet,
+        *,
+        prompt_version=AI_POSTMORTEM_PROMPT_VERSION,
+        failure_prompt_version="ai_postmortem_failure/v0",
+        instructions="",
+    ):
+        self.calls += 1
+        digest = postmortem_packet_hash(packet)
+        return PostmortemProviderMemo(
+            provider=self.provider,
+            model_tag=self.model_tag,
+            prompt_version=failure_prompt_version,
+            input_hash=digest,
+            used_only_provided_data=True,
+            validation_passed=False,
+            output={
+                "used_only_provided_data": True,
+                "lessons": [],
+                "edge_hypotheses": [],
+                "budget_leaks": [],
+                "provider_notes": [],
+                "operator_recommendations": [],
+                "judge_summary": "Provider failed during explicit postmortem review.",
+                "validation_errors": ["ai_postmortem_provider_failed", self.validation_error],
+                "error_type": self.error_type,
+                "http_status": self.http_status,
+                "retry_after_seconds": self.retry_after_seconds,
+                "retryable": self.retryable,
+            },
+            error=f"HTTP Error {self.http_status}: provider failure",
+        )
+
+
 @pytest.mark.asyncio
 async def test_ai_postmortem_default_does_not_call_paid_provider(tmp_path):
     settings = _PostmortemSettings(tmp_path)
@@ -1900,7 +2012,7 @@ async def test_ai_postmortem_provider_setup_failure_writes_invalid_artifact(tmp_
 @pytest.mark.asyncio
 async def test_ai_postmortem_provider_failure_counts_separate_budget(tmp_path):
     class FailingProvider(_FakePostmortemProvider):
-        async def review(self, packet):
+        async def review(self, packet, **kwargs):
             self.calls += 1
             raise RuntimeError("provider down")
 
@@ -1918,6 +2030,193 @@ async def test_ai_postmortem_provider_failure_counts_separate_budget(tmp_path):
     assert result.pack["status"] == "invalid"
     assert result.pack["chargeable_calls"]["after"] == 1
     assert result.pack["provider_results"][0]["prompt_version"] == "ai_postmortem_failure/v0"
+
+
+@pytest.mark.asyncio
+async def test_postmortem_http_provider_classifies_429(monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise HTTPError(
+            request.full_url,
+            429,
+            "Too Many Requests",
+            {"Retry-After": "999"},
+            None,
+        )
+
+    monkeypatch.setattr("auto_trader.ai_postmortem_review.urlopen", fake_urlopen)
+    provider = OpenAIPostmortemProvider("openai-secret", model="gpt-review", timeout_seconds=1)
+
+    memo = await provider.review({"kind": "ai_postmortem_input", "window_days": 5})
+
+    assert memo.validation_passed is False
+    assert memo.output["error_type"] == "rate_limited"
+    assert memo.output["http_status"] == 429
+    assert memo.output["retry_after_seconds"] == 120.0
+    assert memo.output["retryable"] is True
+    assert "ai_postmortem_provider_rate_limited" in memo.output["validation_errors"]
+    assert "openai-secret" not in (memo.error or "")
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_retries_rate_limited_provider_once(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _RateLimitedThenValidPostmortemProvider()
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    provider_result = result.pack["provider_results"][0]
+    assert provider.calls == 2
+    assert result.pack["status"] == "completed"
+    assert provider_result["validation_passed"] is True
+    assert provider_result["attempt_count"] == 2
+    assert provider_result["retry_count"] == 1
+    assert provider_result["last_retry_error_type"] == "rate_limited"
+    assert provider_result["last_retry_http_status"] == 429
+    assert provider_result["retry_history"] == [
+        {
+            "attempt": 1,
+            "error_type": "rate_limited",
+            "http_status": 429,
+            "retry_after_seconds": 0.0,
+            "possible_duplicate_paid_request": False,
+        }
+    ]
+    assert result.pack["chargeable_calls"]["after"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_retry_requires_extra_budget_headroom(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=1)
+    provider = _RateLimitedThenValidPostmortemProvider()
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    provider_result = result.pack["provider_results"][0]
+    assert provider.calls == 1
+    assert result.pack["status"] == "invalid"
+    assert provider_result["error_type"] == "rate_limited"
+    assert provider_result["attempt_count"] == 1
+    assert provider_result["retry_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_retry_after_sleep_is_capped(tmp_path, monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("auto_trader.ai_postmortem_review.asyncio.sleep", fake_sleep)
+    settings = _PostmortemSettings(tmp_path, max_calls=2)
+    provider = _RateLimitedThenValidPostmortemProvider(retry_after_seconds=999.0)
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    provider_result = result.pack["provider_results"][0]
+    assert result.pack["status"] == "completed"
+    assert sleeps == [120.0]
+    assert provider_result["last_retry_after_seconds"] == 999.0
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_exhausts_rate_limit_retry_with_clear_artifact(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _AlwaysFailingPostmortemProvider(
+        error_type="rate_limited",
+        http_status=429,
+        retryable=True,
+        retry_after_seconds=0.0,
+        validation_error="ai_postmortem_provider_rate_limited",
+    )
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    provider_result = result.pack["provider_results"][0]
+    assert provider.calls == 2
+    assert result.pack["status"] == "invalid"
+    assert provider_result["validation_passed"] is False
+    assert provider_result["error_type"] == "rate_limited"
+    assert provider_result["http_status"] == 429
+    assert provider_result["retryable"] is True
+    assert provider_result["attempt_count"] == 2
+    assert provider_result["retry_count"] == 1
+    assert "ai_postmortem_provider_rate_limited" in provider_result["validation_errors"]
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_does_not_retry_non_retryable_http_error(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _AlwaysFailingPostmortemProvider(
+        error_type="provider_http_error",
+        http_status=401,
+        retryable=False,
+        validation_error="ai_postmortem_provider_failed",
+    )
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    provider_result = result.pack["provider_results"][0]
+    assert provider.calls == 1
+    assert result.pack["status"] == "invalid"
+    assert provider_result["error_type"] == "provider_http_error"
+    assert provider_result["http_status"] == 401
+    assert provider_result["retryable"] is False
+    assert provider_result["attempt_count"] == 1
+    assert provider_result["retry_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_escalation_retries_rate_limited_reviewer_once(tmp_path):
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = _FakePostmortemProvider()
+    reviewer = _RateLimitedThenValidPostmortemProvider(
+        provider="anthropic",
+        model_tag="anthropic/claude-fable-5",
+    )
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        escalation_provider=reviewer,
+        run_paid=True,
+        confirm_paid_postmortem=True,
+        force_escalation=True,
+        max_escalation_calls=2,
+    )
+
+    escalation = result.pack["escalation_review"]
+    assert reviewer.calls == 2
+    assert escalation["status"] == "completed"
+    assert escalation["provider_result"]["validation_passed"] is True
+    assert escalation["provider_result"]["attempt_count"] == 2
+    assert escalation["provider_result"]["retry_count"] == 1
+    assert escalation["provider_result"]["last_retry_error_type"] == "rate_limited"
+    assert escalation["provider_result"]["last_retry_http_status"] == 429
 
 
 @pytest.mark.asyncio

@@ -9,8 +9,10 @@ import os
 from dataclasses import replace
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -44,6 +46,10 @@ AI_POSTMORTEM_ESCALATION_FAILURE_PROMPT_VERSION = "ai_postmortem_escalation_fail
 MAX_POSTMORTEM_PROMPT_CONTEXT_CHARS = 4_000
 MAX_POSTMORTEM_ESCALATION_CONTEXT_CHARS = 4_000
 MAX_POSTMORTEM_ROWS = 12
+POSTMORTEM_MAX_PROVIDER_ATTEMPTS = 2
+POSTMORTEM_RETRY_BACKOFF_SECONDS = 30.0
+POSTMORTEM_MAX_RETRY_AFTER_SECONDS = 120.0
+POSTMORTEM_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 POSTMORTEM_REAL_PROVIDERS = ("openai", "xai", "anthropic", "gemini", "deepseek")
 POSTMORTEM_INSTRUCTIONS = (
     "You are an advisory trading postmortem analyst. Use only the provided JSON packet. "
@@ -105,6 +111,19 @@ class PostmortemRunResult:
     pack: dict[str, Any]
     path: Path | None
     guidance_refreshed: bool
+
+
+class PostmortemProviderRequestError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 def default_ai_postmortem_path(settings: Any | None = None) -> Path:
@@ -178,6 +197,7 @@ async def run_ai_postmortem_review(
                         packet,
                         evidence_hash,
                         force_paid=force_paid,
+                        max_http_attempts=max(0, daily_limit - used_before),
                     )
                     used_after = await count_ai_postmortem_chargeable_attempts(provider=None, today_utc=True)
                     called = [memo for memo in provider_memos if memo.prompt_version != "ai_postmortem_deduped/v0"]
@@ -426,6 +446,7 @@ class HTTPPostmortemProvider:
                 output=output,
             )
         except Exception as exc:
+            failure_output = _provider_failure_output(exc)
             memo = PostmortemProviderMemo(
                 provider=self.provider,
                 model_tag=self.model_tag,
@@ -433,16 +454,7 @@ class HTTPPostmortemProvider:
                 input_hash=digest,
                 used_only_provided_data=True,
                 validation_passed=False,
-                output={
-                    "used_only_provided_data": True,
-                    "lessons": [],
-                    "edge_hypotheses": [],
-                    "budget_leaks": [],
-                    "provider_notes": [],
-                    "operator_recommendations": [],
-                    "judge_summary": "Provider failed during explicit postmortem review.",
-                    "validation_errors": ["ai_postmortem_provider_failed"],
-                },
+                output=failure_output,
                 error=str(exc),
             )
         return memo
@@ -467,6 +479,14 @@ class HTTPPostmortemProvider:
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            error = f"HTTP Error {exc.code}: {exc.reason}"
+            retry_after = _retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None)
+            raise PostmortemProviderRequestError(
+                error.replace(self.api_key, "[REDACTED]"),
+                status_code=exc.code,
+                retry_after_seconds=retry_after,
+            ) from exc
         except Exception as exc:
             raise RuntimeError(str(exc).replace(self.api_key, "[REDACTED]")) from exc
 
@@ -588,6 +608,69 @@ class GeminiPostmortemProvider(HTTPPostmortemProvider):
             if isinstance(text, str):
                 return _parse_json_text(text)
         raise ValueError("Gemini response did not contain text JSON output")
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            seconds = (retry_at - datetime.now(UTC)).total_seconds()
+        except (TypeError, ValueError):
+            return None
+    return min(max(seconds, 0.0), POSTMORTEM_MAX_RETRY_AFTER_SECONDS)
+
+
+def _provider_failure_output(exc: BaseException | str) -> dict[str, Any]:
+    metadata = _provider_failure_metadata(exc)
+    validation_errors = ["ai_postmortem_provider_failed"]
+    if metadata["error_type"] == "rate_limited":
+        validation_errors.append("ai_postmortem_provider_rate_limited")
+    elif metadata["retryable"]:
+        validation_errors.append("ai_postmortem_provider_retryable_failed")
+    return {
+        "used_only_provided_data": True,
+        "lessons": [],
+        "edge_hypotheses": [],
+        "budget_leaks": [],
+        "provider_notes": [],
+        "operator_recommendations": [],
+        "judge_summary": "Provider failed during explicit postmortem review.",
+        "validation_errors": validation_errors,
+        **metadata,
+    }
+
+
+def _provider_failure_metadata(exc: BaseException | str) -> dict[str, Any]:
+    status_code = getattr(exc, "status_code", None)
+    retry_after = getattr(exc, "retry_after_seconds", None)
+    text = str(exc)
+    lower = text.lower()
+    if status_code is None and "http error 429" in lower:
+        status_code = 429
+    retryable = bool(status_code in POSTMORTEM_RETRYABLE_STATUS_CODES)
+    if status_code == 429:
+        error_type = "rate_limited"
+    elif "timed out" in lower:
+        error_type = "timeout"
+    elif status_code in POSTMORTEM_RETRYABLE_STATUS_CODES:
+        error_type = "retryable_provider_error"
+    elif status_code is not None:
+        error_type = "provider_http_error"
+    else:
+        error_type = "provider_error"
+    return {
+        "error_type": error_type,
+        "http_status": status_code,
+        "retry_after_seconds": retry_after,
+        "retryable": retryable,
+        "possible_duplicate_paid_request": "timed out" in lower,
+    }
 
 
 def postmortem_json_schema(*, strict: bool = True) -> dict[str, Any]:
@@ -837,21 +920,15 @@ async def _maybe_run_postmortem_escalation(
             ),
         }
     else:
-        try:
-            memo = await reviewer.review(
-                escalation_packet,
-                prompt_version=AI_POSTMORTEM_ESCALATION_PROMPT_VERSION,
-                failure_prompt_version=AI_POSTMORTEM_ESCALATION_FAILURE_PROMPT_VERSION,
-                instructions=POSTMORTEM_ESCALATION_INSTRUCTIONS,
-            )
-            memo = replace(memo, input_hash=attempt_hash)
-        except Exception as exc:
-            memo = _failure_memo(
-                reviewer,
-                attempt_hash,
-                str(exc),
-                prompt_version=AI_POSTMORTEM_ESCALATION_FAILURE_PROMPT_VERSION,
-            )
+        memo = await _review_provider_with_retries(
+            reviewer,
+            escalation_packet,
+            prompt_version=AI_POSTMORTEM_ESCALATION_PROMPT_VERSION,
+            failure_prompt_version=AI_POSTMORTEM_ESCALATION_FAILURE_PROMPT_VERSION,
+            instructions=POSTMORTEM_ESCALATION_INSTRUCTIONS,
+            max_attempts=max(1, daily_limit - used_before),
+        )
+        memo = replace(memo, input_hash=attempt_hash)
     await _log_postmortem_memo(memo, escalation_packet)
     used_after = await count_ai_postmortem_escalation_chargeable_attempts(provider=None, today_utc=True)
     return build_postmortem_escalation_review(
@@ -1084,9 +1161,11 @@ async def _run_paid_postmortem_providers(
     evidence_hash: str,
     *,
     force_paid: bool,
+    max_http_attempts: int,
 ) -> list[PostmortemProviderMemo]:
     memos = []
-    for provider in providers:
+    remaining_http_attempts = max(0, max_http_attempts)
+    for index, provider in enumerate(providers):
         attempt_hash = postmortem_attempt_hash(
             evidence_hash=evidence_hash,
             provider=provider.provider,
@@ -1121,14 +1200,103 @@ async def _run_paid_postmortem_providers(
                     )
                 )
                 continue
-        try:
-            memo = await provider.review(packet)
-            memo = replace(memo, input_hash=attempt_hash)
-        except Exception as exc:
-            memo = _failure_memo(provider, attempt_hash, str(exc))
+        providers_after = len(providers) - index - 1
+        max_attempts_for_provider = min(
+            POSTMORTEM_MAX_PROVIDER_ATTEMPTS,
+            max(1, remaining_http_attempts - providers_after),
+        )
+        memo = await _review_provider_with_retries(
+            provider,
+            packet,
+            max_attempts=max_attempts_for_provider,
+        )
+        remaining_http_attempts = max(
+            0,
+            remaining_http_attempts - int(memo.output.get("attempt_count") or 1),
+        )
+        memo = replace(memo, input_hash=attempt_hash)
         await _log_postmortem_memo(memo, packet)
         memos.append(memo)
     return memos
+
+
+async def _review_provider_with_retries(
+    provider: PostmortemProvider,
+    packet: dict[str, Any],
+    *,
+    prompt_version: str = AI_POSTMORTEM_PROMPT_VERSION,
+    failure_prompt_version: str = AI_POSTMORTEM_FAILURE_PROMPT_VERSION,
+    instructions: str = POSTMORTEM_INSTRUCTIONS,
+    max_attempts: int = POSTMORTEM_MAX_PROVIDER_ATTEMPTS,
+) -> PostmortemProviderMemo:
+    packet_hash = postmortem_packet_hash(packet)
+    attempts = 0
+    retry_history: list[dict[str, Any]] = []
+    max_attempts = max(1, min(max_attempts, POSTMORTEM_MAX_PROVIDER_ATTEMPTS))
+    while attempts < max_attempts:
+        attempts += 1
+        try:
+            memo = await provider.review(
+                packet,
+                prompt_version=prompt_version,
+                failure_prompt_version=failure_prompt_version,
+                instructions=instructions,
+            )
+        except Exception as exc:
+            memo = _failure_memo(provider, packet_hash, str(exc), prompt_version=failure_prompt_version)
+        memo = _memo_with_attempt_count(memo, attempts)
+        if memo.validation_passed or not _memo_is_retryable(memo) or attempts >= max_attempts:
+            return _memo_with_retry_history(memo, retry_history)
+        retry_history.append(_retry_history_row(memo, attempts))
+        await asyncio.sleep(_retry_delay_for_memo(memo, attempts))
+    return _memo_with_retry_history(memo, retry_history)
+
+
+def _memo_with_attempt_count(memo: PostmortemProviderMemo, attempts: int) -> PostmortemProviderMemo:
+    output = dict(memo.output)
+    output["attempt_count"] = attempts
+    output["retry_count"] = max(0, attempts - 1)
+    return replace(memo, output=output)
+
+
+def _memo_is_retryable(memo: PostmortemProviderMemo) -> bool:
+    return bool(memo.output.get("retryable"))
+
+
+def _retry_history_row(memo: PostmortemProviderMemo, attempt: int) -> dict[str, Any]:
+    return {
+        "attempt": attempt,
+        "error_type": memo.output.get("error_type"),
+        "http_status": memo.output.get("http_status"),
+        "retry_after_seconds": memo.output.get("retry_after_seconds"),
+        "possible_duplicate_paid_request": bool(memo.output.get("possible_duplicate_paid_request")),
+    }
+
+
+def _memo_with_retry_history(
+    memo: PostmortemProviderMemo,
+    retry_history: list[dict[str, Any]],
+) -> PostmortemProviderMemo:
+    if not retry_history:
+        return memo
+    output = dict(memo.output)
+    output["retry_history"] = list(retry_history)
+    last = retry_history[-1]
+    output["last_retry_error_type"] = last.get("error_type")
+    output["last_retry_http_status"] = last.get("http_status")
+    output["last_retry_after_seconds"] = last.get("retry_after_seconds")
+    output["possible_duplicate_paid_request"] = bool(
+        output.get("possible_duplicate_paid_request")
+        or any(row.get("possible_duplicate_paid_request") for row in retry_history)
+    )
+    return replace(memo, output=output)
+
+
+def _retry_delay_for_memo(memo: PostmortemProviderMemo, attempts: int) -> float:
+    retry_after = memo.output.get("retry_after_seconds")
+    if isinstance(retry_after, int | float):
+        return min(max(float(retry_after), 0.0), POSTMORTEM_MAX_RETRY_AFTER_SECONDS)
+    return min(POSTMORTEM_RETRY_BACKOFF_SECONDS * attempts, POSTMORTEM_MAX_RETRY_AFTER_SECONDS)
 
 
 def postmortem_attempt_hash(*, evidence_hash: str, provider: str, model_tag: str, window_days: int) -> str:
@@ -1156,16 +1324,7 @@ def _failure_memo(
         input_hash=attempt_hash,
         used_only_provided_data=True,
         validation_passed=False,
-        output={
-            "used_only_provided_data": True,
-            "lessons": [],
-            "edge_hypotheses": [],
-            "budget_leaks": [],
-            "provider_notes": [],
-            "operator_recommendations": [],
-            "judge_summary": "Provider failed during explicit postmortem review.",
-            "validation_errors": ["ai_postmortem_provider_failed"],
-        },
+        output=_provider_failure_output(error),
         error=error,
     )
 
@@ -1227,6 +1386,17 @@ def _provider_result(memo: PostmortemProviderMemo) -> dict[str, Any]:
         "validation_passed": memo.validation_passed,
         "used_only_provided_data": memo.used_only_provided_data,
         "validation_errors": memo.output.get("validation_errors", []),
+        "error_type": memo.output.get("error_type"),
+        "http_status": memo.output.get("http_status"),
+        "retryable": memo.output.get("retryable"),
+        "retry_after_seconds": memo.output.get("retry_after_seconds"),
+        "attempt_count": memo.output.get("attempt_count"),
+        "retry_count": memo.output.get("retry_count"),
+        "last_retry_error_type": memo.output.get("last_retry_error_type"),
+        "last_retry_http_status": memo.output.get("last_retry_http_status"),
+        "last_retry_after_seconds": memo.output.get("last_retry_after_seconds"),
+        "possible_duplicate_paid_request": memo.output.get("possible_duplicate_paid_request"),
+        "retry_history": memo.output.get("retry_history", []),
         "error": memo.error,
     }
 
