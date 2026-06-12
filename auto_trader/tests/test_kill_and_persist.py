@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import tempfile
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError
 from zoneinfo import ZoneInfo
@@ -57,8 +58,10 @@ from auto_trader.ai_postmortem_review import (
     AI_POSTMORTEM_PROMPT_VERSION,
     MAX_POSTMORTEM_ESCALATION_CONTEXT_CHARS,
     DeepSeekPostmortemProvider,
+    GeminiPostmortemProvider,
     OpenAIPostmortemProvider,
     PostmortemProviderMemo,
+    PostmortemProviderRequestError,
     build_ai_postmortem_pack,
     build_postmortem_escalation_packet,
     create_postmortem_escalation_provider,
@@ -68,6 +71,7 @@ from auto_trader.ai_postmortem_review import (
     postmortem_packet_hash,
     run_ai_postmortem_review,
     selected_postmortem_providers,
+    _provider_failure_output,
     _maybe_run_postmortem_escalation,
 )
 from auto_trader.ai_entry_gate_rehearsal import run_ai_entry_gate_rehearsal, render_ai_entry_gate_rehearsal
@@ -2035,12 +2039,34 @@ async def test_ai_postmortem_provider_failure_counts_separate_budget(tmp_path):
 @pytest.mark.asyncio
 async def test_postmortem_http_provider_classifies_429(monkeypatch):
     def fake_urlopen(request, timeout):
+        body = json.dumps(
+            {
+                "error": {
+                    "message": "Rate limit reached for gpt-review in organization org-test on tokens per min.",
+                    "type": "tokens",
+                    "code": "rate_limit_exceeded",
+                },
+                "api_key_echo": "openai-secret",
+                "bearer": "Bearer sk-hidden-provider-token",
+                "api_key": "json-hidden-key",
+            }
+        ).encode("utf-8")
         raise HTTPError(
             request.full_url,
             429,
             "Too Many Requests",
-            {"Retry-After": "999"},
-            None,
+            {
+                "Retry-After": "999",
+                "x-ratelimit-limit-tokens": "30000",
+                "x-ratelimit-remaining-tokens": "0",
+                "x-ratelimit-reset-tokens": "1s",
+                "x-request-id": "req_123",
+                "x-api-key-rate-limit": "poisoned-secret",
+                "authorization-rate-limit": "Bearer poisoned-secret",
+                "Authorization": "Bearer openai-secret",
+                "Set-Cookie": "session=do-not-store",
+            },
+            BytesIO(body),
         )
 
     monkeypatch.setattr("auto_trader.ai_postmortem_review.urlopen", fake_urlopen)
@@ -2055,6 +2081,105 @@ async def test_postmortem_http_provider_classifies_429(monkeypatch):
     assert memo.output["retryable"] is True
     assert "ai_postmortem_provider_rate_limited" in memo.output["validation_errors"]
     assert "openai-secret" not in (memo.error or "")
+    assert "tokens per min" in memo.output["provider_response_body"]
+    assert "openai-secret" not in memo.output["provider_response_body"]
+    assert "sk-hidden-provider-token" not in memo.output["provider_response_body"]
+    assert "json-hidden-key" not in memo.output["provider_response_body"]
+    assert "Bearer [REDACTED]" in memo.output["provider_response_body"]
+    assert memo.output["provider_response_headers"] == {
+        "Retry-After": "999",
+        "x-request-id": "req_123",
+    }
+
+
+@pytest.mark.asyncio
+async def test_postmortem_gemini_429_keeps_quota_diagnostics_without_secrets(monkeypatch):
+    def fake_urlopen(request, timeout):
+        body = json.dumps(
+            {
+                "error": {
+                    "code": 429,
+                    "message": "Quota exceeded for quota metric 'Generate requests per minute' and limit 'GenerateContent request limit per minute for a region'.",
+                    "status": "RESOURCE_EXHAUSTED",
+                },
+                "debug_key": "gemini-secret",
+            }
+        ).encode("utf-8")
+        raise HTTPError(
+            request.full_url,
+            429,
+            "Too Many Requests",
+            {
+                "x-goog-request-id": "goog-req-123",
+                "x-quota-limit": "GenerateRequestsPerMinute",
+                "x-quota-location": "us-central1",
+                "set-cookie-quota": "session=do-not-store",
+                "x-goog-api-key": "gemini-secret",
+                "Cookie": "do-not-store",
+            },
+            BytesIO(body),
+        )
+
+    monkeypatch.setattr("auto_trader.ai_postmortem_review.urlopen", fake_urlopen)
+    provider = GeminiPostmortemProvider("gemini-secret", model="gemini-review", timeout_seconds=1)
+
+    memo = await provider.review({"kind": "ai_postmortem_input", "window_days": 5})
+
+    assert memo.validation_passed is False
+    assert memo.output["error_type"] == "rate_limited"
+    assert memo.output["http_status"] == 429
+    assert "Generate requests per minute" in memo.output["provider_response_body"]
+    assert "RESOURCE_EXHAUSTED" in memo.output["provider_response_body"]
+    assert "gemini-secret" not in memo.output["provider_response_body"]
+    assert memo.output["provider_response_headers"] == {
+        "x-goog-request-id": "goog-req-123",
+        "x-quota-limit": "GenerateRequestsPerMinute",
+        "x-quota-location": "us-central1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ai_postmortem_retry_wrapper_preserves_http_error_diagnostics(tmp_path):
+    class RaisingProvider(_FakePostmortemProvider):
+        async def review(self, packet, **kwargs):
+            self.calls += 1
+            raise PostmortemProviderRequestError(
+                "HTTP Error 429: Too Many Requests",
+                status_code=429,
+                retry_after_seconds=0.0,
+                response_body='{"error":"quota exceeded"}',
+                response_headers={"x-quota-limit": "GenerateRequestsPerMinute"},
+            )
+
+    settings = _PostmortemSettings(tmp_path, max_calls=2)
+    provider = RaisingProvider(provider="gemini", model_tag="gemini/gemini-review")
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    provider_result = result.pack["provider_results"][0]
+    assert provider.calls == 2
+    assert provider_result["error_type"] == "rate_limited"
+    assert provider_result["provider_response_body"] == '{"error":"quota exceeded"}'
+    assert provider_result["provider_response_headers"] == {"x-quota-limit": "GenerateRequestsPerMinute"}
+    assert provider_result["retry_history"][0]["http_status"] == 429
+
+
+def test_postmortem_provider_failure_body_is_capped():
+    output = _provider_failure_output(
+        PostmortemProviderRequestError(
+            "HTTP Error 429: Too Many Requests",
+            status_code=429,
+            response_body="x" * 2500,
+        )
+    )
+
+    assert len(output["provider_response_body"]) <= 2012
+    assert output["provider_response_body"].endswith("[truncated]")
 
 
 @pytest.mark.asyncio

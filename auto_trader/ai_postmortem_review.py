@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from dataclasses import replace
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -49,6 +50,8 @@ MAX_POSTMORTEM_ROWS = 12
 POSTMORTEM_MAX_PROVIDER_ATTEMPTS = 2
 POSTMORTEM_RETRY_BACKOFF_SECONDS = 30.0
 POSTMORTEM_MAX_RETRY_AFTER_SECONDS = 120.0
+POSTMORTEM_MAX_HTTP_ERROR_BODY_CHARS = 2_000
+POSTMORTEM_MAX_HTTP_ERROR_HEADERS = 12
 POSTMORTEM_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 POSTMORTEM_REAL_PROVIDERS = ("openai", "xai", "anthropic", "gemini", "deepseek")
 POSTMORTEM_INSTRUCTIONS = (
@@ -120,10 +123,14 @@ class PostmortemProviderRequestError(RuntimeError):
         *,
         status_code: int | None = None,
         retry_after_seconds: float | None = None,
+        response_body: str | None = None,
+        response_headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
+        self.response_body = response_body
+        self.response_headers = response_headers or {}
 
 
 def default_ai_postmortem_path(settings: Any | None = None) -> Path:
@@ -482,10 +489,13 @@ class HTTPPostmortemProvider:
         except HTTPError as exc:
             error = f"HTTP Error {exc.code}: {exc.reason}"
             retry_after = _retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None)
+            response_body = _sanitize_http_error_body(_read_http_error_body(exc), secrets=[self.api_key])
             raise PostmortemProviderRequestError(
                 error.replace(self.api_key, "[REDACTED]"),
                 status_code=exc.code,
                 retry_after_seconds=retry_after,
+                response_body=response_body,
+                response_headers=_diagnostic_http_headers(exc.headers, secrets=[self.api_key]),
             ) from exc
         except Exception as exc:
             raise RuntimeError(str(exc).replace(self.api_key, "[REDACTED]")) from exc
@@ -626,6 +636,94 @@ def _retry_after_seconds(value: str | None) -> float | None:
     return min(max(seconds, 0.0), POSTMORTEM_MAX_RETRY_AFTER_SECONDS)
 
 
+def _read_http_error_body(exc: HTTPError) -> str | None:
+    try:
+        raw = exc.read()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return str(raw)
+
+
+def _sanitize_http_error_body(text: str | None, *, secrets: list[str]) -> str | None:
+    if not text:
+        return None
+    sanitized = _redact_diagnostic_text(text, secrets=secrets)
+    sanitized = sanitized.replace("\x00", "")
+    if len(sanitized) > POSTMORTEM_MAX_HTTP_ERROR_BODY_CHARS:
+        sanitized = sanitized[:POSTMORTEM_MAX_HTTP_ERROR_BODY_CHARS].rstrip() + "\n[truncated]"
+    return sanitized
+
+
+def _diagnostic_http_headers(headers: Any, *, secrets: list[str]) -> dict[str, str]:
+    if not headers:
+        return {}
+    diagnostic: dict[str, str] = {}
+    for key, value in headers.items():
+        name = str(key).strip()
+        normalized = name.lower()
+        if _is_forbidden_http_header(normalized):
+            continue
+        if not _is_diagnostic_http_header(normalized):
+            continue
+        clean_value = _redact_diagnostic_text(str(value), secrets=secrets)
+        diagnostic[name] = clean_value[:500]
+        if len(diagnostic) >= POSTMORTEM_MAX_HTTP_ERROR_HEADERS:
+            break
+    return diagnostic
+
+
+def _redact_diagnostic_text(text: str, *, secrets: list[str]) -> str:
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", redacted)
+    redacted = re.sub(
+        r'(?i)("?(?:api[_-]?key|access[_-]?token|secret|token|key)"?\s*[:=]\s*")([^"]+)(")',
+        r"\1[REDACTED]\3",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)('?(?:api[_-]?key|access[_-]?token|secret|token|key)'?\s*[:=]\s*')([^']+)(')",
+        r"\1[REDACTED]\3",
+        redacted,
+    )
+    return redacted
+
+
+def _is_forbidden_http_header(normalized_name: str) -> bool:
+    forbidden = ("authorization", "cookie", "set-cookie", "api-key", "apikey", "token", "secret", "key")
+    return any(part in normalized_name for part in forbidden)
+
+
+def _is_diagnostic_http_header(normalized_name: str) -> bool:
+    if normalized_name == "retry-after":
+        return True
+    if normalized_name in {
+        "request-id",
+        "x-request-id",
+        "x-goog-request-id",
+        "x-guploader-uploadid",
+        "openai-processing-ms",
+    }:
+        return True
+    return normalized_name.startswith(
+        (
+            "x-ratelimit-",
+            "ratelimit-",
+            "x-rate-limit-",
+            "x-quota-",
+            "quota-",
+            "x-request-cost-",
+        )
+    )
+
+
 def _provider_failure_output(exc: BaseException | str) -> dict[str, Any]:
     metadata = _provider_failure_metadata(exc)
     validation_errors = ["ai_postmortem_provider_failed"]
@@ -649,6 +747,8 @@ def _provider_failure_output(exc: BaseException | str) -> dict[str, Any]:
 def _provider_failure_metadata(exc: BaseException | str) -> dict[str, Any]:
     status_code = getattr(exc, "status_code", None)
     retry_after = getattr(exc, "retry_after_seconds", None)
+    response_body = _sanitize_http_error_body(getattr(exc, "response_body", None), secrets=[])
+    response_headers = _diagnostic_http_headers(getattr(exc, "response_headers", None), secrets=[])
     text = str(exc)
     lower = text.lower()
     if status_code is None and "http error 429" in lower:
@@ -668,6 +768,8 @@ def _provider_failure_metadata(exc: BaseException | str) -> dict[str, Any]:
         "error_type": error_type,
         "http_status": status_code,
         "retry_after_seconds": retry_after,
+        "provider_response_body": response_body,
+        "provider_response_headers": response_headers or {},
         "retryable": retryable,
         "possible_duplicate_paid_request": "timed out" in lower,
     }
@@ -1243,7 +1345,7 @@ async def _review_provider_with_retries(
                 instructions=instructions,
             )
         except Exception as exc:
-            memo = _failure_memo(provider, packet_hash, str(exc), prompt_version=failure_prompt_version)
+            memo = _failure_memo(provider, packet_hash, exc, prompt_version=failure_prompt_version)
         memo = _memo_with_attempt_count(memo, attempts)
         if memo.validation_passed or not _memo_is_retryable(memo) or attempts >= max_attempts:
             return _memo_with_retry_history(memo, retry_history)
@@ -1313,10 +1415,11 @@ def postmortem_attempt_hash(*, evidence_hash: str, provider: str, model_tag: str
 def _failure_memo(
     provider: PostmortemProvider,
     attempt_hash: str,
-    error: str,
+    error: BaseException | str,
     *,
     prompt_version: str = AI_POSTMORTEM_FAILURE_PROMPT_VERSION,
 ) -> PostmortemProviderMemo:
+    error_text = str(error)
     return PostmortemProviderMemo(
         provider=str(getattr(provider, "provider", "unknown")),
         model_tag=str(getattr(provider, "model_tag", "unknown")),
@@ -1325,7 +1428,7 @@ def _failure_memo(
         used_only_provided_data=True,
         validation_passed=False,
         output=_provider_failure_output(error),
-        error=error,
+        error=error_text,
     )
 
 
@@ -1390,6 +1493,8 @@ def _provider_result(memo: PostmortemProviderMemo) -> dict[str, Any]:
         "http_status": memo.output.get("http_status"),
         "retryable": memo.output.get("retryable"),
         "retry_after_seconds": memo.output.get("retry_after_seconds"),
+        "provider_response_body": memo.output.get("provider_response_body"),
+        "provider_response_headers": memo.output.get("provider_response_headers", {}),
         "attempt_count": memo.output.get("attempt_count"),
         "retry_count": memo.output.get("retry_count"),
         "last_retry_error_type": memo.output.get("last_retry_error_type"),
