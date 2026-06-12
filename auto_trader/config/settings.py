@@ -104,10 +104,22 @@ class Settings(BaseSettings):
     ai_postmortem_gemini_model: str = Field("", alias="AI_POSTMORTEM_GEMINI_MODEL")
     ai_postmortem_deepseek_model: str = Field("", alias="AI_POSTMORTEM_DEEPSEEK_MODEL")
     ai_postmortem_max_calls_per_day: int = Field(0, ge=0, alias="AI_POSTMORTEM_MAX_CALLS_PER_DAY")
+    ai_postmortem_timeout_seconds: float = Field(
+        30.0,
+        ge=1.0,
+        le=180.0,
+        alias="AI_POSTMORTEM_TIMEOUT_SECONDS",
+    )
     ai_postmortem_escalation_enabled: bool = Field(False, alias="AI_POSTMORTEM_ESCALATION_ENABLED")
     ai_postmortem_escalation_provider: str = Field("anthropic", alias="AI_POSTMORTEM_ESCALATION_PROVIDER")
     ai_postmortem_escalation_model: str = Field("", alias="AI_POSTMORTEM_ESCALATION_MODEL")
     ai_postmortem_escalation_max_calls_per_day: int = Field(0, ge=0, alias="AI_POSTMORTEM_ESCALATION_MAX_CALLS_PER_DAY")
+    ai_postmortem_escalation_timeout_seconds: float = Field(
+        90.0,
+        ge=1.0,
+        le=300.0,
+        alias="AI_POSTMORTEM_ESCALATION_TIMEOUT_SECONDS",
+    )
     openai_api_key: str | None = Field(None, alias="OPENAI_API_KEY")
     anthropic_api_key: str | None = Field(None, alias="ANTHROPIC_API_KEY")
     xai_api_key: str | None = Field(None, alias="XAI_API_KEY")

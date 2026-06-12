@@ -634,11 +634,23 @@ def create_postmortem_escalation_provider(settings: Any) -> PostmortemProvider:
     model = str(getattr(settings, "ai_postmortem_escalation_model", "") or "").strip()
     if not model:
         raise ValueError("AI_POSTMORTEM_ESCALATION_MODEL is required when escalation runs")
-    return _create_postmortem_provider_with_model(settings, provider, model)
+    timeout_seconds = _postmortem_timeout_seconds(
+        settings,
+        "ai_postmortem_escalation_timeout_seconds",
+        default=90.0,
+    )
+    return _create_postmortem_provider_with_model(settings, provider, model, timeout_seconds=timeout_seconds)
 
 
-def _create_postmortem_provider_with_model(settings: Any, provider: str, model: str) -> PostmortemProvider:
-    timeout_seconds = float(getattr(settings, "ai_research_timeout_seconds", 8.0) or 8.0)
+def _create_postmortem_provider_with_model(
+    settings: Any,
+    provider: str,
+    model: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> PostmortemProvider:
+    if timeout_seconds is None:
+        timeout_seconds = _postmortem_timeout_seconds(settings, "ai_postmortem_timeout_seconds", default=30.0)
     if provider == "openai":
         return OpenAIPostmortemProvider(
             _required_key(settings, "openai_api_key", provider),
@@ -662,6 +674,13 @@ def _create_postmortem_provider_with_model(settings: Any, provider: str, model: 
             timeout_seconds=timeout_seconds,
         )
     raise ValueError(f"unsupported AI_POSTMORTEM_PROVIDER={provider}")
+
+
+def _postmortem_timeout_seconds(settings: Any, attr: str, *, default: float) -> float:
+    try:
+        return float(getattr(settings, attr, default) or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def postmortem_model_for_provider(settings: Any, provider: str) -> str:

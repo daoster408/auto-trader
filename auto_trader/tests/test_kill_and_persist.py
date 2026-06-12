@@ -59,6 +59,7 @@ from auto_trader.ai_postmortem_review import (
     PostmortemProviderMemo,
     build_ai_postmortem_pack,
     build_postmortem_escalation_packet,
+    create_postmortem_escalation_provider,
     create_postmortem_providers,
     postmortem_escalation_attempt_hash,
     postmortem_attempt_hash,
@@ -1599,10 +1600,12 @@ class _PostmortemSettings:
         self.ai_postmortem_anthropic_model = ""
         self.ai_postmortem_gemini_model = ""
         self.ai_postmortem_deepseek_model = ""
+        self.ai_postmortem_timeout_seconds = 30.0
         self.ai_postmortem_escalation_enabled = False
         self.ai_postmortem_escalation_provider = "anthropic"
         self.ai_postmortem_escalation_model = ""
         self.ai_postmortem_escalation_max_calls_per_day = 0
+        self.ai_postmortem_escalation_timeout_seconds = 90.0
         self.openai_api_key = ""
         self.xai_api_key = ""
         self.anthropic_api_key = ""
@@ -1764,6 +1767,9 @@ async def test_ai_postmortem_run_paid_requires_second_confirmation(tmp_path):
 def test_postmortem_provider_list_is_explicit_and_independent_from_live_ai(tmp_path):
     settings = _PostmortemSettings(tmp_path, max_calls=3)
     settings.ai_research_providers = "anthropic,openai,xai"
+    settings.ai_research_timeout_seconds = 4.0
+    settings.ai_postmortem_timeout_seconds = 45.0
+    settings.ai_postmortem_escalation_timeout_seconds = 120.0
     settings.ai_postmortem_providers = ""
 
     assert selected_postmortem_providers(settings) == []
@@ -1779,7 +1785,17 @@ def test_postmortem_provider_list_is_explicit_and_independent_from_live_ai(tmp_p
 
     assert selected_postmortem_providers(settings) == ["gemini", "deepseek"]
     assert [provider.provider for provider in providers] == ["gemini", "deepseek"]
+    assert [provider.timeout_seconds for provider in providers] == [45.0, 45.0]
     assert settings.ai_research_providers == "anthropic,openai,xai"
+
+    settings.ai_postmortem_escalation_model = "claude-fable-5"
+    settings.anthropic_api_key = "anthropic-key"
+    escalation_provider = create_postmortem_escalation_provider(settings)
+
+    assert escalation_provider.provider == "anthropic"
+    assert escalation_provider.model == "claude-fable-5"
+    assert escalation_provider.timeout_seconds == 120.0
+    assert settings.ai_research_timeout_seconds == 4.0
 
 
 def test_deepseek_postmortem_provider_extracts_json_response():
@@ -9366,10 +9382,12 @@ def test_settings_accepts_optional_brain_review_paths():
         AI_POSTMORTEM_GEMINI_MODEL="gemini-pro-review",
         AI_POSTMORTEM_DEEPSEEK_MODEL="deepseek-v4-pro",
         AI_POSTMORTEM_MAX_CALLS_PER_DAY=1,
+        AI_POSTMORTEM_TIMEOUT_SECONDS=45.0,
         AI_POSTMORTEM_ESCALATION_ENABLED=True,
         AI_POSTMORTEM_ESCALATION_PROVIDER="anthropic",
         AI_POSTMORTEM_ESCALATION_MODEL="claude-fable-5",
         AI_POSTMORTEM_ESCALATION_MAX_CALLS_PER_DAY=1,
+        AI_POSTMORTEM_ESCALATION_TIMEOUT_SECONDS=120.0,
         DEEPSEEK_API_KEY="deepseek-key",
     )
 
@@ -9380,10 +9398,32 @@ def test_settings_accepts_optional_brain_review_paths():
     assert settings.ai_postmortem_gemini_model == "gemini-pro-review"
     assert settings.ai_postmortem_deepseek_model == "deepseek-v4-pro"
     assert settings.ai_postmortem_max_calls_per_day == 1
+    assert settings.ai_postmortem_timeout_seconds == 45.0
     assert settings.ai_postmortem_escalation_enabled is True
     assert settings.ai_postmortem_escalation_model == "claude-fable-5"
     assert settings.ai_postmortem_escalation_max_calls_per_day == 1
+    assert settings.ai_postmortem_escalation_timeout_seconds == 120.0
     assert settings.deepseek_api_key == "deepseek-key"
+
+
+def test_settings_rejects_out_of_bounds_postmortem_timeouts():
+    with pytest.raises(ValidationError):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            AI_POSTMORTEM_TIMEOUT_SECONDS=181.0,
+        )
+
+    with pytest.raises(ValidationError):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            AI_POSTMORTEM_ESCALATION_TIMEOUT_SECONDS=301.0,
+        )
 
 
 async def test_brain_guidance_path_from_env_file_writes_and_loads_same_file(tmp_path, monkeypatch):
