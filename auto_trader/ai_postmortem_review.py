@@ -7,13 +7,14 @@ import hashlib
 import json
 import os
 import re
+import socket
 from dataclasses import replace
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -52,6 +53,8 @@ POSTMORTEM_RETRY_BACKOFF_SECONDS = 30.0
 POSTMORTEM_MAX_RETRY_AFTER_SECONDS = 120.0
 POSTMORTEM_MAX_HTTP_ERROR_BODY_CHARS = 2_000
 POSTMORTEM_MAX_HTTP_ERROR_HEADERS = 12
+POSTMORTEM_OPENAI_MAX_OUTPUT_TOKENS = 2_000
+POSTMORTEM_DEEPSEEK_MAX_TOKENS = 2_500
 POSTMORTEM_ANTHROPIC_MAX_TOKENS = 2_000
 POSTMORTEM_ANTHROPIC_ESCALATION_MAX_TOKENS = 3_000
 POSTMORTEM_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -133,6 +136,12 @@ class PostmortemProviderRequestError(RuntimeError):
         self.retry_after_seconds = retry_after_seconds
         self.response_body = response_body
         self.response_headers = response_headers or {}
+
+
+class PostmortemProviderTimeoutError(RuntimeError):
+    def __init__(self, message: str, *, timeout_seconds: float) -> None:
+        super().__init__(message)
+        self.timeout_seconds = timeout_seconds
 
 
 class PostmortemProviderOutputError(RuntimeError):
@@ -515,6 +524,12 @@ class HTTPPostmortemProvider:
                 response_headers=_diagnostic_http_headers(exc.headers, secrets=[self.api_key]),
             ) from exc
         except Exception as exc:
+            if _is_timeout_exception(exc):
+                safe_error = str(exc).replace(self.api_key, "[REDACTED]")
+                raise PostmortemProviderTimeoutError(
+                    f"Provider request timed out after {self.timeout_seconds:g}s: {safe_error}",
+                    timeout_seconds=self.timeout_seconds,
+                ) from exc
             raise RuntimeError(str(exc).replace(self.api_key, "[REDACTED]")) from exc
 
 
@@ -526,6 +541,7 @@ class OpenAIPostmortemProvider(HTTPPostmortemProvider):
             "model": self.model,
             "instructions": instructions,
             "input": postmortem_prompt(packet),
+            "max_output_tokens": POSTMORTEM_OPENAI_MAX_OUTPUT_TOKENS,
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -576,6 +592,7 @@ class DeepSeekPostmortemProvider(XAIPostmortemProvider):
                 {"role": "system", "content": instructions},
                 {"role": "user", "content": postmortem_prompt(packet)},
             ],
+            "max_tokens": POSTMORTEM_DEEPSEEK_MAX_TOKENS,
             "response_format": {"type": "json_object"},
         }
         return self._post_json("https://api.deepseek.com/chat/completions", body, {"Authorization": f"Bearer {self.api_key}"})
@@ -669,6 +686,17 @@ def _retry_after_seconds(value: str | None) -> float | None:
         except (TypeError, ValueError):
             return None
     return min(max(seconds, 0.0), POSTMORTEM_MAX_RETRY_AFTER_SECONDS)
+
+
+def _is_timeout_exception(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError | socket.timeout):
+        return True
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, TimeoutError | socket.timeout):
+            return True
+        return "timed out" in str(reason).lower()
+    return "timed out" in str(exc).lower()
 
 
 def _read_http_error_body(exc: HTTPError) -> str | None:
@@ -790,6 +818,7 @@ def _provider_failure_metadata(exc: BaseException | str) -> dict[str, Any]:
     retry_after = getattr(exc, "retry_after_seconds", None)
     output_error_type = getattr(exc, "output_error_type", None)
     provider_stop_reason = getattr(exc, "provider_stop_reason", None)
+    timeout_seconds = getattr(exc, "timeout_seconds", None)
     response_body = _sanitize_http_error_body(getattr(exc, "response_body", None), secrets=[])
     response_headers = _diagnostic_http_headers(getattr(exc, "response_headers", None), secrets=[])
     text = str(exc)
@@ -806,8 +835,9 @@ def _provider_failure_metadata(exc: BaseException | str) -> dict[str, Any]:
         retryable = False
     elif status_code == 429:
         error_type = "rate_limited"
-    elif "timed out" in lower:
+    elif timeout_seconds is not None or "timed out" in lower:
         error_type = "timeout"
+        retryable = False
     elif status_code in POSTMORTEM_RETRYABLE_STATUS_CODES:
         error_type = "retryable_provider_error"
     elif status_code is not None:
@@ -821,8 +851,14 @@ def _provider_failure_metadata(exc: BaseException | str) -> dict[str, Any]:
         "provider_response_body": response_body,
         "provider_response_headers": response_headers or {},
         "provider_stop_reason": provider_stop_reason,
+        "timeout_seconds": timeout_seconds,
+        "timeout_remediation": (
+            "Raise postmortem timeout or reduce postmortem output size."
+            if error_type == "timeout"
+            else None
+        ),
         "retryable": retryable,
-        "possible_duplicate_paid_request": "timed out" in lower,
+        "possible_duplicate_paid_request": error_type == "timeout",
     }
 
 
@@ -899,7 +935,7 @@ def _create_postmortem_provider_with_model(
     timeout_seconds: float | None = None,
 ) -> PostmortemProvider:
     if timeout_seconds is None:
-        timeout_seconds = _postmortem_timeout_seconds(settings, "ai_postmortem_timeout_seconds", default=30.0)
+        timeout_seconds = _postmortem_timeout_seconds(settings, "ai_postmortem_timeout_seconds", default=90.0)
     if provider == "openai":
         return OpenAIPostmortemProvider(
             _required_key(settings, "openai_api_key", provider),

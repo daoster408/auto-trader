@@ -58,12 +58,15 @@ from auto_trader.ai_postmortem_review import (
     AI_POSTMORTEM_PROMPT_VERSION,
     MAX_POSTMORTEM_ESCALATION_CONTEXT_CHARS,
     POSTMORTEM_ESCALATION_INSTRUCTIONS,
+    POSTMORTEM_DEEPSEEK_MAX_TOKENS,
+    POSTMORTEM_OPENAI_MAX_OUTPUT_TOKENS,
     AnthropicPostmortemProvider,
     DeepSeekPostmortemProvider,
     GeminiPostmortemProvider,
     OpenAIPostmortemProvider,
     PostmortemProviderMemo,
     PostmortemProviderRequestError,
+    PostmortemProviderTimeoutError,
     build_ai_postmortem_pack,
     build_postmortem_escalation_packet,
     create_postmortem_escalation_provider,
@@ -1608,7 +1611,7 @@ class _PostmortemSettings:
         self.ai_postmortem_anthropic_model = ""
         self.ai_postmortem_gemini_model = ""
         self.ai_postmortem_deepseek_model = ""
-        self.ai_postmortem_timeout_seconds = 30.0
+        self.ai_postmortem_timeout_seconds = 90.0
         self.ai_postmortem_escalation_enabled = False
         self.ai_postmortem_escalation_provider = "anthropic"
         self.ai_postmortem_escalation_model = ""
@@ -1943,6 +1946,56 @@ def test_deepseek_postmortem_provider_extracts_json_response():
 
     assert output["used_only_provided_data"] is True
     assert output["lessons"] == ["Cheap outside reviewer found a pattern."]
+
+
+def test_postmortem_provider_requests_include_output_caps():
+    captured = []
+
+    def fake_post(url, body, headers):
+        captured.append((url, body))
+        return {"output": []}
+
+    openai = OpenAIPostmortemProvider("key", model="gpt-review", timeout_seconds=1)
+    deepseek = DeepSeekPostmortemProvider("key", model="deepseek-v4-pro", timeout_seconds=1)
+    openai._post_json = fake_post
+    deepseek._post_json = fake_post
+
+    openai._call_provider({"kind": "ai_postmortem_input"}, "review instructions")
+    deepseek._call_provider({"kind": "ai_postmortem_input"}, "review instructions")
+
+    assert captured[0][0] == "https://api.openai.com/v1/responses"
+    assert captured[0][1]["max_output_tokens"] == POSTMORTEM_OPENAI_MAX_OUTPUT_TOKENS
+    assert captured[1][0] == "https://api.deepseek.com/chat/completions"
+    assert captured[1][1]["max_tokens"] == POSTMORTEM_DEEPSEEK_MAX_TOKENS
+
+
+def test_live_openai_research_request_remains_without_postmortem_output_cap():
+    captured = {}
+    live = OpenAIResearchCommittee("key", model="gpt-live")
+
+    def fake_post(url, body, headers):
+        captured["body"] = body
+        return {"output": []}
+
+    live._post_json = fake_post
+    live._call_provider({"candidate": {"symbol": "POET"}})
+
+    assert "max_output_tokens" not in captured["body"]
+
+
+def test_postmortem_timeout_failure_metadata_is_explicit():
+    output = _provider_failure_output(
+        PostmortemProviderTimeoutError(
+            "Provider request timed out after 90s: timed out",
+            timeout_seconds=90.0,
+        )
+    )
+
+    assert output["error_type"] == "timeout"
+    assert output["timeout_seconds"] == 90.0
+    assert output["timeout_remediation"] == "Raise postmortem timeout or reduce postmortem output size."
+    assert output["retryable"] is False
+    assert output["possible_duplicate_paid_request"] is True
 
 
 @pytest.mark.asyncio
@@ -9945,6 +9998,19 @@ def test_settings_accepts_optional_brain_review_paths():
     assert settings.ai_postmortem_escalation_max_calls_per_day == 1
     assert settings.ai_postmortem_escalation_timeout_seconds == 120.0
     assert settings.deepseek_api_key == "deepseek-key"
+
+
+def test_settings_default_postmortem_timeout_matches_env_example():
+    settings = Settings(
+        ALPACA_API_KEY="key",
+        ALPACA_API_SECRET="secret",
+        TELEGRAM_BOT_TOKEN="token",
+        RESUME_TOKEN="resume",
+    )
+    env_example = Path(".env.example").read_text()
+
+    assert settings.ai_postmortem_timeout_seconds == 90.0
+    assert "AI_POSTMORTEM_TIMEOUT_SECONDS=90" in env_example
 
 
 def test_settings_rejects_out_of_bounds_postmortem_timeouts():

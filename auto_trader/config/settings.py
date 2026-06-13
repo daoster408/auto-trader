@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     ai_postmortem_deepseek_model: str = Field("", alias="AI_POSTMORTEM_DEEPSEEK_MODEL")
     ai_postmortem_max_calls_per_day: int = Field(0, ge=0, alias="AI_POSTMORTEM_MAX_CALLS_PER_DAY")
     ai_postmortem_timeout_seconds: float = Field(
-        30.0,
+        90.0,
         ge=1.0,
         le=180.0,
         alias="AI_POSTMORTEM_TIMEOUT_SECONDS",
