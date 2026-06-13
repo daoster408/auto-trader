@@ -52,6 +52,8 @@ POSTMORTEM_RETRY_BACKOFF_SECONDS = 30.0
 POSTMORTEM_MAX_RETRY_AFTER_SECONDS = 120.0
 POSTMORTEM_MAX_HTTP_ERROR_BODY_CHARS = 2_000
 POSTMORTEM_MAX_HTTP_ERROR_HEADERS = 12
+POSTMORTEM_ANTHROPIC_MAX_TOKENS = 2_000
+POSTMORTEM_ANTHROPIC_ESCALATION_MAX_TOKENS = 3_000
 POSTMORTEM_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 POSTMORTEM_REAL_PROVIDERS = ("openai", "xai", "anthropic", "gemini", "deepseek")
 POSTMORTEM_INSTRUCTIONS = (
@@ -131,6 +133,21 @@ class PostmortemProviderRequestError(RuntimeError):
         self.retry_after_seconds = retry_after_seconds
         self.response_body = response_body
         self.response_headers = response_headers or {}
+
+
+class PostmortemProviderOutputError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str,
+        response_body: str | None = None,
+        provider_stop_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.output_error_type = error_type
+        self.response_body = response_body
+        self.provider_stop_reason = provider_stop_reason
 
 
 def default_ai_postmortem_path(settings: Any | None = None) -> Path:
@@ -568,10 +585,18 @@ class AnthropicPostmortemProvider(HTTPPostmortemProvider):
     provider = "anthropic"
 
     def _call_provider(self, packet: dict[str, Any], instructions: str) -> dict[str, Any]:
+        max_tokens = (
+            POSTMORTEM_ANTHROPIC_ESCALATION_MAX_TOKENS
+            if instructions == POSTMORTEM_ESCALATION_INSTRUCTIONS
+            else POSTMORTEM_ANTHROPIC_MAX_TOKENS
+        )
         body = {
             "model": self.model,
-            "max_tokens": 1200,
-            "system": instructions,
+            "max_tokens": max_tokens,
+            "system": (
+                f"{instructions} Keep every array to at most 4 short strings and "
+                "keep judge_summary under 500 characters."
+            ),
             "messages": [{"role": "user", "content": postmortem_prompt(packet)}],
         }
         return self._post_json(
@@ -581,10 +606,20 @@ class AnthropicPostmortemProvider(HTTPPostmortemProvider):
         )
 
     def _extract_output(self, response: dict[str, Any]) -> dict[str, Any]:
+        stop_reason = response.get("stop_reason")
         for item in response.get("content", []) or []:
             text = item.get("text")
             if isinstance(text, str):
-                return _parse_json_text(text)
+                try:
+                    return _parse_json_text(text)
+                except Exception as exc:
+                    error_type = "truncated_provider_json" if stop_reason == "max_tokens" else "malformed_provider_json"
+                    raise PostmortemProviderOutputError(
+                        f"Anthropic response JSON could not be parsed: {exc}",
+                        error_type=error_type,
+                        response_body=text,
+                        provider_stop_reason=str(stop_reason) if stop_reason is not None else None,
+                    ) from exc
         raise ValueError("Anthropic response did not contain text JSON output")
 
 
@@ -729,6 +764,12 @@ def _provider_failure_output(exc: BaseException | str) -> dict[str, Any]:
     validation_errors = ["ai_postmortem_provider_failed"]
     if metadata["error_type"] == "rate_limited":
         validation_errors.append("ai_postmortem_provider_rate_limited")
+    elif metadata["error_type"] == "model_unavailable":
+        validation_errors.append("ai_postmortem_provider_model_unavailable")
+    elif metadata["error_type"] == "truncated_provider_json":
+        validation_errors.append("ai_postmortem_provider_json_truncated")
+    elif metadata["error_type"] == "malformed_provider_json":
+        validation_errors.append("ai_postmortem_provider_json_malformed")
     elif metadata["retryable"]:
         validation_errors.append("ai_postmortem_provider_retryable_failed")
     return {
@@ -747,14 +788,23 @@ def _provider_failure_output(exc: BaseException | str) -> dict[str, Any]:
 def _provider_failure_metadata(exc: BaseException | str) -> dict[str, Any]:
     status_code = getattr(exc, "status_code", None)
     retry_after = getattr(exc, "retry_after_seconds", None)
+    output_error_type = getattr(exc, "output_error_type", None)
+    provider_stop_reason = getattr(exc, "provider_stop_reason", None)
     response_body = _sanitize_http_error_body(getattr(exc, "response_body", None), secrets=[])
     response_headers = _diagnostic_http_headers(getattr(exc, "response_headers", None), secrets=[])
     text = str(exc)
     lower = text.lower()
+    response_lower = str(response_body or "").lower()
     if status_code is None and "http error 429" in lower:
         status_code = 429
     retryable = bool(status_code in POSTMORTEM_RETRYABLE_STATUS_CODES)
-    if status_code == 429:
+    if status_code == 404 and _response_indicates_model_unavailable(response_lower):
+        error_type = "model_unavailable"
+        retryable = False
+    elif output_error_type in {"malformed_provider_json", "truncated_provider_json"}:
+        error_type = str(output_error_type)
+        retryable = False
+    elif status_code == 429:
         error_type = "rate_limited"
     elif "timed out" in lower:
         error_type = "timeout"
@@ -770,9 +820,23 @@ def _provider_failure_metadata(exc: BaseException | str) -> dict[str, Any]:
         "retry_after_seconds": retry_after,
         "provider_response_body": response_body,
         "provider_response_headers": response_headers or {},
+        "provider_stop_reason": provider_stop_reason,
         "retryable": retryable,
         "possible_duplicate_paid_request": "timed out" in lower,
     }
+
+
+def _response_indicates_model_unavailable(response_lower: str) -> bool:
+    if not response_lower:
+        return False
+    unavailable_markers = (
+        "not available",
+        "not_found_error",
+        "model_not_found",
+        "model unavailable",
+        "does not exist",
+    )
+    return any(marker in response_lower for marker in unavailable_markers)
 
 
 def postmortem_json_schema(*, strict: bool = True) -> dict[str, Any]:
@@ -1495,6 +1559,7 @@ def _provider_result(memo: PostmortemProviderMemo) -> dict[str, Any]:
         "retry_after_seconds": memo.output.get("retry_after_seconds"),
         "provider_response_body": memo.output.get("provider_response_body"),
         "provider_response_headers": memo.output.get("provider_response_headers", {}),
+        "provider_stop_reason": memo.output.get("provider_stop_reason"),
         "attempt_count": memo.output.get("attempt_count"),
         "retry_count": memo.output.get("retry_count"),
         "last_retry_error_type": memo.output.get("last_retry_error_type"),

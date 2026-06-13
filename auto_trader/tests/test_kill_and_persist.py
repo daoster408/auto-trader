@@ -57,6 +57,8 @@ from auto_trader.ai_postmortem_review import (
     AI_POSTMORTEM_ESCALATION_PROMPT_VERSION,
     AI_POSTMORTEM_PROMPT_VERSION,
     MAX_POSTMORTEM_ESCALATION_CONTEXT_CHARS,
+    POSTMORTEM_ESCALATION_INSTRUCTIONS,
+    AnthropicPostmortemProvider,
     DeepSeekPostmortemProvider,
     GeminiPostmortemProvider,
     OpenAIPostmortemProvider,
@@ -2313,6 +2315,121 @@ async def test_ai_postmortem_does_not_retry_non_retryable_http_error(tmp_path):
     assert provider_result["retryable"] is False
     assert provider_result["attempt_count"] == 1
     assert provider_result["retry_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_anthropic_postmortem_model_unavailable_is_non_retryable(tmp_path, monkeypatch):
+    calls = 0
+
+    def fake_urlopen(request, timeout):
+        nonlocal calls
+        calls += 1
+        body = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "not_found_error",
+                    "message": "Claude Fable 5 is not available. Please use Opus 4.8.",
+                },
+                "request_id": "req_fable_unavailable",
+            }
+        ).encode("utf-8")
+        raise HTTPError(
+            request.full_url,
+            404,
+            "Not Found",
+            {"request-id": "req_fable_unavailable"},
+            BytesIO(body),
+        )
+
+    monkeypatch.setattr("auto_trader.ai_postmortem_review.urlopen", fake_urlopen)
+    settings = _PostmortemSettings(tmp_path, max_calls=3)
+    provider = AnthropicPostmortemProvider("anthropic-secret", model="claude-fable-5", timeout_seconds=1)
+
+    result = await run_ai_postmortem_review(
+        settings=settings,
+        providers=[provider],
+        run_paid=True,
+        confirm_paid_postmortem=True,
+    )
+
+    provider_result = result.pack["provider_results"][0]
+    assert calls == 1
+    assert provider_result["error_type"] == "model_unavailable"
+    assert provider_result["http_status"] == 404
+    assert provider_result["retryable"] is False
+    assert provider_result["attempt_count"] == 1
+    assert provider_result["retry_count"] == 0
+    assert "ai_postmortem_provider_model_unavailable" in provider_result["validation_errors"]
+    assert "not available" in provider_result["provider_response_body"]
+    assert provider_result["provider_response_headers"] == {"request-id": "req_fable_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_postmortem_truncated_json_has_clear_artifact():
+    provider = AnthropicPostmortemProvider("anthropic-secret", model="claude-opus-4-8", timeout_seconds=1)
+    provider._post_json = lambda url, body, headers: {
+        "stop_reason": "max_tokens",
+        "content": [
+            {
+                "type": "text",
+                "text": '{"used_only_provided_data": true, "lessons": ["unfinished',
+            }
+        ],
+    }
+
+    memo = await provider.review({"kind": "ai_postmortem_input", "window_days": 5})
+
+    assert memo.validation_passed is False
+    assert memo.output["error_type"] == "truncated_provider_json"
+    assert memo.output["provider_stop_reason"] == "max_tokens"
+    assert "ai_postmortem_provider_json_truncated" in memo.output["validation_errors"]
+    assert "unfinished" in memo.output["provider_response_body"]
+    assert memo.output["retryable"] is False
+
+
+def test_anthropic_postmortem_uses_postmortem_only_token_limits():
+    postmortem = AnthropicPostmortemProvider("key", model="claude-opus-4-8", timeout_seconds=1)
+    captured = []
+
+    def fake_post(url, body, headers):
+        captured.append(body)
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "used_only_provided_data": True,
+                            "lessons": [],
+                            "edge_hypotheses": [],
+                            "budget_leaks": [],
+                            "provider_notes": [],
+                            "operator_recommendations": [],
+                            "judge_summary": "ok",
+                        }
+                    ),
+                }
+            ]
+        }
+
+    postmortem._post_json = fake_post
+    postmortem._call_provider({"kind": "ai_postmortem_input"}, "")
+    postmortem._call_provider({"kind": "ai_postmortem_escalation_input"}, POSTMORTEM_ESCALATION_INSTRUCTIONS)
+
+    live_captured = {}
+    live = AnthropicResearchCommittee("key", model="claude-opus-4-8")
+
+    def fake_live_post(url, body, headers):
+        live_captured["body"] = body
+        return {"content": [{"type": "text", "text": json.dumps({"symbol": "POET"})}]}
+
+    live._post_json = fake_live_post
+    live._call_provider({"candidate": {"symbol": "POET"}})
+
+    assert captured[0]["max_tokens"] > 1200
+    assert captured[1]["max_tokens"] > captured[0]["max_tokens"]
+    assert live_captured["body"]["max_tokens"] == 900
 
 
 @pytest.mark.asyncio
