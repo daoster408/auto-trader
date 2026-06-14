@@ -53,6 +53,7 @@ POSTMORTEM_RETRY_BACKOFF_SECONDS = 30.0
 POSTMORTEM_MAX_RETRY_AFTER_SECONDS = 120.0
 POSTMORTEM_MAX_HTTP_ERROR_BODY_CHARS = 2_000
 POSTMORTEM_MAX_HTTP_ERROR_HEADERS = 12
+POSTMORTEM_MAX_PROVIDER_JSON_SCAN_CHARS = 24_000
 POSTMORTEM_OPENAI_MAX_OUTPUT_TOKENS = 2_000
 POSTMORTEM_DEEPSEEK_MAX_TOKENS = 2_500
 POSTMORTEM_ANTHROPIC_MAX_TOKENS = 2_000
@@ -597,6 +598,33 @@ class DeepSeekPostmortemProvider(XAIPostmortemProvider):
         }
         return self._post_json("https://api.deepseek.com/chat/completions", body, {"Authorization": f"Bearer {self.api_key}"})
 
+    def _extract_output(self, response: dict[str, Any]) -> dict[str, Any]:
+        choices = response.get("choices") or []
+        if not choices:
+            raise ValueError("DeepSeek response did not contain choices")
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        message = choice.get("message") if isinstance(choice, dict) else {}
+        text = _bounded_provider_json_text(
+            _chat_message_content_text(message.get("content") if isinstance(message, dict) else None)
+        )
+        if not text:
+            raise ValueError("DeepSeek response did not contain text JSON output")
+        finish_reason = choice.get("finish_reason") or choice.get("stop_reason")
+        try:
+            return _parse_json_text_or_embedded_object(text)
+        except Exception as exc:
+            error_type = (
+                "truncated_provider_json"
+                if str(finish_reason or "").lower() in {"length", "max_tokens"}
+                else "malformed_provider_json"
+            )
+            raise PostmortemProviderOutputError(
+                f"DeepSeek response JSON could not be parsed: {exc}",
+                error_type=error_type,
+                response_body=text,
+                provider_stop_reason=str(finish_reason) if finish_reason is not None else None,
+            ) from exc
+
 
 class AnthropicPostmortemProvider(HTTPPostmortemProvider):
     provider = "anthropic"
@@ -901,6 +929,75 @@ def postmortem_prompt(packet: dict[str, Any]) -> str:
         "with no wrapper keys and no extra prose.\n\n"
         f"{json.dumps(packet, sort_keys=True, default=str)}"
     )
+
+
+def _chat_message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _parse_json_text_or_embedded_object(text: str) -> dict[str, Any]:
+    text = _bounded_provider_json_text(text)
+    try:
+        return _parse_json_text(text)
+    except Exception as strict_exc:
+        for embedded in _balanced_json_object_candidates(text):
+            try:
+                return _parse_json_text(embedded)
+            except Exception:
+                continue
+        raise strict_exc
+
+
+def _balanced_json_object_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        candidate = _balanced_json_object_from(text, start)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _balanced_json_object_from(text: str, start: int) -> str | None:
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _bounded_provider_json_text(text: str) -> str:
+    if len(text) <= POSTMORTEM_MAX_PROVIDER_JSON_SCAN_CHARS:
+        return text
+    return text[:POSTMORTEM_MAX_PROVIDER_JSON_SCAN_CHARS]
 
 
 def _create_postmortem_provider(settings: Any, provider: str) -> PostmortemProvider:

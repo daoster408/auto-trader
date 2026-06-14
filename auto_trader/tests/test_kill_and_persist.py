@@ -2195,6 +2195,147 @@ def test_deepseek_postmortem_provider_extracts_json_response():
     assert output["lessons"] == ["Cheap outside reviewer found a pattern."]
 
 
+def test_deepseek_postmortem_provider_extracts_embedded_json_response():
+    provider = DeepSeekPostmortemProvider("key", model="deepseek-v4-pro", timeout_seconds=1)
+
+    output = provider._extract_output(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": (
+                            "Here is the JSON:\n```json\n"
+                            + json.dumps(
+                                {
+                                    "used_only_provided_data": True,
+                                    "lessons": ["DeepSeek found JSON despite wrapper text with brace } inside a string."],
+                                    "edge_hypotheses": [],
+                                    "budget_leaks": [],
+                                    "provider_notes": [],
+                                    "operator_recommendations": [],
+                                    "judge_summary": "valid",
+                                }
+                            )
+                            + "\n```\nDone."
+                        )
+                    },
+                }
+            ]
+        }
+    )
+
+    assert output["used_only_provided_data"] is True
+    assert output["lessons"] == ["DeepSeek found JSON despite wrapper text with brace } inside a string."]
+
+
+def test_deepseek_postmortem_provider_skips_non_json_brace_prefix():
+    provider = DeepSeekPostmortemProvider("key", model="deepseek-v4-pro", timeout_seconds=1)
+
+    output = provider._extract_output(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": (
+                            "Diagnostic prefix {not valid json} then "
+                            + json.dumps(
+                                {
+                                    "used_only_provided_data": True,
+                                    "lessons": ["DeepSeek skipped bogus prefix braces."],
+                                    "edge_hypotheses": [],
+                                    "budget_leaks": [],
+                                    "provider_notes": [],
+                                    "operator_recommendations": [],
+                                    "judge_summary": "valid",
+                                }
+                            )
+                        )
+                    },
+                }
+            ]
+        }
+    )
+
+    assert output["lessons"] == ["DeepSeek skipped bogus prefix braces."]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_postmortem_embedded_json_still_requires_schema_validation():
+    provider = DeepSeekPostmortemProvider("deepseek-secret", model="deepseek-v4-pro", timeout_seconds=1)
+    provider._post_json = lambda url, body, headers: {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": (
+                        "json follows: "
+                        + json.dumps(
+                            {
+                                "used_only_provided_data": True,
+                                "lessons": ["syntactically valid but incomplete"],
+                            }
+                        )
+                    ),
+                },
+            }
+        ]
+    }
+
+    memo = await provider.review({"kind": "ai_postmortem_input", "window_days": 5})
+
+    assert memo.validation_passed is False
+    assert memo.output["lessons"] == ["syntactically valid but incomplete"]
+    assert "missing_edge_hypotheses" in memo.output["validation_errors"]
+    assert "missing_judge_summary" in memo.output["validation_errors"]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_postmortem_malformed_json_has_clear_artifact():
+    provider = DeepSeekPostmortemProvider("deepseek-secret", model="deepseek-v4-pro", timeout_seconds=1)
+    provider._post_json = lambda url, body, headers: {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": "not-json {broken"},
+            }
+        ]
+    }
+
+    memo = await provider.review({"kind": "ai_postmortem_input", "window_days": 5})
+
+    assert memo.validation_passed is False
+    assert memo.output["error_type"] == "malformed_provider_json"
+    assert memo.output["provider_stop_reason"] == "stop"
+    assert "ai_postmortem_provider_json_malformed" in memo.output["validation_errors"]
+    assert "not-json" in memo.output["provider_response_body"]
+    assert "deepseek-secret" not in str(memo.output)
+
+
+@pytest.mark.asyncio
+async def test_deepseek_postmortem_truncated_json_has_clear_artifact():
+    provider = DeepSeekPostmortemProvider("deepseek-secret", model="deepseek-v4-pro", timeout_seconds=1)
+    provider._post_json = lambda url, body, headers: {
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {
+                    "content": '{"used_only_provided_data": true, "lessons": ["unfinished',
+                },
+            }
+        ]
+    }
+
+    memo = await provider.review({"kind": "ai_postmortem_input", "window_days": 5})
+
+    assert memo.validation_passed is False
+    assert memo.output["error_type"] == "truncated_provider_json"
+    assert memo.output["provider_stop_reason"] == "length"
+    assert "ai_postmortem_provider_json_truncated" in memo.output["validation_errors"]
+    assert "unfinished" in memo.output["provider_response_body"]
+
+
 def test_postmortem_provider_requests_include_output_caps():
     captured = []
 
