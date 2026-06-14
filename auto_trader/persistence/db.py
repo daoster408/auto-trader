@@ -11,6 +11,7 @@ Wires directly to existing persistence/schema.sql .
 """
 import asyncio
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,10 +34,60 @@ CHARGEABLE_AI_POSTMORTEM_ESCALATION_PROMPT_VERSIONS = (
     "ai_postmortem_escalation/v0",
     "ai_postmortem_escalation_failure/v0",
 )
+EXIT_SIDES = {"sell", "close", "sell_short", "buy_to_cover"}
+ADMINISTRATIVE_EXIT_RATIONALES = {"", "broker_reconciliation", "unknown"}
+AUTO_EXIT_JOURNAL_RE = re.compile(
+    r"Auto-exit submitted for (?P<symbol>[A-Z0-9.\-]+): (?P<reason>[^.]+)\. "
+    r"Order (?P<order_id>[A-Za-z0-9._:\-]+)",
+    re.IGNORECASE,
+)
 
 
 def _utc_iso(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _clean_rationale(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _is_exit_side(side: Any) -> bool:
+    return str(side or "").strip().lower() in EXIT_SIDES
+
+
+def _is_administrative_exit_rationale(value: Any) -> bool:
+    return str(value or "").strip().lower() in ADMINISTRATIVE_EXIT_RATIONALES
+
+
+async def _pending_exit_reason_for_order(
+    db: aiosqlite.Connection,
+    *,
+    symbol: str,
+    client_order_id: str,
+    broker_order_id: str,
+) -> str | None:
+    """Return a pending-exit reason only when the order ID proves the match."""
+    cur = await db.execute(
+        """
+        SELECT reason
+        FROM pending_exits
+        WHERE upper(symbol) = ?
+          AND status = 'pending'
+          AND reason IS NOT NULL
+          AND reason != ''
+          AND (
+                broker_order_id = ?
+             OR client_order_id = ?
+             OR broker_order_id = ?
+             OR client_order_id = ?
+          )
+        LIMIT 1
+        """,
+        (symbol.upper(), broker_order_id, broker_order_id, client_order_id, client_order_id),
+    )
+    row = await cur.fetchone()
+    return _clean_rationale(row["reason"]) if row else None
 
 
 def configure_db_path(path: str | Path) -> None:
@@ -578,12 +629,24 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
     if not client_order_id or not broker_order_id:
         log.warning("order_record_missing_id_skipped", order=order)
         return False
+    symbol = str(order.get("symbol", "")).upper()
+    side = str(order.get("side", ""))
+    resolved_rationale = _clean_rationale(rationale or order.get("rationale"))
 
     async with _DB_LOCK:
         try:
             await init_db()
             db = await _get_conn()
             try:
+                if _is_exit_side(side) and _is_administrative_exit_rationale(resolved_rationale):
+                    pending_reason = await _pending_exit_reason_for_order(
+                        db,
+                        symbol=symbol,
+                        client_order_id=client_order_id,
+                        broker_order_id=broker_order_id,
+                    )
+                    if pending_reason:
+                        resolved_rationale = pending_reason
                 await db.execute(
                     """
                     INSERT INTO orders (
@@ -604,13 +667,24 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
                         submitted_at=COALESCE(excluded.submitted_at, orders.submitted_at),
                         filled_at=COALESCE(excluded.filled_at, orders.filled_at),
                         risk_decision_id=COALESCE(excluded.risk_decision_id, orders.risk_decision_id),
-                        rationale=COALESCE(excluded.rationale, orders.rationale)
+                        rationale=CASE
+                            WHEN excluded.rationale IS NULL OR excluded.rationale = '' THEN orders.rationale
+                            WHEN lower(excluded.rationale) = 'broker_reconciliation'
+                                 AND orders.rationale IS NOT NULL
+                                 AND lower(orders.rationale) NOT IN ('', 'broker_reconciliation', 'unknown')
+                                THEN orders.rationale
+                            WHEN orders.rationale IS NULL
+                                 OR orders.rationale = ''
+                                 OR lower(orders.rationale) IN ('broker_reconciliation', 'unknown')
+                                THEN excluded.rationale
+                            ELSE orders.rationale
+                        END
                     """,
                     (
                         client_order_id,
                         broker_order_id,
-                        str(order.get("symbol", "")).upper(),
-                        str(order.get("side", "")),
+                        symbol,
+                        side,
                         float(order.get("qty") or 0.0),
                         str(order.get("order_type") or "market"),
                         str(order.get("status") or "unknown"),
@@ -619,7 +693,7 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
                         order.get("submitted_at"),
                         order.get("filled_at"),
                         risk_decision_id,
-                        rationale or order.get("rationale"),
+                        resolved_rationale,
                     ),
                 )
                 await db.commit()
@@ -1292,6 +1366,116 @@ async def get_latest_order_records(limit: int = 5) -> list[dict[str, Any]]:
                 await db.close()
         except Exception as e:
             log.error("latest_order_records_failed", error=str(e))
+            raise
+
+
+async def backfill_exit_reasons_from_journal(*, dry_run: bool = True, limit: int | None = None) -> dict[str, Any]:
+    """Repair administrative exit reasons only when a journal order-id match proves the reason."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                limit_clause = "LIMIT ?" if limit is not None else ""
+                params: tuple[Any, ...] = (int(limit),) if limit is not None else ()
+                cur = await db.execute(
+                    f"""
+                    SELECT id, content, created_at
+                    FROM journal_entries
+                    WHERE content LIKE 'Auto-exit submitted for %'
+                    ORDER BY id DESC
+                    {limit_clause}
+                    """,
+                    params,
+                )
+                journal_rows = [dict(row) for row in await cur.fetchall()]
+                updates: list[dict[str, Any]] = []
+                ambiguous: list[dict[str, Any]] = []
+                unmatched: list[dict[str, Any]] = []
+                for journal in journal_rows:
+                    match = AUTO_EXIT_JOURNAL_RE.search(str(journal.get("content") or ""))
+                    if not match:
+                        unmatched.append({"journal_id": journal.get("id"), "reason": "journal_parse_failed"})
+                        continue
+                    symbol = match.group("symbol").upper()
+                    reason = match.group("reason").strip()
+                    order_id = match.group("order_id").strip()
+                    order_cur = await db.execute(
+                        """
+                        SELECT client_order_id, broker_order_id, symbol, side, status, rationale
+                        FROM orders
+                        WHERE upper(symbol) = ?
+                          AND lower(side) IN ('sell', 'close', 'sell_short', 'buy_to_cover')
+                          AND (broker_order_id = ? OR client_order_id = ?)
+                          AND (
+                                rationale IS NULL
+                             OR rationale = ''
+                             OR lower(rationale) IN ('broker_reconciliation', 'unknown')
+                          )
+                        """,
+                        (symbol, order_id, order_id),
+                    )
+                    matches = [dict(row) for row in await order_cur.fetchall()]
+                    if len(matches) == 1:
+                        row = matches[0]
+                        update = {
+                            "journal_id": journal.get("id"),
+                            "symbol": symbol,
+                            "order_id": order_id,
+                            "client_order_id": row.get("client_order_id"),
+                            "broker_order_id": row.get("broker_order_id"),
+                            "old_rationale": row.get("rationale"),
+                            "new_rationale": reason,
+                        }
+                        updates.append(update)
+                        if not dry_run:
+                            await db.execute(
+                                """
+                                UPDATE orders
+                                SET rationale = ?
+                                WHERE client_order_id = ?
+                                  AND (
+                                        rationale IS NULL
+                                     OR rationale = ''
+                                     OR lower(rationale) IN ('broker_reconciliation', 'unknown')
+                                  )
+                                """,
+                                (reason, row.get("client_order_id")),
+                            )
+                    elif len(matches) > 1:
+                        ambiguous.append({"journal_id": journal.get("id"), "symbol": symbol, "order_id": order_id, "matches": len(matches)})
+                    else:
+                        unmatched.append({"journal_id": journal.get("id"), "symbol": symbol, "order_id": order_id})
+                if not dry_run and updates:
+                    now_date = datetime.now(UTC).date().isoformat()
+                    await db.execute(
+                        """
+                        INSERT INTO journal_entries (date, kind, content)
+                        VALUES (?, 'daily', ?)
+                        """,
+                        (
+                            now_date,
+                            (
+                                "Exit reason backfill applied: "
+                                f"{len(updates)} order row(s) repaired from exact auto-exit journal order-id matches."
+                            ),
+                        ),
+                    )
+                if not dry_run:
+                    await db.commit()
+                return {
+                    "dry_run": dry_run,
+                    "journal_entries_scanned": len(journal_rows),
+                    "updates": updates,
+                    "updated_count": len(updates) if not dry_run else 0,
+                    "would_update_count": len(updates),
+                    "ambiguous": ambiguous,
+                    "unmatched": unmatched,
+                }
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("exit_reason_backfill_failed", error=str(e))
             raise
 
 

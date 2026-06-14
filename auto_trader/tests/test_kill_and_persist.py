@@ -120,6 +120,7 @@ from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_s
 from auto_trader.scheduler.trading_supervisor import AIResearchRunResult, TradingSupervisor, _position_stagnation_features
 from auto_trader.persistence.db import (
     append_journal_entry,
+    backfill_exit_reasons_from_journal,
     consume_planned_maintenance_shutdown,
     clear_pending_exit,
     configure_db_path,
@@ -792,6 +793,236 @@ async def test_halted_state_survives_real_restart():
         # Simulate full restart: new process loads from disk
         restored, _ = await load_system_state()
         assert restored == SystemState.HALTED, "HALTED must survive real DB roundtrip"
+
+
+@pytest.mark.asyncio
+async def test_reconciled_exit_order_uses_matching_pending_exit_reason(tmp_path):
+    configure_db_path(tmp_path / "exit_reason_pending.db")
+    await init_db()
+
+    await upsert_pending_exit(
+        "FMDE",
+        {
+            "client_order_id": "close-fmde-client",
+            "broker_order_id": "close-fmde-broker",
+            "symbol": "FMDE",
+            "qty": 1.0,
+        },
+        reason="position stagnation exit",
+    )
+
+    await upsert_order_record(
+        {
+            "client_order_id": "close-fmde-client",
+            "broker_order_id": "close-fmde-broker",
+            "symbol": "FMDE",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 11.0,
+            "rationale": "broker_reconciliation",
+        }
+    )
+
+    orders = await get_latest_order_records(limit=1)
+
+    assert orders[0]["rationale"] == "position stagnation exit"
+
+
+@pytest.mark.asyncio
+async def test_closed_trade_evidence_uses_preserved_pending_exit_reason(tmp_path):
+    configure_db_path(tmp_path / "exit_reason_edge.db")
+    await init_db()
+    now = datetime.now(UTC)
+
+    await upsert_order_record(
+        {
+            "client_order_id": "entry-fmde",
+            "broker_order_id": "entry-fmde",
+            "symbol": "FMDE",
+            "side": "buy",
+            "qty": 1.0,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 10.0,
+            "submitted_at": (now - timedelta(hours=2)).isoformat(),
+            "filled_at": (now - timedelta(hours=2) + timedelta(seconds=1)).isoformat(),
+            "rationale": "entry",
+        }
+    )
+    await upsert_pending_exit(
+        "FMDE",
+        {
+            "client_order_id": "close-fmde",
+            "broker_order_id": "close-fmde",
+            "symbol": "FMDE",
+            "qty": 1.0,
+        },
+        reason="position stagnation exit",
+    )
+    await upsert_order_record(
+        {
+            "client_order_id": "close-fmde",
+            "broker_order_id": "close-fmde",
+            "symbol": "FMDE",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 11.0,
+            "submitted_at": (now - timedelta(hours=1)).isoformat(),
+            "filled_at": (now - timedelta(hours=1) + timedelta(seconds=1)).isoformat(),
+            "rationale": "broker_reconciliation",
+        }
+    )
+
+    report = await build_edge_report(window_days=7)
+
+    assert len(report.closed_trades) == 1
+    assert report.closed_trades[0].exit_reason == "position stagnation exit"
+
+
+@pytest.mark.asyncio
+async def test_reconciled_exit_order_keeps_administrative_reason_without_proof(tmp_path):
+    configure_db_path(tmp_path / "exit_reason_unknown.db")
+    await init_db()
+
+    await upsert_order_record(
+        {
+            "client_order_id": "external-close",
+            "broker_order_id": "external-close",
+            "symbol": "UVXY",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 9.0,
+            "rationale": "broker_reconciliation",
+        }
+    )
+
+    orders = await get_latest_order_records(limit=1)
+
+    assert orders[0]["rationale"] == "broker_reconciliation"
+
+
+@pytest.mark.asyncio
+async def test_real_exit_reason_is_not_overwritten_by_later_reconciliation(tmp_path):
+    configure_db_path(tmp_path / "exit_reason_no_clobber.db")
+    await init_db()
+
+    order = {
+        "client_order_id": "close-profit",
+        "broker_order_id": "close-profit",
+        "symbol": "CLOV",
+        "side": "sell",
+        "qty": 1.0,
+        "status": "accepted",
+        "filled_qty": 0.0,
+        "rationale": "position take profit reached",
+    }
+    await upsert_order_record(order)
+    await upsert_order_record(
+        {
+            **order,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 12.0,
+            "rationale": "broker_reconciliation",
+        }
+    )
+
+    orders = await get_latest_order_records(limit=1)
+
+    assert orders[0]["status"] == "filled"
+    assert orders[0]["rationale"] == "position take profit reached"
+
+
+@pytest.mark.asyncio
+async def test_exit_reason_backfill_repairs_only_journal_order_id_matches(tmp_path):
+    configure_db_path(tmp_path / "exit_reason_backfill.db")
+    await init_db()
+
+    await upsert_order_record(
+        {
+            "client_order_id": "close-fmde",
+            "broker_order_id": "close-fmde",
+            "symbol": "FMDE",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 11.0,
+            "rationale": "broker_reconciliation",
+        }
+    )
+    await upsert_order_record(
+        {
+            "client_order_id": "external-imax",
+            "broker_order_id": "external-imax",
+            "symbol": "IMAX",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 20.0,
+            "rationale": "broker_reconciliation",
+        }
+    )
+    await upsert_order_record(
+        {
+            "client_order_id": "ambiguous-one",
+            "broker_order_id": "ambiguous-broker-id",
+            "symbol": "KSS",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 17.0,
+            "rationale": "broker_reconciliation",
+        }
+    )
+    await upsert_order_record(
+        {
+            "client_order_id": "ambiguous-two",
+            "broker_order_id": "ambiguous-broker-id",
+            "symbol": "KSS",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 17.0,
+            "rationale": "broker_reconciliation",
+        }
+    )
+    await append_journal_entry(
+        content="Auto-exit submitted for FMDE: position stagnation exit. Order close-fmde; qty 1.0; status filled; metrics {}."
+    )
+    await append_journal_entry(
+        content="Auto-exit submitted for IMAX: position take profit reached. Order missing-order; qty 1.0; status filled; metrics {}."
+    )
+    await append_journal_entry(
+        content="Auto-exit submitted for KSS: position take profit reached. Order ambiguous-broker-id; qty 1.0; status filled; metrics {}."
+    )
+
+    dry_run = await backfill_exit_reasons_from_journal(dry_run=True)
+    applied = await backfill_exit_reasons_from_journal(dry_run=False)
+    second_apply = await backfill_exit_reasons_from_journal(dry_run=False)
+    orders = await get_latest_order_records(limit=5)
+    journal_entries = await get_latest_journal_entries(limit=1)
+    by_symbol = {order["symbol"]: order for order in orders}
+
+    assert dry_run["would_update_count"] == 1
+    assert dry_run["updated_count"] == 0
+    assert dry_run["ambiguous"] == [{"journal_id": 3, "symbol": "KSS", "order_id": "ambiguous-broker-id", "matches": 2}]
+    assert applied["updated_count"] == 1
+    assert second_apply["updated_count"] == 0
+    assert second_apply["would_update_count"] == 0
+    assert by_symbol["FMDE"]["rationale"] == "position stagnation exit"
+    assert by_symbol["IMAX"]["rationale"] == "broker_reconciliation"
+    assert by_symbol["KSS"]["rationale"] == "broker_reconciliation"
+    assert "Exit reason backfill applied: 1 order row(s)" in journal_entries[0]["content"]
 
 
 @pytest.mark.asyncio
