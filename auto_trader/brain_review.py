@@ -28,6 +28,7 @@ from auto_trader.utils.logging import setup_logging
 
 BRAIN_REVIEW_KIND = "brain_review_pack"
 BRAIN_GUIDANCE_KIND = "brain_guidance_pack"
+PATTERN_MEMORY_VERSION = "postmortem_edge_memory/v2"
 BRAIN_REVIEW_WINDOWS = {"weekly": 5, "monthly": 21, "quarterly": 63}
 
 
@@ -150,11 +151,13 @@ def build_brain_guidance_pack(
         "advisory_only": True,
         "order_authority": "RiskEngine",
         "config_authority": "operator_only",
+        "active_memory_version": PATTERN_MEMORY_VERSION,
         "source_labels": [str(pack.get("label")) for pack in review_packs],
         "reviews": [_compact_review_for_guidance(pack) for pack in review_packs],
     }
     if postmortem_pack:
         pack["ai_postmortem"] = _compact_postmortem_for_guidance(postmortem_pack)
+    pack["pattern_memory"] = _build_pattern_memory_v2(review_packs, postmortem_pack=postmortem_pack)
     pack["prompt_context"] = render_brain_guidance_prompt_context(pack)
     return pack
 
@@ -278,6 +281,9 @@ def render_brain_guidance_prompt_context(pack: dict[str, Any]) -> str:
         "Use this to press better setups and reduce wasted research, not to default to passivity.",
         "Do not change config, sizing, orders, limits, or RiskEngine behavior.",
     ]
+    pattern_memory = pack.get("pattern_memory")
+    if isinstance(pattern_memory, dict) and pattern_memory.get("version") == PATTERN_MEMORY_VERSION:
+        lines.extend(_pattern_memory_v2_lines(pattern_memory))
     for review in pack.get("reviews") if isinstance(pack.get("reviews"), list) else []:
         if not isinstance(review, dict):
             continue
@@ -317,6 +323,98 @@ def render_brain_guidance_prompt_context(pack: dict[str, Any]) -> str:
                     lines.append(f"- reviewer note: {note}")
     lines.append("If review context conflicts with the current packet, explain the conflict and judge the current packet.")
     return "\n".join(lines)
+
+
+def _build_pattern_memory_v2(
+    review_packs: list[dict[str, Any]],
+    *,
+    postmortem_pack: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create compact active pattern memory for live AI committee prompts."""
+    winning_patterns: list[dict[str, Any]] = []
+    weak_patterns: list[dict[str, Any]] = []
+    provider_strengths: list[dict[str, Any]] = []
+    provider_weaknesses: list[dict[str, Any]] = []
+    sample_warnings: list[str] = []
+
+    for pack in review_packs:
+        if not isinstance(pack, dict):
+            continue
+        label = str(pack.get("label") or "review")
+        sample = str(pack.get("sample_label") or "thin")
+        closed_trade_count = int(float(pack.get("closed_trade_count") or 0))
+        if sample in {"empty", "opportunity_only", "thin"}:
+            sample_warnings.append(
+                f"{label}: sample={sample}, closed_trades={closed_trade_count}; treat patterns as pressure, not proof."
+            )
+        for row in _bounded_dict_list(pack.get("observed_edge_amplifiers"), limit=3):
+            bucket = _pattern_bucket(row, label=label, action="approve_pressure")
+            if bucket:
+                winning_patterns.append(bucket)
+        for row in _bounded_dict_list(pack.get("deprioritize"), limit=3):
+            bucket = _pattern_bucket(row, label=label, action="demand_current_evidence")
+            if bucket:
+                weak_patterns.append(bucket)
+        for row in _bounded_dict_list(pack.get("provider_behavior"), limit=6):
+            bucket = _pattern_bucket(row, label=label, action="provider_memory")
+            if not bucket:
+                continue
+            if float(bucket.get("expectancy") or 0.0) > 0:
+                provider_strengths.append(bucket)
+            elif float(bucket.get("expectancy") or 0.0) < 0:
+                provider_weaknesses.append(bucket)
+
+    candidate_guidance: list[dict[str, Any]] = []
+    for row in winning_patterns[:4]:
+        candidate_guidance.append(
+            {
+                "pattern": row["key"],
+                "action": "approve_pressure",
+                "reason": _bounded_text(
+                    f"Candidate matching `{row['key']}` should receive positive edge pressure when current data confirms it."
+                ),
+                "source": row["source"],
+                "sample": row["sample"],
+            }
+        )
+    for row in weak_patterns[:4]:
+        candidate_guidance.append(
+            {
+                "pattern": row["key"],
+                "action": "demand_current_evidence",
+                "reason": _bounded_text(
+                    f"Candidate matching `{row['key']}` needs stronger current volume/news/price evidence before approval."
+                ),
+                "source": row["source"],
+                "sample": row["sample"],
+            }
+        )
+    if not candidate_guidance:
+        candidate_guidance.append(
+            {
+                "pattern": "no_active_v2_pattern",
+                "action": "neutral",
+                "reason": "No reliable V2 pattern bucket is available; judge the current verified packet directly.",
+                "source": "brain_guidance",
+                "sample": "empty",
+            }
+        )
+
+    postmortem = _compact_postmortem_for_guidance(postmortem_pack) if postmortem_pack else {}
+    return {
+        "version": PATTERN_MEMORY_VERSION,
+        "advisory_only": True,
+        "order_authority": "RiskEngine",
+        "config_authority": "operator_only",
+        "winning_patterns": winning_patterns[:6],
+        "weak_patterns": weak_patterns[:6],
+        "provider_strengths": provider_strengths[:5],
+        "provider_weaknesses": provider_weaknesses[:5],
+        "candidate_guidance": candidate_guidance[:8],
+        "sample_warnings": _bounded_text_list(sample_warnings, limit=5),
+        "postmortem_lessons": _bounded_text_list(postmortem.get("distilled_lessons"), limit=4),
+        "postmortem_edge_hypotheses": _bounded_text_list(postmortem.get("edge_hypotheses"), limit=4),
+    }
 
 
 def _observed_market_dates(rows: dict[str, list[dict[str, Any]]]) -> list[date]:
@@ -462,6 +560,56 @@ def _compact_postmortem_for_guidance(pack: dict[str, Any]) -> dict[str, Any]:
             "operator_recommendations": _bounded_dict_list(escalation.get("operator_recommendations"), limit=2),
         }
     return compact
+
+
+def _pattern_memory_v2_lines(pattern_memory: dict[str, Any]) -> list[str]:
+    lines = [
+        f"ACTIVE PATTERN MEMORY: {PATTERN_MEMORY_VERSION}",
+        "Compare the current candidate against these buckets before verdict; current verified data still wins.",
+        "Candidate guidance:",
+    ]
+    guidance = _bounded_dict_list(pattern_memory.get("candidate_guidance"), limit=6)
+    lines.extend(
+        [
+            f"- {row.get('action')}: {row.get('pattern')} ({row.get('source')}, sample={row.get('sample')})"
+            for row in guidance
+        ]
+        or ["- neutral: no active pattern guidance yet"]
+    )
+    lines.append("Provider memory:")
+    strengths = _bounded_dict_list(pattern_memory.get("provider_strengths"), limit=3)
+    weaknesses = _bounded_dict_list(pattern_memory.get("provider_weaknesses"), limit=3)
+    lines.extend([f"- strength: {_compact_row_line(row)} source={row.get('source')}" for row in strengths])
+    lines.extend([f"- weakness: {_compact_row_line(row)} source={row.get('source')}" for row in weaknesses])
+    if not strengths and not weaknesses:
+        lines.append("- no provider pattern memory yet")
+    warnings = _bounded_text_list(pattern_memory.get("sample_warnings"), limit=3)
+    if warnings:
+        lines.append("Sample warnings:")
+        lines.extend([f"- {warning}" for warning in warnings])
+    return lines
+
+
+def _pattern_bucket(row: dict[str, Any], *, label: str, action: str) -> dict[str, Any] | None:
+    key = str(row.get("key") or "").strip()
+    if not key:
+        return None
+    count = int(float(row.get("n") or 0))
+    sample = str(row.get("sample") or ("thin" if count < 3 else "building"))
+    return {
+        "key": key[:120],
+        "source": label[:40],
+        "action": action,
+        "n": count,
+        "sample": sample[:40],
+        "realized_pnl": round(float(row.get("realized_pnl") or 0.0), 4),
+        "expectancy": round(float(row.get("expectancy") or 0.0), 4),
+        "win_rate": round(float(row.get("win_rate") or 0.0), 2),
+    }
+
+
+def _bounded_text(value: Any, *, limit: int = 500) -> str:
+    return " ".join(str(value or "").split())[:limit]
 
 
 def _bounded_text_list(value: Any, *, limit: int) -> list[str]:

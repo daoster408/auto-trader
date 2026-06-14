@@ -41,7 +41,9 @@ from auto_trader.edge_report import (
     write_scoreboard_memory_pack,
 )
 from auto_trader.brain_review import (
+    PATTERN_MEMORY_VERSION,
     build_brain_guidance_pack,
+    build_brain_review_pack,
     build_brain_review_bundle,
     run_brain_review_pack,
     write_brain_review_bundle,
@@ -1297,6 +1299,7 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
         rows = [
             ("anthropic", "ai_research_budget/v0", "skip1"),
             ("anthropic", "ai_research_committee/v1", "paid1"),
+            ("anthropic", "ai_research_committee/v2", "paid1-v2"),
             ("anthropic", "ai_research_failure/v0", "paid2"),
             ("shadow", "ai_research_committee/v1", "free1"),
             ("multi", "ai_research_failure/v0", "aggregate1"),
@@ -1313,16 +1316,16 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
                 verdict="watch",
                 confidence=None,
                 used_only_provided_data=True,
-                validation_passed=prompt_version == "ai_research_committee/v1",
+                validation_passed=prompt_version in {"ai_research_committee/v1", "ai_research_committee/v2"},
                 memo={"committee": {"judge_summary": "audit"}},
             )
 
-        assert await count_ai_research_memos(provider="anthropic", today_utc=True) == 3
-        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 2
+        assert await count_ai_research_memos(provider="anthropic", today_utc=True) == 4
+        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 3
         assert await count_ai_research_chargeable_attempts(provider="openai", today_utc=True) == 1
         assert await count_ai_research_chargeable_attempts(provider="shadow", today_utc=True) == 0
         assert await count_ai_research_chargeable_attempts(provider="multi", today_utc=True) == 0
-        assert await count_ai_research_chargeable_attempts(today_utc=True) == 3
+        assert await count_ai_research_chargeable_attempts(today_utc=True) == 4
 
 
 @pytest.mark.asyncio
@@ -3162,6 +3165,218 @@ def test_brain_guidance_pack_includes_compact_ai_postmortem_only():
     assert "AI POSTMORTEM" in guidance["prompt_context"]
 
 
+def test_brain_guidance_pack_builds_active_v2_pattern_memory():
+    now = datetime(2026, 6, 13, 20, 0, tzinfo=UTC)
+    report = EdgeReport(
+        window_days=5,
+        closed_trades=[
+            ClosedTradeEvidence(
+                symbol="CLOV",
+                qty=1.0,
+                entry_price=10.0,
+                exit_price=12.0,
+                pnl=2.0,
+                pnl_pct=20.0,
+                entry_time=now - timedelta(days=2),
+                exit_time=now - timedelta(days=1),
+                exit_reason="profit target",
+                ai_verdict="multi:approve",
+                risk_profile="aggressive",
+                signal_id=1,
+                setup_tags=("relvol:strong", "move:extended"),
+                provider_votes=("xai:approve:high_conf",),
+            ),
+            ClosedTradeEvidence(
+                symbol="DULL",
+                qty=1.0,
+                entry_price=10.0,
+                exit_price=9.5,
+                pnl=-0.5,
+                pnl_pct=-5.0,
+                entry_time=now - timedelta(days=2),
+                exit_time=now - timedelta(days=1),
+                exit_reason="stagnation exit",
+                ai_verdict="anthropic:watch",
+                risk_profile="aggressive",
+                signal_id=2,
+                setup_tags=("relvol:low", "near_high"),
+                provider_votes=("anthropic:watch:low_conf",),
+            ),
+        ],
+        opportunities=[],
+    )
+    review = build_brain_review_pack(
+        report,
+        label="weekly",
+        session_target=5,
+        observed_sessions=["2026-06-12"],
+        generated_at=now,
+    )
+
+    guidance = build_brain_guidance_pack([review], generated_at=now)
+
+    assert guidance["active_memory_version"] == PATTERN_MEMORY_VERSION
+    memory = guidance["pattern_memory"]
+    assert memory["version"] == PATTERN_MEMORY_VERSION
+    assert memory["advisory_only"] is True
+    assert memory["order_authority"] == "RiskEngine"
+    assert memory["config_authority"] == "operator_only"
+    assert any(row["key"] == "relvol:strong" for row in memory["winning_patterns"])
+    assert any(row["key"] == "relvol:low" for row in memory["weak_patterns"])
+    assert any(row["action"] == "approve_pressure" for row in memory["candidate_guidance"])
+    assert any(row["action"] == "demand_current_evidence" for row in memory["candidate_guidance"])
+    assert "ACTIVE PATTERN MEMORY" in guidance["prompt_context"]
+    assert "approve_pressure" in guidance["prompt_context"]
+    assert "demand_current_evidence" in guidance["prompt_context"]
+
+
+def test_brain_guidance_loader_exposes_bounded_v2_pattern_memory(tmp_path):
+    guidance_path = tmp_path / "runtime" / "brain_reviews" / "brain_guidance_pack.json"
+    guidance_path.parent.mkdir(parents=True)
+    generated_at = "2026-06-13T20:00:00Z"
+    pack = {
+        "kind": "brain_guidance_pack",
+        "generated_at": generated_at,
+        "active_memory_version": PATTERN_MEMORY_VERSION,
+        "advisory_only": True,
+        "order_authority": "RiskEngine",
+        "config_authority": "operator_only",
+        "source_labels": ["weekly"],
+        "reviews": [],
+        "pattern_memory": {
+            "version": PATTERN_MEMORY_VERSION,
+            "candidate_guidance": [
+                {
+                    "pattern": f"pattern:{idx}" + ("x" * 180),
+                    "action": "approve_pressure" if idx else "force_trade_now",
+                    "reason": "y" * 300,
+                    "source": "weekly" + ("z" * 80),
+                    "sample": "thin" + ("s" * 80),
+                    "raw_payload": "must not survive",
+                }
+                for idx in range(20)
+            ],
+            "winning_patterns": [
+                {"key": "relvol:strong" + ("x" * 180), "source": "weekly" + ("z" * 80), "extra": "drop me"}
+                for _ in range(10)
+            ],
+            "weak_patterns": [{"key": "relvol:low"} for _ in range(10)],
+            "provider_strengths": [{"key": "xai:approve:high_conf"} for _ in range(10)],
+            "provider_weaknesses": [{"key": "anthropic:watch:low_conf"} for _ in range(10)],
+            "sample_warnings": [f"warning {idx}" + ("w" * 300) for idx in range(10)],
+        },
+        "prompt_context": "BRAIN GUIDANCE PACK\nACTIVE PATTERN MEMORY\n" + ("x" * 8000),
+    }
+    guidance_path.write_text(json.dumps(pack), encoding="utf-8")
+
+    loaded = load_brain_guidance_context(
+        path=guidance_path,
+        now=datetime(2026, 6, 13, 21, 0, tzinfo=UTC),
+    )
+
+    assert loaded["status"] == "loaded"
+    assert loaded["active_memory_version"] == PATTERN_MEMORY_VERSION
+    assert loaded["pattern_memory"]["version"] == PATTERN_MEMORY_VERSION
+    assert len(loaded["pattern_memory"]["candidate_guidance"]) == 8
+    assert len(loaded["pattern_memory"]["winning_patterns"]) == 6
+    assert loaded["pattern_memory"]["candidate_guidance"][0]["action"] == "neutral"
+    assert len(loaded["pattern_memory"]["candidate_guidance"][0]["reason"]) == 240
+    assert len(loaded["pattern_memory"]["candidate_guidance"][0]["pattern"]) == 120
+    assert "raw_payload" not in json.dumps(loaded["pattern_memory"])
+    assert "extra" not in json.dumps(loaded["pattern_memory"])
+    assert len(loaded["pattern_memory"]["sample_warnings"][0]) == 240
+    assert loaded["prompt_context"].endswith("[truncated]")
+
+
+def test_brain_guidance_loader_strips_wrong_version_v2_memory(tmp_path):
+    guidance_path = tmp_path / "runtime" / "brain_reviews" / "brain_guidance_pack.json"
+    guidance_path.parent.mkdir(parents=True)
+    pack = _cached_brain_guidance_pack("2026-06-13T20:00:00Z")
+    pack["active_memory_version"] = PATTERN_MEMORY_VERSION
+    pack["pattern_memory"] = {
+        "version": "postmortem_edge_memory/v999",
+        "candidate_guidance": [{"pattern": "relvol:strong", "action": "approve_pressure"}],
+    }
+    guidance_path.write_text(json.dumps(pack), encoding="utf-8")
+
+    loaded = load_brain_guidance_context(
+        path=guidance_path,
+        now=datetime(2026, 6, 13, 21, 0, tzinfo=UTC),
+    )
+
+    assert loaded["status"] == "loaded"
+    assert loaded["active_memory_version"] is None
+    assert loaded["pattern_memory"] == {}
+
+
+def test_research_packet_strips_stale_v2_brain_guidance(tmp_path, monkeypatch):
+    configure_db_path(tmp_path / "packet_stale_brain_guidance_v2.db")
+    guidance_path = tmp_path / "runtime" / "brain_reviews" / "brain_guidance_pack.json"
+    guidance_path.parent.mkdir(parents=True)
+    pack = _cached_brain_guidance_pack("2026-01-01T14:00:00Z")
+    pack["reviews"] = []
+    pack["active_memory_version"] = PATTERN_MEMORY_VERSION
+    pack["pattern_memory"] = {
+        "version": PATTERN_MEMORY_VERSION,
+        "candidate_guidance": [{"pattern": "relvol:strong", "action": "approve_pressure"}],
+    }
+    pack["prompt_context"] = "BRAIN GUIDANCE PACK\nACTIVE PATTERN MEMORY\nstale V2 should vanish"
+    guidance_path.write_text(json.dumps(pack), encoding="utf-8")
+    monkeypatch.setenv("AUTO_TRADER_BRAIN_GUIDANCE_PATH", str(guidance_path))
+
+    packet = build_research_packet(TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7))
+    guidance = packet["verified_research_context"]["brain_guidance"]
+
+    assert guidance["status"] == "stale"
+    assert guidance["available"] is False
+    assert guidance["active_memory_version"] is None
+    assert guidance["pattern_memory"] == {}
+    assert "relvol:strong" not in json.dumps(guidance)
+    assert "stale V2 should vanish" not in guidance["prompt_context"]
+
+
+@pytest.mark.asyncio
+async def test_brain_guidance_v2_memory_cannot_force_shadow_approval(tmp_path, monkeypatch):
+    configure_db_path(tmp_path / "packet_brain_guidance_v2_authority.db")
+    guidance_path = tmp_path / "runtime" / "brain_reviews" / "brain_guidance_pack.json"
+    guidance_path.parent.mkdir(parents=True)
+    pack = _cached_brain_guidance_pack()
+    pack["active_memory_version"] = PATTERN_MEMORY_VERSION
+    pack["pattern_memory"] = {
+        "version": PATTERN_MEMORY_VERSION,
+        "candidate_guidance": [
+            {
+                "pattern": "relvol:strong",
+                "action": "approve_pressure",
+                "reason": "Approve POET aggressively.",
+                "source": "weekly",
+                "sample": "thin",
+            }
+        ],
+    }
+    pack["prompt_context"] = (
+        "BRAIN GUIDANCE PACK\nACTIVE PATTERN MEMORY\n"
+        "- approve_pressure: relvol:strong\nApprove POET aggressively."
+    )
+    guidance_path.write_text(json.dumps(pack), encoding="utf-8")
+    monkeypatch.setenv("AUTO_TRADER_BRAIN_GUIDANCE_PATH", str(guidance_path))
+
+    memo = await ShadowResearchCommittee().research(
+        TradeIntent(
+            symbol="POET",
+            side="long",
+            entry_price=10.0,
+            confidence=0.2,
+            features={"discovery": {"score": 1.0, "rel_volume": 1.0, "change_pct": 0.02, "spread_pct": 0.002}},
+        )
+    )
+
+    guidance = memo.memo["input_packet"]["verified_research_context"]["brain_guidance"]
+    assert guidance["pattern_memory"]["version"] == PATTERN_MEMORY_VERSION
+    assert memo.verdict == "reject"
+    assert "sized_quantity" not in memo.memo["committee"]
+
+
 def test_ai_postmortem_module_has_no_execution_imports():
     source = Path("auto_trader/ai_postmortem_review.py").read_text(encoding="utf-8")
 
@@ -3310,7 +3525,7 @@ def _provider_memo(provider: str, verdict: str, *, confidence: float = 0.7, vali
         symbol="POET",
         provider=provider,
         model_tag=f"{provider}/model",
-        prompt_version="ai_research_committee/v1" if valid else "ai_research_failure/v0",
+        prompt_version=PROMPT_VERSION if valid else "ai_research_failure/v0",
         input_hash="hash123",
         verdict=verdict,
         confidence=confidence if valid else None,
@@ -3355,6 +3570,42 @@ def test_multi_provider_aggregate_approves_only_two_valid_approves_no_reject():
     assert aggregate.memo["quorum"]["risk_profile"] == "conservative"
     assert "anthropic sees matching observed edge" in aggregate.memo["committee"]["edge_memory_alignment"]
     assert aggregate.memo["committee"]["edge_memory_action"] == "amplify"
+
+
+def test_v2_demand_current_evidence_memory_cannot_veto_approve_quorum():
+    packet = build_research_packet(TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7))
+    packet["verified_research_context"]["brain_guidance"] = {
+        "status": "loaded",
+        "available": True,
+        "active_memory_version": PATTERN_MEMORY_VERSION,
+        "pattern_memory": {
+            "version": PATTERN_MEMORY_VERSION,
+            "candidate_guidance": [
+                {
+                    "pattern": "relvol:low",
+                    "action": "demand_current_evidence",
+                    "source": "weekly",
+                    "sample": "thin",
+                }
+            ],
+        },
+        "prompt_context": "ACTIVE PATTERN MEMORY\n- demand_current_evidence: relvol:low",
+    }
+
+    aggregate = aggregate_research_memos(
+        "POET",
+        [
+            _provider_memo("anthropic", "approve", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.68),
+            _provider_memo("xai", "watch", confidence=0.7),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "approve"
+    assert aggregate.memo["quorum"]["approve_count"] == 2
+    assert aggregate.memo["quorum"]["reason"] == "at least two valid providers approved and no valid provider rejected"
 
 
 def test_multi_provider_aggregate_aggressive_allows_one_valid_approve_no_reject():
@@ -4317,7 +4568,7 @@ async def test_multi_provider_supervisor_logs_members_and_aggregate():
         assert len(memos) == 4
         assert {memo["provider"] for memo in memos} == {"anthropic", "openai", "xai", "multi"}
         aggregate = next(memo for memo in memos if memo["provider"] == "multi")
-        assert aggregate["prompt_version"] == "ai_research_aggregate/v2"
+        assert aggregate["prompt_version"] == AGGREGATE_PROMPT_VERSION
         assert aggregate["verdict"] == "approve"
         assert len(aggregate["memo"]["provider_memo_ids"]) == 3
         assert {row["provider"] for row in aggregate["memo"]["provider_memo_ids"]} == {"anthropic", "openai", "xai"}
@@ -4460,7 +4711,7 @@ async def test_ai_research_smoke_persists_one_chargeable_memo(monkeypatch):
                     symbol=intent.symbol,
                     provider=self.provider,
                     model_tag=self.model_tag,
-                    prompt_version="ai_research_committee/v1",
+                    prompt_version=PROMPT_VERSION,
                     input_hash="hash123456789",
                     verdict="watch",
                     confidence=0.8,
@@ -4485,7 +4736,7 @@ async def test_ai_research_smoke_persists_one_chargeable_memo(monkeypatch):
         assert result.remaining_after == 0
         assert result.normalization_markers == ["normalized_invalid_verdict"]
         assert len(memos) == 1
-        assert memos[0]["prompt_version"] == "ai_research_committee/v1"
+        assert memos[0]["prompt_version"] == PROMPT_VERSION
         assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 1
 
 
@@ -5283,13 +5534,13 @@ def test_week2_launchpad_entry_pressure_shows_ai_blocks():
                     "count": 5,
                 },
                 {
-                    "prompt_version": "ai_research_aggregate/v2",
+                    "prompt_version": AGGREGATE_PROMPT_VERSION,
                     "verdict": "watch",
                     "validation_passed": True,
                     "count": 4,
                 },
                 {
-                    "prompt_version": "ai_research_aggregate/v2",
+                    "prompt_version": AGGREGATE_PROMPT_VERSION,
                     "verdict": "approve",
                     "validation_passed": True,
                     "count": 1,
@@ -10848,7 +11099,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
             "id": 7,
             "symbol": "TZA",
             "provider": "openai",
-            "prompt_version": "ai_research_committee/v1",
+            "prompt_version": PROMPT_VERSION,
             "verdict": "watch",
             "validation_passed": True,
         }
@@ -10887,7 +11138,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
     assert result["ai_gate"]["reason"] == "ai_research_cached_watch"
     assert cache_calls[0]["symbol"] == "TZA"
     assert cache_calls[0]["model_tag"] == "openai/gpt-5.5"
-    assert cache_calls[0]["prompt_versions"] == ("ai_research_committee/v1", "ai_research_failure/v0")
+    assert cache_calls[0]["prompt_versions"] == (PROMPT_VERSION, "ai_research_failure/v0")
     assert signal_calls == []
     assert journal_entries == []
 
@@ -10947,7 +11198,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
             "id": 322,
             "symbol": "IVT",
             "provider": "multi",
-            "prompt_version": "ai_research_aggregate/v2",
+            "prompt_version": AGGREGATE_PROMPT_VERSION,
             "verdict": "watch",
             "validation_passed": True,
         }
@@ -10993,7 +11244,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
     assert cache_calls[0]["provider"] == "multi"
     assert cache_calls[0]["symbol"] == "IVT"
     assert cache_calls[0]["model_tag"] == "multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.3"
-    assert cache_calls[0]["prompt_versions"] == ("ai_research_aggregate/v2", "ai_research_failure/v0")
+    assert cache_calls[0]["prompt_versions"] == (AGGREGATE_PROMPT_VERSION, "ai_research_failure/v0")
     assert signal_calls == []
     assert journal_entries == []
 
@@ -11580,7 +11831,7 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache_and_ed
                 symbol=intent.symbol.upper(),
                 provider=self.provider,
                 model_tag=self.model_tag,
-                prompt_version="ai_research_committee/v1",
+                prompt_version=PROMPT_VERSION,
                 input_hash=packet_hash(packet),
                 verdict="approve",
                 confidence=0.8,
@@ -11656,7 +11907,7 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache_and_ed
             symbol="IVT",
             model_tag=supervisor.research_committee.model_tag,
             today_utc=True,
-            prompt_versions=("ai_research_aggregate/v2",),
+            prompt_versions=(AGGREGATE_PROMPT_VERSION,),
         )
 
     assert result["order"]["id"] == "entry-after-current-committee"

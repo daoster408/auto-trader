@@ -22,8 +22,8 @@ from auto_trader.utils.logging import get_logger
 
 log = get_logger("auto_trader.intelligence.ai_committee")
 
-PROMPT_VERSION = "ai_research_committee/v1"
-AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v2"
+PROMPT_VERSION = "ai_research_committee/v2"
+AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v3"
 VALID_VERDICTS = {"approve", "reject", "watch"}
 REAL_PROVIDERS = ("openai", "xai", "anthropic", "gemini")
 MIN_APPROVE_CONFIDENCE = 0.65
@@ -31,9 +31,11 @@ EDGE_MEMORY_ACTIONS = {"amplify", "neutral", "conflict_review", "memory_unavaila
 COMMITTEE_INSTRUCTIONS = (
     "You are an advisory trading research committee. Use only the provided JSON packet. "
     "Do not invent market facts. Do not recommend order size. Use any loaded "
-    "scoreboard_memory and brain_guidance as advisory observed-edge context only; "
+    "scoreboard_memory and brain_guidance/pattern_memory_v2 as advisory observed-edge context only; "
     "current verified candidate data has priority, and stale/missing memory is never "
-    "a standalone reason to approve or reject. Return only valid JSON. "
+    "a standalone reason to approve or reject. When pattern_memory_v2 is available, compare the "
+    "candidate to winning_patterns, weak_patterns, provider_strengths/provider_weaknesses, and "
+    "candidate_guidance before setting edge_memory_* fields. Return only valid JSON. "
     "Return exactly one top-level JSON object with these keys only: symbol, verdict, "
     "confidence, used_only_provided_data, bull_case, bear_case, edge_memory_alignment, "
     "edge_memory_conflicts, edge_memory_action, judge_summary. edge_memory_action must be "
@@ -328,7 +330,7 @@ def committee_prompt(packet: dict[str, Any]) -> str:
     return (
         "Review this verified candidate packet. Return exactly the required JSON object, "
         "with no wrapper keys and no extra prose. For edge_memory_alignment, state which "
-        "loaded observed-edge/postmortem patterns this candidate confirms. For "
+        "loaded observed-edge/postmortem/pattern_memory_v2 buckets this candidate confirms. For "
         "edge_memory_conflicts, state which loaded patterns argue against it. For "
         "edge_memory_action, return exactly one advisory label: amplify, neutral, "
         "conflict_review, memory_unavailable, or defer_to_current_packet; do not change "
