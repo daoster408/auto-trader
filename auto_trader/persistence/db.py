@@ -25,7 +25,11 @@ log = get_logger("auto_trader.persistence.db")
 
 _DB_PATH: Path = Path("auto_trader.db")
 _DB_LOCK = asyncio.Lock()  # single writer guarantee (simple & cheap for v1)
-CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = ("ai_research_committee/v0", "ai_research_failure/v0")
+CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = (
+    "ai_research_committee/v0",
+    "ai_research_committee/v1",
+    "ai_research_failure/v0",
+)
 CHARGEABLE_AI_POSTMORTEM_PROMPT_VERSIONS = (
     "ai_postmortem_review/v0",
     "ai_postmortem_failure/v0",

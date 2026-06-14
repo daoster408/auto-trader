@@ -95,14 +95,17 @@ from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.ai_committee import (
     AnthropicResearchCommittee,
+    AGGREGATE_PROMPT_VERSION,
     GeminiResearchCommittee,
     MultiProviderResearchCommittee,
     OpenAIResearchCommittee,
+    PROMPT_VERSION,
     ResearchMemo,
     ShadowResearchCommittee,
     XAIResearchCommittee,
     aggregate_research_memos,
     build_research_packet,
+    committee_json_schema,
     committee_prompt,
     normalize_committee_output,
     packet_hash,
@@ -1191,7 +1194,7 @@ async def test_ai_research_memo_persistence_roundtrip():
             symbol="POET",
             provider="shadow",
             model_tag="shadow_ai_committee/v0",
-            prompt_version="ai_research_committee/v0",
+            prompt_version="ai_research_committee/v1",
             input_hash="abc123",
             verdict="watch",
             confidence=0.66,
@@ -1222,7 +1225,7 @@ async def test_latest_ai_research_memo_for_symbol_filters_provider_symbol_and_da
             symbol="TZA",
             provider="anthropic",
             model_tag="anthropic/claude-opus-4-8",
-            prompt_version="ai_research_committee/v0",
+            prompt_version="ai_research_committee/v1",
             input_hash="first",
             verdict="watch",
             confidence=0.5,
@@ -1235,7 +1238,7 @@ async def test_latest_ai_research_memo_for_symbol_filters_provider_symbol_and_da
             symbol="TZA",
             provider="anthropic",
             model_tag="anthropic/claude-opus-4-8",
-            prompt_version="ai_research_committee/v0",
+            prompt_version="ai_research_committee/v1",
             input_hash="second",
             verdict="approve",
             confidence=0.8,
@@ -1248,7 +1251,7 @@ async def test_latest_ai_research_memo_for_symbol_filters_provider_symbol_and_da
             symbol="TZA",
             provider="openai",
             model_tag="openai/gpt-5.5",
-            prompt_version="ai_research_committee/v0",
+            prompt_version="ai_research_committee/v1",
             input_hash="third",
             verdict="reject",
             confidence=0.9,
@@ -1261,7 +1264,7 @@ async def test_latest_ai_research_memo_for_symbol_filters_provider_symbol_and_da
             symbol="TZA",
             provider="anthropic",
             model_tag="anthropic/new-model",
-            prompt_version="ai_research_committee/v0",
+            prompt_version="ai_research_committee/v1",
             input_hash="fourth",
             verdict="reject",
             confidence=0.9,
@@ -1275,7 +1278,7 @@ async def test_latest_ai_research_memo_for_symbol_filters_provider_symbol_and_da
             symbol="tza",
             model_tag="anthropic/claude-opus-4-8",
             today_utc=True,
-            prompt_versions=("ai_research_committee/v0",),
+            prompt_versions=("ai_research_committee/v1",),
         )
 
         assert latest is not None
@@ -1293,11 +1296,11 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
 
         rows = [
             ("anthropic", "ai_research_budget/v0", "skip1"),
-            ("anthropic", "ai_research_committee/v0", "paid1"),
+            ("anthropic", "ai_research_committee/v1", "paid1"),
             ("anthropic", "ai_research_failure/v0", "paid2"),
-            ("shadow", "ai_research_committee/v0", "free1"),
+            ("shadow", "ai_research_committee/v1", "free1"),
             ("multi", "ai_research_failure/v0", "aggregate1"),
-            ("openai", "ai_research_committee/v0", "paid3"),
+            ("openai", "ai_research_committee/v1", "paid3"),
         ]
         for provider, prompt_version, input_hash in rows:
             await log_ai_research_memo(
@@ -1310,7 +1313,7 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
                 verdict="watch",
                 confidence=None,
                 used_only_provided_data=True,
-                validation_passed=prompt_version == "ai_research_committee/v0",
+                validation_passed=prompt_version == "ai_research_committee/v1",
                 memo={"committee": {"judge_summary": "audit"}},
             )
 
@@ -1346,7 +1349,7 @@ async def test_shadow_research_committee_validates_advisory_memo():
 
     assert memo.symbol == "POET"
     assert memo.provider == "shadow"
-    assert memo.prompt_version == "ai_research_committee/v0"
+    assert memo.prompt_version == PROMPT_VERSION
     assert memo.verdict == "approve"
     assert memo.used_only_provided_data is True
     assert memo.validation_passed is True
@@ -1509,6 +1512,19 @@ def test_research_packet_includes_cached_scoreboard_memory(tmp_path, monkeypatch
     memory["path"] = "/different/machine/path.json"
     memory["age_seconds"] = 12345
     assert packet_hash(packet) == first_hash
+
+
+def test_committee_schema_requires_postmortem_edge_bias_fields():
+    schema = committee_json_schema(strict=True)
+    required = set(schema["required"])
+    prompt = committee_prompt({"candidate": {"symbol": "POET"}})
+
+    assert {"edge_memory_alignment", "edge_memory_conflicts", "edge_memory_action"} <= required
+    assert schema["properties"]["edge_memory_alignment"]["type"] == "string"
+    assert "amplify" in schema["properties"]["edge_memory_action"]["enum"]
+    assert "conflict_review" in schema["properties"]["edge_memory_action"]["enum"]
+    assert "edge_memory_alignment" in prompt
+    assert "edge_memory_action" in prompt
 
 
 def test_research_packet_missing_scoreboard_memory_is_non_blocking(tmp_path, monkeypatch):
@@ -3059,7 +3075,30 @@ def test_ai_committee_validator_rejects_missing_required_fields():
     assert "missing_confidence" in errors
     assert "missing_bull_case" in errors
     assert "missing_bear_case" in errors
+    assert "missing_edge_memory_alignment" in errors
+    assert "missing_edge_memory_conflicts" in errors
+    assert "missing_edge_memory_action" in errors
     assert "missing_judge_summary" in errors
+
+
+def test_ai_committee_validator_rejects_missing_postmortem_edge_bias_fields():
+    valid, errors = validate_committee_output(
+        "SPCE",
+        {
+            "symbol": "SPCE",
+            "verdict": "watch",
+            "confidence": 0.55,
+            "used_only_provided_data": True,
+            "bull_case": "Provided packet shows momentum.",
+            "bear_case": "Catalyst is unverified.",
+            "judge_summary": "Watch only.",
+        },
+    )
+
+    assert valid is False
+    assert "missing_edge_memory_alignment" in errors
+    assert "missing_edge_memory_conflicts" in errors
+    assert "missing_edge_memory_action" in errors
 
 
 def test_research_committee_factory_wires_real_providers_and_requires_keys():
@@ -3130,7 +3169,7 @@ def _provider_memo(provider: str, verdict: str, *, confidence: float = 0.7, vali
         symbol="POET",
         provider=provider,
         model_tag=f"{provider}/model",
-        prompt_version="ai_research_committee/v0" if valid else "ai_research_failure/v0",
+        prompt_version="ai_research_committee/v1" if valid else "ai_research_failure/v0",
         input_hash="hash123",
         verdict=verdict,
         confidence=confidence if valid else None,
@@ -3144,6 +3183,9 @@ def _provider_memo(provider: str, verdict: str, *, confidence: float = 0.7, vali
                 "used_only_provided_data": True,
                 "bull_case": f"{provider} bull",
                 "bear_case": f"{provider} bear",
+                "edge_memory_alignment": f"{provider} sees matching observed edge.",
+                "edge_memory_conflicts": f"{provider} sees no decisive memory conflict.",
+                "edge_memory_action": "amplify",
                 "judge_summary": f"{provider} summary",
                 "validation_errors": [] if valid else ["ai_research_provider_failed"],
             }
@@ -3165,11 +3207,13 @@ def test_multi_provider_aggregate_approves_only_two_valid_approves_no_reject():
     )
 
     assert aggregate.provider == "multi"
-    assert aggregate.prompt_version == "ai_research_aggregate/v1"
+    assert aggregate.prompt_version == AGGREGATE_PROMPT_VERSION
     assert aggregate.verdict == "approve"
     assert aggregate.validation_passed is True
     assert aggregate.memo["quorum"]["approve_count"] == 2
     assert aggregate.memo["quorum"]["risk_profile"] == "conservative"
+    assert "anthropic sees matching observed edge" in aggregate.memo["committee"]["edge_memory_alignment"]
+    assert aggregate.memo["committee"]["edge_memory_action"] == "amplify"
 
 
 def test_multi_provider_aggregate_aggressive_allows_one_valid_approve_no_reject():
@@ -3368,6 +3412,9 @@ def test_real_provider_extractors_parse_structured_json():
         "used_only_provided_data": True,
         "bull_case": "Provided packet shows constructive momentum.",
         "bear_case": "Catalyst is unverified.",
+        "edge_memory_alignment": "Candidate resembles the observed strong relative-volume winner cluster.",
+        "edge_memory_conflicts": "Memory sample is thin and catalyst evidence is limited.",
+        "edge_memory_action": "amplify",
         "judge_summary": "Watch only.",
     }
     text = json.dumps(payload)
@@ -3403,6 +3450,9 @@ def _opus_nested_committee_output(**committee_overrides):
                 "Modest dollar volume may widen realized execution slippage.",
                 "Chasing an extended move increases reversal risk.",
             ],
+            "edge_memory_alignment": "Matches observed hot relative-volume edge.",
+            "edge_memory_conflicts": "Thin sample and missing catalyst context still conflict.",
+            "edge_memory_action": "amplify",
         },
         "data_limitations": [
             "No historical price context.",
@@ -3428,6 +3478,9 @@ def test_normalizes_opus_nested_shape_but_requires_explicit_provided_data():
     assert normalized["used_only_provided_data"] is False
     assert "Positive intraday momentum" in normalized["bull_case"]
     assert "No historical price context" in normalized["bear_case"]
+    assert "hot relative-volume edge" in normalized["edge_memory_alignment"]
+    assert "Thin sample" in normalized["edge_memory_conflicts"]
+    assert normalized["edge_memory_action"] == "amplify"
     assert "advisory research only" in normalized["judge_summary"]
     assert "normalized_missing_verdict" in normalized["normalization_errors"]
     assert valid is False
@@ -3522,6 +3575,9 @@ def test_anthropic_prompt_requires_exact_schema_without_wrapper_keys():
         "used_only_provided_data": True,
         "bull_case": "Provided packet shows momentum.",
         "bear_case": "Catalyst is unverified.",
+        "edge_memory_alignment": "Candidate matches no proven edge cluster yet.",
+        "edge_memory_conflicts": "Observed memory is too thin for decisive support.",
+        "edge_memory_action": "neutral",
         "judge_summary": "Watch only.",
     }
     packet = {"candidate": {"symbol": "SPCE"}}
@@ -4120,7 +4176,7 @@ async def test_multi_provider_supervisor_logs_members_and_aggregate():
         assert len(memos) == 4
         assert {memo["provider"] for memo in memos} == {"anthropic", "openai", "xai", "multi"}
         aggregate = next(memo for memo in memos if memo["provider"] == "multi")
-        assert aggregate["prompt_version"] == "ai_research_aggregate/v1"
+        assert aggregate["prompt_version"] == "ai_research_aggregate/v2"
         assert aggregate["verdict"] == "approve"
         assert len(aggregate["memo"]["provider_memo_ids"]) == 3
         assert {row["provider"] for row in aggregate["memo"]["provider_memo_ids"]} == {"anthropic", "openai", "xai"}
@@ -4263,7 +4319,7 @@ async def test_ai_research_smoke_persists_one_chargeable_memo(monkeypatch):
                     symbol=intent.symbol,
                     provider=self.provider,
                     model_tag=self.model_tag,
-                    prompt_version="ai_research_committee/v0",
+                    prompt_version="ai_research_committee/v1",
                     input_hash="hash123456789",
                     verdict="watch",
                     confidence=0.8,
@@ -4288,7 +4344,7 @@ async def test_ai_research_smoke_persists_one_chargeable_memo(monkeypatch):
         assert result.remaining_after == 0
         assert result.normalization_markers == ["normalized_invalid_verdict"]
         assert len(memos) == 1
-        assert memos[0]["prompt_version"] == "ai_research_committee/v0"
+        assert memos[0]["prompt_version"] == "ai_research_committee/v1"
         assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 1
 
 
@@ -5086,13 +5142,13 @@ def test_week2_launchpad_entry_pressure_shows_ai_blocks():
                     "count": 5,
                 },
                 {
-                    "prompt_version": "ai_research_aggregate/v1",
+                    "prompt_version": "ai_research_aggregate/v2",
                     "verdict": "watch",
                     "validation_passed": True,
                     "count": 4,
                 },
                 {
-                    "prompt_version": "ai_research_aggregate/v1",
+                    "prompt_version": "ai_research_aggregate/v2",
                     "verdict": "approve",
                     "validation_passed": True,
                     "count": 1,
@@ -10651,7 +10707,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
             "id": 7,
             "symbol": "TZA",
             "provider": "openai",
-            "prompt_version": "ai_research_committee/v0",
+            "prompt_version": "ai_research_committee/v1",
             "verdict": "watch",
             "validation_passed": True,
         }
@@ -10690,7 +10746,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
     assert result["ai_gate"]["reason"] == "ai_research_cached_watch"
     assert cache_calls[0]["symbol"] == "TZA"
     assert cache_calls[0]["model_tag"] == "openai/gpt-5.5"
-    assert cache_calls[0]["prompt_versions"] == ("ai_research_committee/v0", "ai_research_failure/v0")
+    assert cache_calls[0]["prompt_versions"] == ("ai_research_committee/v1", "ai_research_failure/v0")
     assert signal_calls == []
     assert journal_entries == []
 
@@ -10750,7 +10806,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
             "id": 322,
             "symbol": "IVT",
             "provider": "multi",
-            "prompt_version": "ai_research_aggregate/v1",
+            "prompt_version": "ai_research_aggregate/v2",
             "verdict": "watch",
             "validation_passed": True,
         }
@@ -10796,7 +10852,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
     assert cache_calls[0]["provider"] == "multi"
     assert cache_calls[0]["symbol"] == "IVT"
     assert cache_calls[0]["model_tag"] == "multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.3"
-    assert cache_calls[0]["prompt_versions"] == ("ai_research_aggregate/v1", "ai_research_failure/v0")
+    assert cache_calls[0]["prompt_versions"] == ("ai_research_aggregate/v2", "ai_research_failure/v0")
     assert signal_calls == []
     assert journal_entries == []
 
@@ -11344,7 +11400,7 @@ async def test_ai_entry_gate_systemic_failure_does_not_try_next_candidate(monkey
 
 
 @pytest.mark.asyncio
-async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache(monkeypatch):
+async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache_and_edge_memory_action(monkeypatch):
     class GateSettings(DummySupervisorSettings):
         auto_entry_enabled = True
         ai_research_enabled = True
@@ -11383,7 +11439,7 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache(monkey
                 symbol=intent.symbol.upper(),
                 provider=self.provider,
                 model_tag=self.model_tag,
-                prompt_version="ai_research_committee/v0",
+                prompt_version="ai_research_committee/v1",
                 input_hash=packet_hash(packet),
                 verdict="approve",
                 confidence=0.8,
@@ -11398,6 +11454,9 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache(monkey
                         "used_only_provided_data": True,
                         "bull_case": "Current committee approves from provided packet.",
                         "bear_case": "Advisory only.",
+                        "edge_memory_alignment": "Current candidate matches observed edge context.",
+                        "edge_memory_conflicts": "No decisive observed-edge conflict.",
+                        "edge_memory_action": "conflict_review",
                         "judge_summary": "Current provider set approved.",
                     },
                 },
@@ -11451,8 +11510,17 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache(monkey
             today_new_entries=0,
             max_new_positions_per_day=1,
         )
+        latest = await get_latest_ai_research_memo_for_symbol(
+            provider="multi",
+            symbol="IVT",
+            model_tag=supervisor.research_committee.model_tag,
+            today_utc=True,
+            prompt_versions=("ai_research_aggregate/v2",),
+        )
 
     assert result["order"]["id"] == "entry-after-current-committee"
+    assert latest is not None
+    assert latest["memo"]["committee"]["edge_memory_action"] == "conflict_review"
     assert member_calls == ["anthropic", "openai", "xai"]
 
 

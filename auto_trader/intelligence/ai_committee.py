@@ -22,16 +22,22 @@ from auto_trader.utils.logging import get_logger
 
 log = get_logger("auto_trader.intelligence.ai_committee")
 
-PROMPT_VERSION = "ai_research_committee/v0"
-AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v1"
+PROMPT_VERSION = "ai_research_committee/v1"
+AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v2"
 VALID_VERDICTS = {"approve", "reject", "watch"}
 REAL_PROVIDERS = ("openai", "xai", "anthropic", "gemini")
 MIN_APPROVE_CONFIDENCE = 0.65
+EDGE_MEMORY_ACTIONS = {"amplify", "neutral", "conflict_review", "memory_unavailable", "defer_to_current_packet"}
 COMMITTEE_INSTRUCTIONS = (
     "You are an advisory trading research committee. Use only the provided JSON packet. "
-    "Do not invent market facts. Do not recommend order size. Return only valid JSON. "
+    "Do not invent market facts. Do not recommend order size. Use any loaded "
+    "scoreboard_memory and brain_guidance as advisory observed-edge context only; "
+    "current verified candidate data has priority, and stale/missing memory is never "
+    "a standalone reason to approve or reject. Return only valid JSON. "
     "Return exactly one top-level JSON object with these keys only: symbol, verdict, "
-    "confidence, used_only_provided_data, bull_case, bear_case, judge_summary. "
+    "confidence, used_only_provided_data, bull_case, bear_case, edge_memory_alignment, "
+    "edge_memory_conflicts, edge_memory_action, judge_summary. edge_memory_action must be "
+    "one of: amplify, neutral, conflict_review, memory_unavailable, defer_to_current_packet. "
     "Do not wrap the object in committee, assessment, analysis, result, or any other key."
 )
 COMMITTEE_REQUIRED_FIELDS = [
@@ -41,6 +47,9 @@ COMMITTEE_REQUIRED_FIELDS = [
     "used_only_provided_data",
     "bull_case",
     "bear_case",
+    "edge_memory_alignment",
+    "edge_memory_conflicts",
+    "edge_memory_action",
     "judge_summary",
 ]
 
@@ -126,6 +135,8 @@ def validate_committee_output(symbol: str, output: dict[str, Any]) -> tuple[bool
         errors.append("invalid_verdict")
     if output.get("used_only_provided_data") is not True:
         errors.append("used_unverified_data")
+    if output.get("edge_memory_action") not in EDGE_MEMORY_ACTIONS:
+        errors.append("invalid_edge_memory_action_value")
     confidence = output.get("confidence")
     try:
         value = float(confidence)
@@ -133,7 +144,14 @@ def validate_committee_output(symbol: str, output: dict[str, Any]) -> tuple[bool
             errors.append("confidence_out_of_range")
     except (TypeError, ValueError):
         errors.append("confidence_not_numeric")
-    for field in ("bull_case", "bear_case", "judge_summary"):
+    for field in (
+        "bull_case",
+        "bear_case",
+        "edge_memory_alignment",
+        "edge_memory_conflicts",
+        "edge_memory_action",
+        "judge_summary",
+    ):
         if not isinstance(output.get(field), str) or not output.get(field, "").strip():
             errors.append(f"invalid_{field}")
     return not errors, errors
@@ -211,6 +229,51 @@ def normalize_committee_output(
     else:
         markers.append("normalized_missing_bear_case")
 
+    edge_memory_alignment = _bounded_text(
+        _first_text(
+            source.get("edge_memory_alignment"),
+            assessment.get("edge_memory_alignment"),
+            source.get("memory_alignment"),
+            assessment.get("memory_alignment"),
+            source.get("edge_alignment"),
+            assessment.get("edge_alignment"),
+        )
+    )
+    if edge_memory_alignment:
+        normalized["edge_memory_alignment"] = edge_memory_alignment
+    else:
+        markers.append("normalized_missing_edge_memory_alignment")
+
+    edge_memory_conflicts = _bounded_text(
+        _first_text(
+            source.get("edge_memory_conflicts"),
+            assessment.get("edge_memory_conflicts"),
+            source.get("memory_conflicts"),
+            assessment.get("memory_conflicts"),
+            source.get("edge_conflicts"),
+            assessment.get("edge_conflicts"),
+        )
+    )
+    if edge_memory_conflicts:
+        normalized["edge_memory_conflicts"] = edge_memory_conflicts
+    else:
+        markers.append("normalized_missing_edge_memory_conflicts")
+
+    edge_memory_action = _normalize_edge_memory_action(
+        _first_text(
+            source.get("edge_memory_action"),
+            assessment.get("edge_memory_action"),
+            source.get("memory_action"),
+            assessment.get("memory_action"),
+            source.get("edge_action"),
+            assessment.get("edge_action"),
+        )
+    )
+    if edge_memory_action:
+        normalized["edge_memory_action"] = edge_memory_action
+    else:
+        markers.append("normalized_missing_edge_memory_action")
+
     judge_summary = _bounded_text(
         _first_text(
             source.get("judge_summary"),
@@ -247,6 +310,12 @@ def committee_json_schema(*, strict: bool = True) -> dict[str, Any]:
             "used_only_provided_data": {"type": "boolean"},
             "bull_case": {"type": "string"},
             "bear_case": {"type": "string"},
+            "edge_memory_alignment": {"type": "string"},
+            "edge_memory_conflicts": {"type": "string"},
+            "edge_memory_action": {
+                "type": "string",
+                "enum": sorted(EDGE_MEMORY_ACTIONS),
+            },
             "judge_summary": {"type": "string"},
         },
     }
@@ -258,7 +327,12 @@ def committee_json_schema(*, strict: bool = True) -> dict[str, Any]:
 def committee_prompt(packet: dict[str, Any]) -> str:
     return (
         "Review this verified candidate packet. Return exactly the required JSON object, "
-        "with no wrapper keys and no extra prose.\n\n"
+        "with no wrapper keys and no extra prose. For edge_memory_alignment, state which "
+        "loaded observed-edge/postmortem patterns this candidate confirms. For "
+        "edge_memory_conflicts, state which loaded patterns argue against it. For "
+        "edge_memory_action, return exactly one advisory label: amplify, neutral, "
+        "conflict_review, memory_unavailable, or defer_to_current_packet; do not change "
+        "sizing or config.\n\n"
         f"{json.dumps(packet, sort_keys=True, default=str)}"
     )
 
@@ -300,6 +374,9 @@ class ShadowResearchCommittee:
                 "Shadow committee cannot verify catalysts beyond provided packet; "
                 f"spread_pct={spread_pct} and news context must remain advisory."
             ),
+            "edge_memory_alignment": _shadow_edge_memory_alignment(packet),
+            "edge_memory_conflicts": _shadow_edge_memory_conflicts(packet),
+            "edge_memory_action": _shadow_edge_memory_action(packet),
             "judge_summary": "Advisory memo only; deterministic RiskEngine remains the execution gate.",
             "data_sources": sorted(k for k, v in features.items() if v),
             "finnhub_enabled": bool(finnhub.get("enabled")) if isinstance(finnhub, dict) else False,
@@ -644,6 +721,23 @@ def aggregate_research_memos(
             )
             or "Provider failures, invalid memos, or watch votes keep the advisory result conservative."
         ),
+        "edge_memory_alignment": _bounded_text(
+            "; ".join(
+                _committee_text(memo, "edge_memory_alignment")
+                for memo in valid_memos
+                if _committee_text(memo, "edge_memory_alignment")
+            )
+            or "No valid provider supplied edge-memory alignment."
+        ),
+        "edge_memory_conflicts": _bounded_text(
+            "; ".join(
+                _committee_text(memo, "edge_memory_conflicts")
+                for memo in valid_memos
+                if _committee_text(memo, "edge_memory_conflicts")
+            )
+            or "No valid provider supplied edge-memory conflicts."
+        ),
+        "edge_memory_action": _aggregate_edge_memory_action(valid_memos),
         "judge_summary": _bounded_text(
             f"Multi-provider advisory result is {verdict}: {reason}. "
             "RiskEngine remains the only order and sizing authority."
@@ -741,6 +835,67 @@ def _aggregate_rule_text(risk_profile: str) -> str:
     if risk_profile == "aggressive":
         return "aggressive approve requires at least one valid approve vote with confidence >= 0.65 and no valid reject"
     return "approve requires at least two valid approve votes with confidence >= 0.65 and no valid reject"
+
+
+def _aggregate_edge_memory_action(valid_memos: list[ResearchMemo]) -> str:
+    actions = []
+    for memo in valid_memos:
+        committee = memo.memo.get("committee") if isinstance(memo.memo, dict) else {}
+        action = committee.get("edge_memory_action") if isinstance(committee, dict) else None
+        if action in EDGE_MEMORY_ACTIONS:
+            actions.append(str(action))
+    if not actions:
+        return "memory_unavailable"
+    if "conflict_review" in actions:
+        return "conflict_review"
+    if "amplify" in actions:
+        return "amplify"
+    if all(action == "memory_unavailable" for action in actions):
+        return "memory_unavailable"
+    if "defer_to_current_packet" in actions:
+        return "defer_to_current_packet"
+    return "neutral"
+
+
+def _shadow_edge_memory_alignment(packet: dict[str, Any]) -> str:
+    context = packet.get("verified_research_context")
+    if not isinstance(context, dict):
+        return "No loaded edge memory was available in the verified packet."
+    parts: list[str] = []
+    for key, label in (("brain_guidance", "brain guidance"), ("scoreboard_memory", "scoreboard memory")):
+        memory = context.get(key)
+        if not isinstance(memory, dict):
+            continue
+        if memory.get("available") is True and str(memory.get("prompt_context") or "").strip():
+            parts.append(f"Loaded {label} is available for advisory comparison.")
+        elif memory.get("status"):
+            parts.append(f"{label} status={memory.get('status')}; no active edge boost from this source.")
+    return " ".join(parts) or "No loaded edge memory was available in the verified packet."
+
+
+def _shadow_edge_memory_conflicts(packet: dict[str, Any]) -> str:
+    context = packet.get("verified_research_context")
+    if not isinstance(context, dict):
+        return "No loaded edge memory conflict was available in the verified packet."
+    stale = []
+    for key, label in (("brain_guidance", "brain guidance"), ("scoreboard_memory", "scoreboard memory")):
+        memory = context.get(key)
+        if isinstance(memory, dict) and memory.get("available") is not True:
+            stale.append(f"{label} status={memory.get('status', 'missing')}")
+    if stale:
+        return "Memory unavailable or stale: " + "; ".join(stale) + ". Current packet data remains primary."
+    return "No explicit conflict was derived by the zero-cost shadow committee."
+
+
+def _shadow_edge_memory_action(packet: dict[str, Any]) -> str:
+    context = packet.get("verified_research_context")
+    if not isinstance(context, dict):
+        return "memory_unavailable"
+    for key in ("brain_guidance", "scoreboard_memory"):
+        memory = context.get(key)
+        if isinstance(memory, dict) and memory.get("available") is True:
+            return "neutral"
+    return "memory_unavailable"
 
 
 async def research_committee_round(
@@ -862,6 +1017,25 @@ def _committee_text(memo: ResearchMemo, field: str) -> str:
     committee = memo.memo.get("committee") if isinstance(memo.memo, dict) else {}
     value = committee.get(field) if isinstance(committee, dict) else None
     return _stringify_points(value)
+
+
+def _normalize_edge_memory_action(value: Any) -> str:
+    text = _stringify_points(value).strip().lower()
+    aliases = {
+        "supports_trade": "amplify",
+        "support": "amplify",
+        "press": "amplify",
+        "cautions_trade": "conflict_review",
+        "caution": "conflict_review",
+        "conflict": "conflict_review",
+        "unavailable": "memory_unavailable",
+        "missing": "memory_unavailable",
+        "stale": "memory_unavailable",
+        "defer": "defer_to_current_packet",
+    }
+    if text in EDGE_MEMORY_ACTIONS:
+        return text
+    return aliases.get(text, text)
 
 
 def _extract_openai_response_json(response: dict[str, Any]) -> dict[str, Any]:
