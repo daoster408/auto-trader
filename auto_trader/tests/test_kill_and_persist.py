@@ -95,6 +95,7 @@ from auto_trader.comms.telegram_bot import TelegramBot
 from auto_trader.config.settings import Settings
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
+import auto_trader.intelligence.ai_committee as ai_committee
 from auto_trader.intelligence.ai_committee import (
     AnthropicResearchCommittee,
     AGGREGATE_PROMPT_VERSION,
@@ -106,6 +107,7 @@ from auto_trader.intelligence.ai_committee import (
     ShadowResearchCommittee,
     XAIResearchCommittee,
     aggregate_research_memos,
+    build_candidate_memory_match,
     build_research_packet,
     committee_json_schema,
     committee_prompt,
@@ -1300,6 +1302,7 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
             ("anthropic", "ai_research_budget/v0", "skip1"),
             ("anthropic", "ai_research_committee/v1", "paid1"),
             ("anthropic", "ai_research_committee/v2", "paid1-v2"),
+            ("anthropic", "ai_research_committee/v3", "paid1-v3"),
             ("anthropic", "ai_research_failure/v0", "paid2"),
             ("shadow", "ai_research_committee/v1", "free1"),
             ("multi", "ai_research_failure/v0", "aggregate1"),
@@ -1316,16 +1319,17 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
                 verdict="watch",
                 confidence=None,
                 used_only_provided_data=True,
-                validation_passed=prompt_version in {"ai_research_committee/v1", "ai_research_committee/v2"},
+                validation_passed=prompt_version
+                in {"ai_research_committee/v1", "ai_research_committee/v2", "ai_research_committee/v3"},
                 memo={"committee": {"judge_summary": "audit"}},
             )
 
-        assert await count_ai_research_memos(provider="anthropic", today_utc=True) == 4
-        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 3
+        assert await count_ai_research_memos(provider="anthropic", today_utc=True) == 5
+        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 4
         assert await count_ai_research_chargeable_attempts(provider="openai", today_utc=True) == 1
         assert await count_ai_research_chargeable_attempts(provider="shadow", today_utc=True) == 0
         assert await count_ai_research_chargeable_attempts(provider="multi", today_utc=True) == 0
-        assert await count_ai_research_chargeable_attempts(today_utc=True) == 4
+        assert await count_ai_research_chargeable_attempts(today_utc=True) == 5
 
 
 @pytest.mark.asyncio
@@ -3333,6 +3337,224 @@ def test_research_packet_strips_stale_v2_brain_guidance(tmp_path, monkeypatch):
     assert guidance["pattern_memory"] == {}
     assert "relvol:strong" not in json.dumps(guidance)
     assert "stale V2 should vanish" not in guidance["prompt_context"]
+    match = packet["verified_research_context"]["candidate_memory_match"]
+    assert match["available"] is False
+    assert match["advisory_action"] == "memory_unavailable"
+    assert match["matched_approve_pressure"] == []
+    assert "stale V2 should vanish" not in json.dumps(match)
+
+
+def test_v3_candidate_memory_match_missing_brain_guidance_is_unavailable(tmp_path, monkeypatch):
+    configure_db_path(tmp_path / "packet_candidate_memory_missing_v3.db")
+    monkeypatch.setenv("AUTO_TRADER_BRAIN_GUIDANCE_PATH", str(tmp_path / "runtime" / "missing.json"))
+
+    packet = build_research_packet(
+        TradeIntent(
+            symbol="POET",
+            side="long",
+            entry_price=10.0,
+            confidence=0.7,
+            features={"discovery": {"rel_volume": 2.4, "change_pct": 0.02, "spread_pct": 0.002}},
+        )
+    )
+    match = packet["verified_research_context"]["candidate_memory_match"]
+
+    assert match["status"] == "unavailable"
+    assert match["available"] is False
+    assert match["advisory_action"] == "memory_unavailable"
+    assert match["matched_approve_pressure"] == []
+    assert match["matched_demand_current_evidence"] == []
+
+
+def test_v3_candidate_memory_match_wrong_version_v2_memory_is_unavailable(tmp_path, monkeypatch):
+    configure_db_path(tmp_path / "packet_candidate_memory_wrong_version_v3.db")
+    guidance_path = tmp_path / "runtime" / "brain_reviews" / "brain_guidance_pack.json"
+    guidance_path.parent.mkdir(parents=True)
+    pack = _cached_brain_guidance_pack()
+    pack["active_memory_version"] = PATTERN_MEMORY_VERSION
+    pack["pattern_memory"] = {
+        "version": "postmortem_edge_memory/v999",
+        "candidate_guidance": [
+            {
+                "pattern": "wrong-version-pattern",
+                "action": "approve_pressure",
+                "reason": "wrong-version secret bucket",
+            }
+        ],
+    }
+    guidance_path.write_text(json.dumps(pack), encoding="utf-8")
+    monkeypatch.setenv("AUTO_TRADER_BRAIN_GUIDANCE_PATH", str(guidance_path))
+
+    packet = build_research_packet(TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7))
+    match = packet["verified_research_context"]["candidate_memory_match"]
+
+    assert match["available"] is False
+    assert match["advisory_action"] == "memory_unavailable"
+    assert match["matched_approve_pressure"] == []
+    assert "wrong-version secret bucket" not in json.dumps(match)
+
+
+def test_v3_candidate_memory_match_adds_candidate_specific_approve_pressure(tmp_path, monkeypatch):
+    configure_db_path(tmp_path / "packet_candidate_memory_match_v3.db")
+    guidance_path = tmp_path / "runtime" / "brain_reviews" / "brain_guidance_pack.json"
+    guidance_path.parent.mkdir(parents=True)
+    pack = _cached_brain_guidance_pack()
+    pack["active_memory_version"] = PATTERN_MEMORY_VERSION
+    pack["pattern_memory"] = {
+        "version": PATTERN_MEMORY_VERSION,
+        "candidate_guidance": [
+            {
+                "pattern": "relvol:strong",
+                "action": "approve_pressure",
+                "reason": "Recent high-relative-volume winners paid.",
+                "source": "weekly",
+                "sample": "thin",
+            }
+        ],
+        "winning_patterns": [
+            {
+                "key": "spread:tight",
+                "source": "weekly",
+                "sample": "building",
+                "n": 3,
+                "realized_pnl": 4.25,
+                "expectancy": 1.42,
+                "win_rate": 66.7,
+            }
+        ],
+        "weak_patterns": [{"key": "relvol:low", "source": "weekly", "sample": "thin"}],
+        "provider_strengths": [{"key": "xai:approve:high_conf", "source": "weekly", "n": 2}],
+        "sample_warnings": ["Thin sample; current packet still wins."],
+    }
+    guidance_path.write_text(json.dumps(pack), encoding="utf-8")
+    monkeypatch.setenv("AUTO_TRADER_BRAIN_GUIDANCE_PATH", str(guidance_path))
+
+    packet = build_research_packet(
+        TradeIntent(
+            symbol="CLOV",
+            side="long",
+            entry_price=10.0,
+            confidence=0.7,
+            features={
+                "discovery": {"rel_volume": 2.6, "change_pct": 0.05, "spread_pct": 0.003},
+                "fred": {"enabled": True, "series": {}, "regime": {}},
+                "research_context": {
+                    "risk": {"risk_profile": {"name": "aggressive"}},
+                    "news": [{"headline": "new contract"}],
+                    "fundamental": {"market_cap": 500_000_000},
+                },
+            },
+        )
+    )
+    match = packet["verified_research_context"]["candidate_memory_match"]
+
+    assert match["version"] == "candidate_memory_match/v3"
+    assert match["available"] is True
+    assert match["advisory_only"] is True
+    assert match["order_authority"] == "RiskEngine"
+    assert match["advisory_action"] == "approve_pressure"
+    assert {"profile:aggressive", "relvol:strong", "spread:tight", "news:present", "macro:ok"} <= set(
+        match["candidate_tags"]
+    )
+    assert [row["pattern"] for row in match["matched_approve_pressure"]] == ["relvol:strong", "spread:tight"]
+    assert match["matched_demand_current_evidence"] == []
+    assert match["provider_memory_notes"][0]["type"] == "strength"
+    assert "candidate_memory_match_v3" in committee_prompt(packet)
+
+
+def test_v3_candidate_memory_match_demands_current_evidence_for_weak_bucket(tmp_path, monkeypatch):
+    configure_db_path(tmp_path / "packet_candidate_memory_demand_v3.db")
+    guidance_path = tmp_path / "runtime" / "brain_reviews" / "brain_guidance_pack.json"
+    guidance_path.parent.mkdir(parents=True)
+    pack = _cached_brain_guidance_pack()
+    pack["active_memory_version"] = PATTERN_MEMORY_VERSION
+    pack["pattern_memory"] = {
+        "version": PATTERN_MEMORY_VERSION,
+        "candidate_guidance": [],
+        "winning_patterns": [{"key": "relvol:strong", "source": "weekly"}],
+        "weak_patterns": [{"key": "relvol:low", "source": "weekly", "sample": "building", "n": 4}],
+    }
+    guidance_path.write_text(json.dumps(pack), encoding="utf-8")
+    monkeypatch.setenv("AUTO_TRADER_BRAIN_GUIDANCE_PATH", str(guidance_path))
+
+    packet = build_research_packet(
+        TradeIntent(
+            symbol="DULL",
+            side="long",
+            entry_price=10.0,
+            confidence=0.7,
+            features={"discovery": {"rel_volume": 0.35, "change_pct": 0.03, "spread_pct": 0.004}},
+        )
+    )
+    match = packet["verified_research_context"]["candidate_memory_match"]
+
+    assert match["available"] is True
+    assert match["advisory_action"] == "demand_current_evidence"
+    assert [row["pattern"] for row in match["matched_demand_current_evidence"]] == ["relvol:low"]
+    assert match["matched_approve_pressure"] == []
+
+
+def test_v3_candidate_memory_match_enforces_serialized_payload_cap(monkeypatch):
+    monkeypatch.setattr(ai_committee, "CANDIDATE_MEMORY_MATCH_MAX_BYTES", 1200)
+    memory = {
+        "version": PATTERN_MEMORY_VERSION,
+        "candidate_guidance": [
+            {
+                "pattern": "relvol:strong",
+                "action": "approve_pressure",
+                "reason": "x" * 1000,
+                "source": "weekly" + ("y" * 200),
+                "sample": "thin" + ("z" * 200),
+            }
+            for _ in range(20)
+        ],
+        "winning_patterns": [{"key": "spread:tight", "source": "weekly", "sample": "thin"} for _ in range(20)],
+        "provider_strengths": [{"key": "xai:approve:high_conf", "source": "weekly", "n": 2} for _ in range(20)],
+        "sample_warnings": ["w" * 1000 for _ in range(20)],
+    }
+    verified_context = {
+        "brain_guidance": {
+            "status": "loaded",
+            "available": True,
+            "active_memory_version": PATTERN_MEMORY_VERSION,
+            "pattern_memory": memory,
+        },
+        "technical": {"rel_volume": 2.8, "change_pct": 0.03, "spread_pct": 0.002},
+    }
+
+    match = build_candidate_memory_match(
+        TradeIntent(symbol="CLOV", side="long", entry_price=10.0, confidence=0.7),
+        verified_context,
+    )
+
+    assert match["truncated"] is True
+    assert match["max_bytes"] == 1200
+    assert len(json.dumps(match, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")) <= 1200
+
+
+def test_v3_candidate_memory_match_final_fallback_stays_under_tiny_cap(monkeypatch):
+    monkeypatch.setattr(ai_committee, "CANDIDATE_MEMORY_MATCH_MAX_BYTES", 180)
+    payload = {
+        "version": "candidate_memory_match/v3",
+        "advisory_only": True,
+        "order_authority": "RiskEngine",
+        "config_authority": "operator_only",
+        "candidate_tags": ["profile:aggressive", "relvol:strong", "spread:tight"],
+        "status": "matched",
+        "available": True,
+        "advisory_action": "approve_pressure",
+        "reason": "x" * 1000,
+        "matched_approve_pressure": [{"pattern": "relvol:strong", "reason": "x" * 1000} for _ in range(10)],
+        "matched_demand_current_evidence": [{"pattern": "spread:wide", "reason": "y" * 1000} for _ in range(10)],
+        "provider_memory_notes": [{"bucket": "xai:approve:high_conf", "source": "weekly"} for _ in range(10)],
+        "sample_warnings": ["z" * 1000 for _ in range(10)],
+    }
+
+    match = ai_committee._cap_candidate_memory_match(payload)
+
+    assert match["truncated"] is True
+    assert match["advisory_action"] == "neutral"
+    assert len(json.dumps(match, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")) <= 180
 
 
 @pytest.mark.asyncio
@@ -3375,6 +3597,72 @@ async def test_brain_guidance_v2_memory_cannot_force_shadow_approval(tmp_path, m
     assert guidance["pattern_memory"]["version"] == PATTERN_MEMORY_VERSION
     assert memo.verdict == "reject"
     assert "sized_quantity" not in memo.memo["committee"]
+
+
+@pytest.mark.asyncio
+async def test_v3_candidate_memory_match_cannot_force_shadow_approval(tmp_path, monkeypatch):
+    configure_db_path(tmp_path / "packet_candidate_memory_v3_authority.db")
+    guidance_path = tmp_path / "runtime" / "brain_reviews" / "brain_guidance_pack.json"
+    guidance_path.parent.mkdir(parents=True)
+    pack = _cached_brain_guidance_pack()
+    pack["active_memory_version"] = PATTERN_MEMORY_VERSION
+    pack["pattern_memory"] = {
+        "version": PATTERN_MEMORY_VERSION,
+        "candidate_guidance": [
+            {
+                "pattern": "relvol:strong",
+                "action": "approve_pressure",
+                "reason": "Approve pressure is advisory only.",
+                "source": "weekly",
+                "sample": "thin",
+            }
+        ],
+    }
+    guidance_path.write_text(json.dumps(pack), encoding="utf-8")
+    monkeypatch.setenv("AUTO_TRADER_BRAIN_GUIDANCE_PATH", str(guidance_path))
+
+    memo = await ShadowResearchCommittee().research(
+        TradeIntent(
+            symbol="POET",
+            side="long",
+            entry_price=10.0,
+            confidence=0.2,
+            features={"discovery": {"score": 1.0, "rel_volume": 2.4, "change_pct": 0.02, "spread_pct": 0.002}},
+        )
+    )
+
+    match = memo.memo["input_packet"]["verified_research_context"]["candidate_memory_match"]
+    assert match["advisory_action"] == "approve_pressure"
+    assert memo.verdict == "reject"
+    assert "sized_quantity" not in memo.memo["committee"]
+
+
+def test_v3_demand_current_evidence_memory_cannot_veto_approve_quorum():
+    packet = build_research_packet(TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7))
+    packet["verified_research_context"]["candidate_memory_match"] = {
+        "version": "candidate_memory_match/v3",
+        "available": True,
+        "advisory_only": True,
+        "order_authority": "RiskEngine",
+        "advisory_action": "demand_current_evidence",
+        "matched_approve_pressure": [],
+        "matched_demand_current_evidence": [{"pattern": "relvol:low", "action": "demand_current_evidence"}],
+    }
+
+    aggregate = aggregate_research_memos(
+        "POET",
+        [
+            _provider_memo("anthropic", "approve", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.68),
+            _provider_memo("xai", "watch", confidence=0.7),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "approve"
+    assert aggregate.memo["quorum"]["approve_count"] == 2
+    assert aggregate.memo["quorum"]["reason"] == "at least two valid providers approved and no valid provider rejected"
 
 
 def test_ai_postmortem_module_has_no_execution_imports():

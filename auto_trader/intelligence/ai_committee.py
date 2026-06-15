@@ -22,8 +22,11 @@ from auto_trader.utils.logging import get_logger
 
 log = get_logger("auto_trader.intelligence.ai_committee")
 
-PROMPT_VERSION = "ai_research_committee/v2"
-AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v3"
+PROMPT_VERSION = "ai_research_committee/v3"
+AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v4"
+PATTERN_MEMORY_VERSION = "postmortem_edge_memory/v2"
+CANDIDATE_MEMORY_MATCH_VERSION = "candidate_memory_match/v3"
+CANDIDATE_MEMORY_MATCH_MAX_BYTES = 5000
 VALID_VERDICTS = {"approve", "reject", "watch"}
 REAL_PROVIDERS = ("openai", "xai", "anthropic", "gemini")
 MIN_APPROVE_CONFIDENCE = 0.65
@@ -31,11 +34,12 @@ EDGE_MEMORY_ACTIONS = {"amplify", "neutral", "conflict_review", "memory_unavaila
 COMMITTEE_INSTRUCTIONS = (
     "You are an advisory trading research committee. Use only the provided JSON packet. "
     "Do not invent market facts. Do not recommend order size. Use any loaded "
-    "scoreboard_memory and brain_guidance/pattern_memory_v2 as advisory observed-edge context only; "
+    "scoreboard_memory, brain_guidance/pattern_memory_v2, and candidate_memory_match/v3 "
+    "as advisory observed-edge context only; "
     "current verified candidate data has priority, and stale/missing memory is never "
-    "a standalone reason to approve or reject. When pattern_memory_v2 is available, compare the "
-    "candidate to winning_patterns, weak_patterns, provider_strengths/provider_weaknesses, and "
-    "candidate_guidance before setting edge_memory_* fields. Return only valid JSON. "
+    "a standalone reason to approve or reject. When candidate_memory_match/v3 is available, use "
+    "that compact pre-match first, then pattern_memory_v2, before setting edge_memory_* fields. "
+    "Return only valid JSON. "
     "Return exactly one top-level JSON object with these keys only: symbol, verdict, "
     "confidence, used_only_provided_data, bull_case, bear_case, edge_memory_alignment, "
     "edge_memory_conflicts, edge_memory_action, judge_summary. edge_memory_action must be "
@@ -86,6 +90,7 @@ def build_research_packet(intent: TradeIntent, *, signal_id: int | None = None) 
     verified_context = build_verified_research_context(intent)
     verified_context["scoreboard_memory"] = load_scoreboard_memory_context()
     verified_context["brain_guidance"] = load_brain_guidance_context()
+    verified_context["candidate_memory_match"] = build_candidate_memory_match(intent, verified_context)
     return {
         "generated_at": datetime.now(UTC).isoformat() + "Z",
         "signal_id": signal_id,
@@ -107,6 +112,93 @@ def build_research_packet(intent: TradeIntent, *, signal_id: int | None = None) 
     }
 
 
+def build_candidate_memory_match(intent: TradeIntent, verified_context: dict[str, Any]) -> dict[str, Any]:
+    """Deterministically pre-match a candidate to loaded V2 memory."""
+    tags = _candidate_setup_tags(intent, verified_context)
+    base: dict[str, Any] = {
+        "version": CANDIDATE_MEMORY_MATCH_VERSION,
+        "advisory_only": True,
+        "order_authority": "RiskEngine",
+        "config_authority": "operator_only",
+        "candidate_tags": tags[:12],
+    }
+    guidance = verified_context.get("brain_guidance") if isinstance(verified_context, dict) else {}
+    if not isinstance(guidance, dict) or guidance.get("available") is not True:
+        return _cap_candidate_memory_match({
+            **base,
+            "status": "unavailable",
+            "available": False,
+            "advisory_action": "memory_unavailable",
+            "reason": _bounded_text("Brain guidance is missing, stale, or unavailable; judge current packet directly."),
+            "matched_approve_pressure": [],
+            "matched_demand_current_evidence": [],
+            "provider_memory_notes": [],
+            "sample_warnings": [],
+        })
+    memory = guidance.get("pattern_memory")
+    if (
+        guidance.get("active_memory_version") != PATTERN_MEMORY_VERSION
+        or not isinstance(memory, dict)
+        or memory.get("version") != PATTERN_MEMORY_VERSION
+    ):
+        return _cap_candidate_memory_match({
+            **base,
+            "status": "neutral",
+            "available": False,
+            "advisory_action": "memory_unavailable",
+            "reason": _bounded_text("No valid V2 pattern memory is loaded; judge current packet directly."),
+            "matched_approve_pressure": [],
+            "matched_demand_current_evidence": [],
+            "provider_memory_notes": [],
+            "sample_warnings": _bounded_text_list(memory.get("sample_warnings") if isinstance(memory, dict) else [], limit=3),
+        })
+
+    tag_set = set(tags)
+    guidance_matches = [
+        _candidate_guidance_match(row)
+        for row in _list(memory.get("candidate_guidance"))
+        if isinstance(row, dict) and str(row.get("pattern") or "") in tag_set
+    ]
+    guidance_matches = [row for row in guidance_matches if row]
+    approve_matches = [row for row in guidance_matches if row.get("action") == "approve_pressure"]
+    demand_matches = [row for row in guidance_matches if row.get("action") == "demand_current_evidence"]
+
+    for row in _list(memory.get("winning_patterns")):
+        match = _pattern_row_match(row, tag_set=tag_set, action="approve_pressure")
+        if match and all(existing.get("pattern") != match.get("pattern") for existing in approve_matches):
+            approve_matches.append(match)
+    for row in _list(memory.get("weak_patterns")):
+        match = _pattern_row_match(row, tag_set=tag_set, action="demand_current_evidence")
+        if match and all(existing.get("pattern") != match.get("pattern") for existing in demand_matches):
+            demand_matches.append(match)
+
+    if approve_matches and demand_matches:
+        advisory_action = "mixed"
+        reason = "Candidate matches both recent winner and weak-pattern buckets; judge current evidence carefully."
+    elif approve_matches:
+        advisory_action = "approve_pressure"
+        reason = "Candidate matches recent observed edge buckets; use as positive pressure if current data confirms."
+    elif demand_matches:
+        advisory_action = "demand_current_evidence"
+        reason = "Candidate matches recent weak buckets; require stronger current evidence before approval."
+    else:
+        advisory_action = "neutral"
+        reason = "No candidate-specific V2 pattern bucket matched; judge current packet directly."
+
+    return _cap_candidate_memory_match({
+        **base,
+        "status": "matched" if approve_matches or demand_matches else "neutral",
+        "available": True,
+        "source_memory_version": PATTERN_MEMORY_VERSION,
+        "advisory_action": advisory_action,
+        "reason": _bounded_text(reason),
+        "matched_approve_pressure": approve_matches[:4],
+        "matched_demand_current_evidence": demand_matches[:4],
+        "provider_memory_notes": _provider_memory_notes(memory),
+        "sample_warnings": _bounded_text_list(memory.get("sample_warnings"), limit=3),
+    })
+
+
 def packet_hash(packet: dict[str, Any]) -> str:
     stable_packet = dict(packet)
     stable_packet.pop("generated_at", None)
@@ -114,7 +206,7 @@ def packet_hash(packet: dict[str, Any]) -> str:
     context = stable_packet.get("verified_research_context")
     if isinstance(context, dict):
         stable_context = dict(context)
-        for context_key in ("scoreboard_memory", "brain_guidance"):
+        for context_key in ("scoreboard_memory", "brain_guidance", "candidate_memory_match"):
             if not isinstance(stable_context.get(context_key), dict):
                 continue
             stable_payload = dict(stable_context[context_key])
@@ -330,13 +422,174 @@ def committee_prompt(packet: dict[str, Any]) -> str:
     return (
         "Review this verified candidate packet. Return exactly the required JSON object, "
         "with no wrapper keys and no extra prose. For edge_memory_alignment, state which "
-        "loaded observed-edge/postmortem/pattern_memory_v2 buckets this candidate confirms. For "
+        "loaded observed-edge/postmortem/candidate_memory_match_v3 buckets this candidate confirms. For "
         "edge_memory_conflicts, state which loaded patterns argue against it. For "
         "edge_memory_action, return exactly one advisory label: amplify, neutral, "
         "conflict_review, memory_unavailable, or defer_to_current_packet; do not change "
         "sizing or config.\n\n"
         f"{json.dumps(packet, sort_keys=True, default=str)}"
     )
+
+
+def _candidate_setup_tags(intent: TradeIntent, verified_context: dict[str, Any]) -> list[str]:
+    features = intent.features or {}
+    discovery = features.get("discovery") if isinstance(features.get("discovery"), dict) else {}
+    technical = verified_context.get("technical") if isinstance(verified_context.get("technical"), dict) else {}
+    risk = verified_context.get("risk") if isinstance(verified_context.get("risk"), dict) else {}
+    risk_profile = risk.get("risk_profile") if isinstance(risk.get("risk_profile"), dict) else {}
+    tags: list[str] = []
+
+    profile = _bounded_text(risk_profile.get("name") or _nested_get(features, ("research_context", "risk_profile", "name")))
+    tags.append(f"profile:{profile or 'unknown'}")
+
+    rel_volume = _first_number(discovery.get("rel_volume"), technical.get("rel_volume"))
+    if rel_volume is None:
+        tags.append("relvol:missing")
+    elif rel_volume < 0.8:
+        tags.append("relvol:low")
+    elif rel_volume < 2.0:
+        tags.append("relvol:normal")
+    elif rel_volume < 4.0:
+        tags.append("relvol:strong")
+    else:
+        tags.append("relvol:hot")
+
+    change_pct = _decimal_pct(_first_number(discovery.get("change_pct"), technical.get("change_pct")))
+    if change_pct is None:
+        tags.append("move:missing")
+    elif change_pct < 0.005:
+        tags.append("move:cold")
+    elif change_pct < 0.08:
+        tags.append("move:tradable")
+    elif change_pct < 0.15:
+        tags.append("move:extended")
+    else:
+        tags.append("move:parabolic")
+
+    spread_pct = _decimal_pct(_first_number(discovery.get("spread_pct"), technical.get("spread_pct")))
+    if spread_pct is None:
+        tags.append("spread:missing")
+    elif spread_pct <= 0.006:
+        tags.append("spread:tight")
+    elif spread_pct <= 0.01:
+        tags.append("spread:workable")
+    else:
+        tags.append("spread:wide")
+
+    distance_from_high_pct = _decimal_pct(technical.get("distance_from_high_pct"))
+    if distance_from_high_pct is not None and distance_from_high_pct >= -0.02:
+        tags.append("near_high")
+
+    news = verified_context.get("news")
+    tags.append("news:present" if isinstance(news, list) and bool(news) else "news:missing")
+
+    fundamental = verified_context.get("fundamental")
+    tags.append("fundamental:present" if _has_meaningful_dict_values(fundamental) else "fundamental:missing")
+
+    macro = verified_context.get("macro")
+    if not isinstance(macro, dict) or not macro:
+        tags.append("macro:missing")
+    elif macro.get("error"):
+        tags.append("macro:error")
+    else:
+        tags.append("macro:ok")
+
+    return tags
+
+
+def _candidate_guidance_match(row: dict[str, Any]) -> dict[str, Any] | None:
+    pattern = _bounded_text(row.get("pattern"), limit=120)
+    if not pattern:
+        return None
+    action = _bounded_text(row.get("action"), limit=40)
+    return {
+        "pattern": pattern,
+        "action": action if action in {"approve_pressure", "demand_current_evidence", "neutral"} else "neutral",
+        "reason": _bounded_text(row.get("reason"), limit=240),
+        "source": _bounded_text(row.get("source"), limit=60),
+        "sample": _bounded_text(row.get("sample"), limit=40),
+    }
+
+
+def _pattern_row_match(row: Any, *, tag_set: set[str], action: str) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    key = _bounded_text(row.get("key"), limit=120)
+    if not key or key not in tag_set:
+        return None
+    return {
+        "pattern": key,
+        "action": action,
+        "source": _bounded_text(row.get("source"), limit=60),
+        "sample": _bounded_text(row.get("sample"), limit=40),
+        "n": _safe_int(row.get("n")),
+        "realized_pnl": _safe_round(row.get("realized_pnl")),
+        "expectancy": _safe_round(row.get("expectancy")),
+        "win_rate": _safe_round(row.get("win_rate")),
+    }
+
+
+def _provider_memory_notes(memory: dict[str, Any]) -> list[dict[str, Any]]:
+    notes: list[dict[str, Any]] = []
+    for kind, key in (("strength", "provider_strengths"), ("weakness", "provider_weaknesses")):
+        for row in _list(memory.get(key))[:3]:
+            if not isinstance(row, dict):
+                continue
+            bucket = _bounded_text(row.get("key"), limit=120)
+            if not bucket:
+                continue
+            notes.append(
+                {
+                    "type": kind,
+                    "bucket": bucket,
+                    "source": _bounded_text(row.get("source"), limit=60),
+                    "sample": _bounded_text(row.get("sample"), limit=40),
+                    "n": _safe_int(row.get("n")),
+                    "expectancy": _safe_round(row.get("expectancy")),
+                    "win_rate": _safe_round(row.get("win_rate")),
+                }
+            )
+    return notes[:5]
+
+
+def _cap_candidate_memory_match(payload: dict[str, Any]) -> dict[str, Any]:
+    payload["max_bytes"] = CANDIDATE_MEMORY_MATCH_MAX_BYTES
+    payload["truncated"] = False
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    if len(encoded) <= CANDIDATE_MEMORY_MATCH_MAX_BYTES:
+        return payload
+
+    capped = dict(payload)
+    capped["truncated"] = True
+    capped["max_bytes"] = CANDIDATE_MEMORY_MATCH_MAX_BYTES
+    capped["candidate_tags"] = _list(capped.get("candidate_tags"))[:8]
+    capped["matched_approve_pressure"] = _list(capped.get("matched_approve_pressure"))[:2]
+    capped["matched_demand_current_evidence"] = _list(capped.get("matched_demand_current_evidence"))[:2]
+    capped["provider_memory_notes"] = _list(capped.get("provider_memory_notes"))[:2]
+    capped["sample_warnings"] = _bounded_text_list(capped.get("sample_warnings"), limit=1)
+    capped["reason"] = _bounded_text(capped.get("reason"), limit=160)
+    encoded = json.dumps(capped, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    if len(encoded) <= CANDIDATE_MEMORY_MATCH_MAX_BYTES:
+        return capped
+
+    capped["matched_approve_pressure"] = []
+    capped["matched_demand_current_evidence"] = []
+    capped["provider_memory_notes"] = []
+    capped["sample_warnings"] = []
+    capped["reason"] = "Candidate memory match exceeded the compact payload cap; judge current packet directly."
+    capped["advisory_action"] = "neutral"
+    capped["status"] = "neutral"
+    encoded = json.dumps(capped, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    if len(encoded) <= CANDIDATE_MEMORY_MATCH_MAX_BYTES:
+        return capped
+
+    return {
+        "version": CANDIDATE_MEMORY_MATCH_VERSION,
+        "available": False,
+        "advisory_action": "neutral",
+        "truncated": True,
+        "max_bytes": CANDIDATE_MEMORY_MATCH_MAX_BYTES,
+    }
 
 
 class ShadowResearchCommittee:
@@ -1106,6 +1359,59 @@ def _stringify_points(value: Any) -> str:
                 parts.append(f"{key}: {text}")
         return " ".join(parts)
     return str(value).strip()
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _bounded_text_list(value: Any, *, limit: int) -> list[str]:
+    return [_bounded_text(item, limit=240) for item in _list(value)[:limit] if _bounded_text(item, limit=240)]
+
+
+def _nested_get(source: Any, path: tuple[str, ...]) -> Any:
+    current = source
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _first_number(*values: Any) -> float | None:
+    for value in values:
+        parsed = _nullable_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _decimal_pct(value: Any) -> float | None:
+    parsed = _nullable_float(value)
+    if parsed is None:
+        return None
+    return parsed / 100.0 if abs(parsed) > 1 else parsed
+
+
+def _has_meaningful_dict_values(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for item in value.values():
+        if item not in (None, "", 0, 0.0, [], {}):
+            return True
+    return False
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_round(value: Any) -> float:
+    parsed = _nullable_float(value)
+    return round(parsed or 0.0, 4)
 
 
 def _bounded_text(text: str, *, limit: int = 800) -> str:
