@@ -661,7 +661,7 @@ class HTTPResearchCommittee:
             raise ValueError(f"{self.provider} research provider requires an API key")
         self.api_key = api_key
         self.model = model
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = float(timeout_seconds)
 
     @property
     def model_tag(self) -> str:
@@ -692,6 +692,7 @@ class HTTPResearchCommittee:
                 "raw_committee_output": raw_output,
                 "normalization": normalization,
                 "response_id": raw.get("id"),
+                "provider_usage": _provider_usage_metadata(raw),
             },
         )
 
@@ -716,7 +717,10 @@ class HTTPResearchCommittee:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
         except Exception as exc:
-            raise RuntimeError(str(exc).replace(self.api_key, "[REDACTED]")) from exc
+            message = str(exc).replace(self.api_key, "[REDACTED]")
+            raise RuntimeError(
+                f"{self.provider} request failed after {self.timeout_seconds:g}s: {message}"
+            ) from exc
 
 
 class OpenAIResearchCommittee(HTTPResearchCommittee):
@@ -784,10 +788,21 @@ class AnthropicResearchCommittee(HTTPResearchCommittee):
 
     provider = "anthropic"
 
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str,
+        timeout_seconds: float = 20.0,
+        max_tokens: int = 2200,
+    ) -> None:
+        super().__init__(api_key, model=model, timeout_seconds=timeout_seconds)
+        self.max_tokens = int(max_tokens)
+
     def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
         body = {
             "model": self.model,
-            "max_tokens": 900,
+            "max_tokens": self.max_tokens,
             "system": COMMITTEE_INSTRUCTIONS,
             "messages": [{"role": "user", "content": committee_prompt(packet)}],
         }
@@ -866,11 +881,12 @@ class MultiProviderResearchCommittee:
     async def research_round(self, intent: TradeIntent, *, signal_id: int | None = None) -> ResearchRound:
         packet = build_research_packet(intent, signal_id=signal_id)
         digest = packet_hash(packet)
-        member_memos = []
-        for member in self.members:
-            member_memos.append(
-                await self._safe_member_research(member, intent, signal_id=signal_id, digest=digest)
-            )
+        member_memos = await asyncio.gather(
+            *[
+                self._safe_member_research(member, intent, signal_id=signal_id, digest=digest)
+                for member in self.members
+            ]
+        )
         aggregate = aggregate_research_memos(intent.symbol, member_memos, packet=packet, input_hash=digest)
         return ResearchRound(member_memos=list(member_memos), aggregate_memo=aggregate)
 
@@ -1201,7 +1217,7 @@ def _create_single_research_committee(settings: Any, provider: str) -> ResearchC
     if provider == "shadow":
         return ShadowResearchCommittee()
     model = _required_model(settings, provider)
-    timeout_seconds = float(getattr(settings, "ai_research_timeout_seconds", 8.0) or 8.0)
+    timeout_seconds = research_provider_timeout_seconds(settings, provider)
     if provider == "openai":
         return OpenAIResearchCommittee(
             _required_key(settings, "openai_api_key", provider),
@@ -1219,6 +1235,7 @@ def _create_single_research_committee(settings: Any, provider: str) -> ResearchC
             _required_key(settings, "anthropic_api_key", provider),
             model=model,
             timeout_seconds=timeout_seconds,
+            max_tokens=_anthropic_max_tokens(settings),
         )
     if provider == "gemini":
         return GeminiResearchCommittee(
@@ -1227,6 +1244,18 @@ def _create_single_research_committee(settings: Any, provider: str) -> ResearchC
             timeout_seconds=timeout_seconds,
         )
     raise ValueError(f"unsupported AI_RESEARCH_PROVIDER={provider}")
+
+
+def research_provider_timeout_seconds(settings: Any, provider: str) -> float:
+    shared = float(getattr(settings, "ai_research_timeout_seconds", 8.0) or 8.0)
+    override = getattr(settings, f"ai_research_{provider}_timeout_seconds", None)
+    if override is None:
+        return shared
+    return float(override or shared)
+
+
+def _anthropic_max_tokens(settings: Any) -> int:
+    return int(getattr(settings, "ai_research_anthropic_max_tokens", 2200) or 2200)
 
 
 def _required_key(settings: Any, attr: str, provider: str) -> str:
@@ -1419,6 +1448,32 @@ def _bounded_text(text: str, *, limit: int = 800) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3].rstrip() + "..."
+
+
+def _provider_usage_metadata(response: dict[str, Any]) -> dict[str, int]:
+    usage = response.get("usage")
+    if isinstance(usage, dict):
+        return {
+            key: int(value)
+            for key, value in {
+                "input_tokens": usage.get("input_tokens") or usage.get("prompt_tokens"),
+                "output_tokens": usage.get("output_tokens") or usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            }.items()
+            if isinstance(value, int) and value >= 0
+        }
+    usage = response.get("usageMetadata")
+    if isinstance(usage, dict):
+        return {
+            key: int(value)
+            for key, value in {
+                "input_tokens": usage.get("promptTokenCount"),
+                "output_tokens": usage.get("candidatesTokenCount"),
+                "total_tokens": usage.get("totalTokenCount"),
+            }.items()
+            if isinstance(value, int) and value >= 0
+        }
+    return {}
 
 
 def _float(value: Any, default: float = 0.0) -> float:

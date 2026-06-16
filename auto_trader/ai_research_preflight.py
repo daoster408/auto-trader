@@ -10,7 +10,11 @@ from urllib.request import Request, urlopen
 
 from auto_trader.account_risk_validate import ValidationGate, validation_exit_code
 from auto_trader.config.settings import get_settings
-from auto_trader.intelligence.ai_committee import model_for_provider, selected_research_providers
+from auto_trader.intelligence.ai_committee import (
+    model_for_provider,
+    research_provider_timeout_seconds,
+    selected_research_providers,
+)
 from auto_trader.persistence.db import (
     configure_db_path,
     count_ai_research_chargeable_attempts,
@@ -64,6 +68,10 @@ class AIResearchPreflightReport:
     remaining_calls: int | None
     attempts_per_round: int
     timeout_seconds: float
+    provider_timeout_seconds: dict[str, float]
+    provider_timeout_budget_seconds: float
+    sequential_timeout_budget_seconds: float
+    supervisor_tick_timeout_seconds: float
     cost: CostAssumptions
     gates: list[ValidationGate]
 
@@ -91,6 +99,10 @@ def _provider_key_present(settings: Any, provider: str) -> bool:
 
 def _gate(name: str, ok: bool, detail: str) -> ValidationGate:
     return ValidationGate(name=name, status="PASS" if ok else "FAIL", detail=detail)
+
+
+def _warn_gate(name: str, ok: bool, detail: str) -> ValidationGate:
+    return ValidationGate(name=name, status="PASS" if ok else "WARN", detail=detail)
 
 
 def _cost_assumptions_from_settings(settings: Any) -> CostAssumptions:
@@ -178,6 +190,14 @@ def build_ai_research_preflight_report(
         f"{row.provider}:{row.model or 'n/a'}={row.model_availability}" for row in provider_reports
     )
     attempts_per_round = len([row for row in provider_reports if row.real_provider])
+    provider_timeout_seconds = {
+        row.provider: research_provider_timeout_seconds(settings, row.provider)
+        for row in provider_reports
+        if row.real_provider
+    }
+    provider_timeout_budget_seconds = max(provider_timeout_seconds.values(), default=0.0)
+    sequential_timeout_budget_seconds = sum(provider_timeout_seconds.values())
+    supervisor_tick_timeout_seconds = float(getattr(settings, "supervisor_tick_timeout_seconds", 20) or 20)
     remaining_calls = max(0, max_calls - used_calls) if used_calls is not None else None
     cost = cost or _cost_assumptions_from_settings(settings)
 
@@ -199,8 +219,18 @@ def build_ai_research_preflight_report(
             f"remaining_calls={remaining_calls}" if remaining_calls is not None else "budget count unavailable",
         ),
         _gate("Timeout bounded", 1.0 <= timeout_seconds <= 15.0, f"timeout_seconds={timeout_seconds:g}"),
+        _warn_gate(
+            "Provider timeout budget",
+            provider_timeout_budget_seconds <= supervisor_tick_timeout_seconds,
+            (
+                f"provider_timeouts={provider_timeout_seconds}, "
+                f"parallel_budget={provider_timeout_budget_seconds:g}s, "
+                f"sequential_sum={sequential_timeout_budget_seconds:g}s, "
+                f"supervisor_tick_timeout={supervisor_tick_timeout_seconds:g}s"
+            ),
+        ),
     ]
-    ready = all(gate.status == "PASS" for gate in gates)
+    ready = not any(gate.status == "FAIL" for gate in gates)
     return AIResearchPreflightReport(
         ready=ready,
         provider=provider,
@@ -213,6 +243,10 @@ def build_ai_research_preflight_report(
         remaining_calls=remaining_calls,
         attempts_per_round=attempts_per_round,
         timeout_seconds=timeout_seconds,
+        provider_timeout_seconds=provider_timeout_seconds,
+        provider_timeout_budget_seconds=provider_timeout_budget_seconds,
+        sequential_timeout_budget_seconds=sequential_timeout_budget_seconds,
+        supervisor_tick_timeout_seconds=supervisor_tick_timeout_seconds,
         cost=cost,
         gates=gates,
     )
@@ -235,6 +269,12 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
         f"Chargeable calls per round: {report.attempts_per_round}",
         f"Full rounds remaining: {rounds}",
         f"Timeout: {report.timeout_seconds:g}s",
+        (
+            "Provider timeout budget: "
+            f"parallel max {report.provider_timeout_budget_seconds:g}s, "
+            f"sequential sum {report.sequential_timeout_budget_seconds:g}s vs "
+            f"supervisor tick {report.supervisor_tick_timeout_seconds:g}s"
+        ),
         (
             "Cost assumptions: "
             f"input_tokens={report.cost.input_tokens_per_call}, "

@@ -400,6 +400,38 @@ def test_settings_rejects_inverted_stagnation_pnl_band():
         )
 
 
+def test_settings_bounds_live_ai_provider_reliability_knobs():
+    settings = Settings(
+        ALPACA_API_KEY="key",
+        ALPACA_API_SECRET="secret",
+        TELEGRAM_BOT_TOKEN="token",
+        RESUME_TOKEN="resume",
+    )
+
+    assert settings.ai_research_openai_timeout_seconds == 12.0
+    assert settings.ai_research_anthropic_timeout_seconds == 12.0
+    assert settings.ai_research_xai_timeout_seconds is None
+    assert settings.ai_research_gemini_timeout_seconds is None
+    assert settings.ai_research_anthropic_max_tokens == 2200
+
+    with pytest.raises(ValidationError, match="AI_RESEARCH_OPENAI_TIMEOUT_SECONDS"):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            AI_RESEARCH_OPENAI_TIMEOUT_SECONDS=30,
+        )
+    with pytest.raises(ValidationError, match="AI_RESEARCH_ANTHROPIC_MAX_TOKENS"):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            AI_RESEARCH_ANTHROPIC_MAX_TOKENS=9000,
+        )
+
+
 def test_stagnation_features_require_recent_timestamp():
     old_ts = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     snapshot = {
@@ -2866,7 +2898,7 @@ def test_anthropic_postmortem_uses_postmortem_only_token_limits():
     postmortem._call_provider({"kind": "ai_postmortem_escalation_input"}, POSTMORTEM_ESCALATION_INSTRUCTIONS)
 
     live_captured = {}
-    live = AnthropicResearchCommittee("key", model="claude-opus-4-8")
+    live = AnthropicResearchCommittee("key", model="claude-opus-4-8", max_tokens=2400)
 
     def fake_live_post(url, body, headers):
         live_captured["body"] = body
@@ -2877,7 +2909,7 @@ def test_anthropic_postmortem_uses_postmortem_only_token_limits():
 
     assert captured[0]["max_tokens"] > 1200
     assert captured[1]["max_tokens"] > captured[0]["max_tokens"]
-    assert live_captured["body"]["max_tokens"] == 900
+    assert live_captured["body"]["max_tokens"] == 2400
 
 
 @pytest.mark.asyncio
@@ -3749,6 +3781,7 @@ def test_research_committee_factory_wires_real_providers_and_requires_keys():
     class Base:
         ai_research_model = "explicit-model"
         ai_research_timeout_seconds = 4
+        ai_research_anthropic_max_tokens = 2200
         openai_api_key = "openai-key"
         xai_api_key = "xai-key"
         anthropic_api_key = "anthropic-key"
@@ -3787,6 +3820,36 @@ def test_research_committee_factory_wires_real_providers_and_requires_keys():
         create_research_committee(MissingOpenAI())
     with pytest.raises(ValueError, match="requires AI_RESEARCH_OPENAI_MODEL or AI_RESEARCH_MODEL"):
         create_research_committee(MissingModel())
+
+
+def test_research_committee_factory_wires_provider_timeouts_and_anthropic_tokens():
+    class SettingsWithOverrides(DummySupervisorSettings):
+        ai_research_providers = "anthropic,openai,xai,gemini"
+        ai_research_model = "fallback-model"
+        ai_research_openai_model = "gpt-5.5"
+        ai_research_xai_model = "grok-4.3"
+        ai_research_anthropic_model = "claude-opus-4-8"
+        ai_research_gemini_model = "gemini-3.1-pro"
+        ai_research_timeout_seconds = 5
+        ai_research_openai_timeout_seconds = 12
+        ai_research_xai_timeout_seconds = None
+        ai_research_anthropic_timeout_seconds = 11
+        ai_research_gemini_timeout_seconds = 9
+        ai_research_anthropic_max_tokens = 2400
+        openai_api_key = "openai-key"
+        xai_api_key = "xai-key"
+        anthropic_api_key = "anthropic-key"
+        gemini_api_key = "gemini-key"
+
+    committee = create_research_committee(SettingsWithOverrides())
+
+    assert isinstance(committee, MultiProviderResearchCommittee)
+    members = {member.provider: member for member in committee.members}
+    assert members["anthropic"].timeout_seconds == 11
+    assert members["anthropic"].max_tokens == 2400
+    assert members["openai"].timeout_seconds == 12
+    assert members["xai"].timeout_seconds == 5
+    assert members["gemini"].timeout_seconds == 9
 
 
 def test_research_committee_factory_wires_multi_provider_models():
@@ -3835,6 +3898,32 @@ def _provider_memo(provider: str, verdict: str, *, confidence: float = 0.7, vali
             }
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_multi_provider_research_runs_members_concurrently():
+    class SlowProvider:
+        def __init__(self, provider: str) -> None:
+            self.provider = provider
+            self.model_tag = f"{provider}/slow"
+
+        async def research(self, intent, *, signal_id=None):
+            await asyncio.sleep(0.05)
+            return _provider_memo(self.provider, "approve", confidence=0.75)
+
+    committee = MultiProviderResearchCommittee(
+        [SlowProvider("anthropic"), SlowProvider("openai"), SlowProvider("xai")]
+    )
+    start = asyncio.get_running_loop().time()
+    round_result = await committee.research_round(
+        TradeIntent(symbol="POET", side="long", entry_price=10.0),
+        signal_id=7,
+    )
+    elapsed = asyncio.get_running_loop().time() - start
+
+    assert elapsed < 0.12
+    assert [memo.provider for memo in round_result.member_memos] == ["anthropic", "openai", "xai"]
+    assert round_result.aggregate_memo.verdict == "approve"
 
 
 def test_multi_provider_aggregate_approves_only_two_valid_approves_no_reject():
@@ -4294,6 +4383,41 @@ def test_provider_http_errors_redact_api_keys(monkeypatch):
 
     assert "secret-key-value" not in str(exc.value)
     assert "[REDACTED]" in str(exc.value)
+    assert "gemini request failed after 20s" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_real_provider_research_stores_bounded_usage_metadata():
+    payload = {
+        "symbol": "POET",
+        "verdict": "watch",
+        "confidence": 0.5,
+        "used_only_provided_data": True,
+        "bull_case": "Provided packet shows constructive momentum.",
+        "bear_case": "Catalyst is unverified.",
+        "edge_memory_alignment": "Candidate resembles the observed strong relative-volume winner cluster.",
+        "edge_memory_conflicts": "Memory sample is thin and catalyst evidence is limited.",
+        "edge_memory_action": "neutral",
+        "judge_summary": "Watch only.",
+    }
+    provider = XAIResearchCommittee("key", model="grok-4.3")
+
+    def fake_call(packet):
+        return {
+            "id": "resp_123",
+            "choices": [{"message": {"content": json.dumps(payload)}}],
+            "usage": {"prompt_tokens": 101, "completion_tokens": 202, "total_tokens": 303},
+        }
+
+    provider._call_provider = fake_call
+    memo = await provider.research(TradeIntent(symbol="POET", side="long", entry_price=10.0))
+
+    assert memo.memo["response_id"] == "resp_123"
+    assert memo.memo["provider_usage"] == {
+        "input_tokens": 101,
+        "output_tokens": 202,
+        "total_tokens": 303,
+    }
 
 
 def test_ai_research_packet_hash_ignores_volatile_metadata():
@@ -4461,10 +4585,18 @@ def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
     assert report.attempts_per_round == 3
     assert report.remaining_calls == 3
     assert report.remaining_rounds == 1
+    assert report.provider_timeout_budget_seconds == 8
+    assert report.sequential_timeout_budget_seconds == 24
+    assert report.supervisor_tick_timeout_seconds == 20
+    assert any(
+        gate.name == "Provider timeout budget" and gate.status == "PASS" for gate in report.gates
+    )
     assert report.estimated_cost_per_round == pytest.approx(0.375)
     assert "Provider: multi" in text
     assert "Chargeable calls per round: 3" in text
     assert "Full rounds remaining: 1" in text
+    assert "Provider timeout budget: parallel max 8s, sequential sum 24s vs supervisor tick 20s" in text
+    assert "[PASS] Provider timeout budget" in text
     assert "Estimated cost per round: $0.3750" in text
     assert "- anthropic: model=claude-opus-4-8, key_present=true, model_availability=not_checked" in text
     assert "- xai: model=grok-4.3, key_present=true, model_availability=available" in text
