@@ -126,6 +126,46 @@ class Settings(BaseSettings):
     ai_research_est_output_tokens: int = Field(2000, ge=0, alias="AI_RESEARCH_EST_OUTPUT_TOKENS")
     ai_research_input_price_per_mtok: float = Field(5.0, ge=0.0, alias="AI_RESEARCH_INPUT_PRICE_PER_MTOK")
     ai_research_output_price_per_mtok: float = Field(25.0, ge=0.0, alias="AI_RESEARCH_OUTPUT_PRICE_PER_MTOK")
+    ai_research_openai_input_price_per_mtok: float | None = Field(
+        None,
+        ge=0.0,
+        alias="AI_RESEARCH_OPENAI_INPUT_PRICE_PER_MTOK",
+    )
+    ai_research_openai_output_price_per_mtok: float | None = Field(
+        None,
+        ge=0.0,
+        alias="AI_RESEARCH_OPENAI_OUTPUT_PRICE_PER_MTOK",
+    )
+    ai_research_anthropic_input_price_per_mtok: float | None = Field(
+        None,
+        ge=0.0,
+        alias="AI_RESEARCH_ANTHROPIC_INPUT_PRICE_PER_MTOK",
+    )
+    ai_research_anthropic_output_price_per_mtok: float | None = Field(
+        None,
+        ge=0.0,
+        alias="AI_RESEARCH_ANTHROPIC_OUTPUT_PRICE_PER_MTOK",
+    )
+    ai_research_xai_input_price_per_mtok: float | None = Field(
+        None,
+        ge=0.0,
+        alias="AI_RESEARCH_XAI_INPUT_PRICE_PER_MTOK",
+    )
+    ai_research_xai_output_price_per_mtok: float | None = Field(
+        None,
+        ge=0.0,
+        alias="AI_RESEARCH_XAI_OUTPUT_PRICE_PER_MTOK",
+    )
+    ai_research_gemini_input_price_per_mtok: float | None = Field(
+        None,
+        ge=0.0,
+        alias="AI_RESEARCH_GEMINI_INPUT_PRICE_PER_MTOK",
+    )
+    ai_research_gemini_output_price_per_mtok: float | None = Field(
+        None,
+        ge=0.0,
+        alias="AI_RESEARCH_GEMINI_OUTPUT_PRICE_PER_MTOK",
+    )
     ai_postmortem_providers: str = Field("", alias="AI_POSTMORTEM_PROVIDERS")
     ai_postmortem_model: str = Field("", alias="AI_POSTMORTEM_MODEL")
     ai_postmortem_openai_model: str = Field("", alias="AI_POSTMORTEM_OPENAI_MODEL")

@@ -85,6 +85,7 @@ from auto_trader.ai_entry_gate_rehearsal import run_ai_entry_gate_rehearsal, ren
 from auto_trader.ai_rehearsal_batch import run_ai_rehearsal_batch, render_ai_rehearsal_batch
 from auto_trader.ai_research_smoke import run_ai_research_smoke
 from auto_trader.ai_research_smoke import render_ai_research_smoke
+from auto_trader.ai_cost_report import build_ai_cost_report, render_ai_cost_report
 from auto_trader.friday_recovery_check import build_friday_recovery_report, recovery_exit_code
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
 from auto_trader.week2_launchpad import build_intelligence_readiness, build_week2_launchpad_report, launchpad_exit_code
@@ -413,6 +414,16 @@ def test_settings_bounds_live_ai_provider_reliability_knobs():
     assert settings.ai_research_xai_timeout_seconds is None
     assert settings.ai_research_gemini_timeout_seconds is None
     assert settings.ai_research_anthropic_max_tokens == 2200
+    priced = Settings(
+        ALPACA_API_KEY="key",
+        ALPACA_API_SECRET="secret",
+        TELEGRAM_BOT_TOKEN="token",
+        RESUME_TOKEN="resume",
+        AI_RESEARCH_OPENAI_INPUT_PRICE_PER_MTOK=2.5,
+        AI_RESEARCH_OPENAI_OUTPUT_PRICE_PER_MTOK=10.0,
+    )
+    assert priced.ai_research_openai_input_price_per_mtok == 2.5
+    assert priced.ai_research_openai_output_price_per_mtok == 10.0
 
     with pytest.raises(ValidationError, match="AI_RESEARCH_OPENAI_TIMEOUT_SECONDS"):
         Settings(
@@ -1362,6 +1373,100 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
         assert await count_ai_research_chargeable_attempts(provider="shadow", today_utc=True) == 0
         assert await count_ai_research_chargeable_attempts(provider="multi", today_utc=True) == 0
         assert await count_ai_research_chargeable_attempts(today_utc=True) == 5
+
+
+@pytest.mark.asyncio
+async def test_ai_cost_report_groups_provider_usage_and_unknown_failures():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "ai_cost.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        async def seed(provider, prompt_version, memo, *, model_tag=None):
+            await log_ai_research_memo(
+                signal_id=1,
+                symbol="POET",
+                provider=provider,
+                model_tag=model_tag or f"{provider}/model",
+                prompt_version=prompt_version,
+                input_hash=f"{provider}-{prompt_version}",
+                verdict="watch",
+                confidence=None,
+                used_only_provided_data=True,
+                validation_passed=prompt_version != "ai_research_failure/v0",
+                memo=memo,
+            )
+
+        await seed(
+            "anthropic",
+            "ai_research_committee/v3",
+            {
+                "provider_usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 500_000,
+                    "total_tokens": 1_500_000,
+                }
+            },
+        )
+        await seed("anthropic", "ai_research_failure/v0", {"committee": {"validation_errors": ["timeout"]}})
+        await seed(
+            "xai",
+            "ai_research_committee/v3",
+            {
+                "provider_usage": {
+                    "input_tokens": 250_000,
+                    "output_tokens": 125_000,
+                    "total_tokens": 375_000,
+                }
+            },
+        )
+        await seed("shadow", "ai_research_committee/v3", {"provider_usage": {"input_tokens": 999}})
+        await seed("multi", "ai_research_aggregate/v4", {"provider_usage": {"input_tokens": 999}})
+
+        class CostSettings(DummySupervisorSettings):
+            ai_research_input_price_per_mtok = 5.0
+            ai_research_output_price_per_mtok = 25.0
+            ai_research_xai_input_price_per_mtok = 2.0
+            ai_research_xai_output_price_per_mtok = 8.0
+
+        CostSettings.db_path = str(db_path)
+        report = await build_ai_cost_report(settings=CostSettings(), days=1)
+        rendered = render_ai_cost_report(report)
+        by_provider = {row.provider: row for row in report.providers}
+
+        assert report.total_calls == 3
+        assert report.total_usage_known == 2
+        assert report.total_usage_unknown == 1
+        assert set(by_provider) == {"anthropic", "xai"}
+        assert by_provider["anthropic"].calls == 2
+        assert by_provider["anthropic"].usage_known == 1
+        assert by_provider["anthropic"].usage_unknown == 1
+        assert by_provider["anthropic"].estimated_cost == pytest.approx(17.5)
+        assert by_provider["anthropic"].pricing_source == "global_estimate"
+        assert by_provider["xai"].estimated_cost == pytest.approx(1.5)
+        assert by_provider["xai"].pricing_source == "provider_override"
+        assert "Unknown possible billed failures: 1" in rendered
+        assert "- anthropic: calls=2, usage_known=1, unknown=1" in rendered
+        assert "- xai: calls=1, usage_known=1, unknown=0" in rendered
+
+
+@pytest.mark.asyncio
+async def test_ai_cost_report_missing_db_is_read_only_unavailable():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "missing-ai-cost.db"
+
+        class CostSettings(DummySupervisorSettings):
+            pass
+
+        CostSettings.db_path = str(db_path)
+        report = await build_ai_cost_report(settings=CostSettings(), days=1)
+        rendered = render_ai_cost_report(report)
+
+        assert not db_path.exists()
+        assert report.providers == []
+        assert report.unavailable_reason is not None
+        assert "Unavailable: database not found:" in rendered
+        assert "Providers: none" in rendered
 
 
 @pytest.mark.asyncio
