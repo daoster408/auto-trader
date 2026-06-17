@@ -407,10 +407,14 @@ def test_settings_bounds_live_ai_provider_reliability_knobs():
         ALPACA_API_SECRET="secret",
         TELEGRAM_BOT_TOKEN="token",
         RESUME_TOKEN="resume",
+        SUPERVISOR_TICK_TIMEOUT_SECONDS=90,
+        AI_RESEARCH_OPENAI_TIMEOUT_SECONDS=60,
+        AI_RESEARCH_ANTHROPIC_TIMEOUT_SECONDS=60,
     )
 
-    assert settings.ai_research_openai_timeout_seconds == 12.0
-    assert settings.ai_research_anthropic_timeout_seconds == 12.0
+    assert settings.supervisor_tick_timeout_seconds == 90
+    assert settings.ai_research_openai_timeout_seconds == 60.0
+    assert settings.ai_research_anthropic_timeout_seconds == 60.0
     assert settings.ai_research_xai_timeout_seconds is None
     assert settings.ai_research_gemini_timeout_seconds is None
     assert settings.ai_research_anthropic_max_tokens == 2200
@@ -431,7 +435,7 @@ def test_settings_bounds_live_ai_provider_reliability_knobs():
             ALPACA_API_SECRET="secret",
             TELEGRAM_BOT_TOKEN="token",
             RESUME_TOKEN="resume",
-            AI_RESEARCH_OPENAI_TIMEOUT_SECONDS=30,
+            AI_RESEARCH_OPENAI_TIMEOUT_SECONDS=61,
         )
     with pytest.raises(ValidationError, match="AI_RESEARCH_ANTHROPIC_MAX_TOKENS"):
         Settings(
@@ -3936,7 +3940,7 @@ def test_research_committee_factory_wires_provider_timeouts_and_anthropic_tokens
         ai_research_anthropic_model = "claude-opus-4-8"
         ai_research_gemini_model = "gemini-3.1-pro"
         ai_research_timeout_seconds = 5
-        ai_research_openai_timeout_seconds = 12
+        ai_research_openai_timeout_seconds = 60
         ai_research_xai_timeout_seconds = None
         ai_research_anthropic_timeout_seconds = 11
         ai_research_gemini_timeout_seconds = 9
@@ -3952,7 +3956,7 @@ def test_research_committee_factory_wires_provider_timeouts_and_anthropic_tokens
     members = {member.provider: member for member in committee.members}
     assert members["anthropic"].timeout_seconds == 11
     assert members["anthropic"].max_tokens == 2400
-    assert members["openai"].timeout_seconds == 12
+    assert members["openai"].timeout_seconds == 60
     assert members["xai"].timeout_seconds == 5
     assert members["gemini"].timeout_seconds == 9
 
@@ -4491,6 +4495,60 @@ def test_provider_http_errors_redact_api_keys(monkeypatch):
     assert "gemini request failed after 20s" in str(exc.value)
 
 
+def test_live_ai_provider_failure_categories_are_bounded():
+    def http_error(code, message):
+        return HTTPError("https://provider.example/v1", code, message, {}, BytesIO(b""))
+
+    cases = [
+        (TimeoutError("timed out"), ("timeout", True, None)),
+        (http_error(401, "Unauthorized"), ("auth_error", False, 401)),
+        (http_error(403, "Forbidden"), ("auth_error", False, 403)),
+        (http_error(429, "Too Many Requests"), ("rate_limited", False, 429)),
+        (http_error(404, "model not found"), ("model_unavailable", False, 404)),
+        (http_error(503, "provider unavailable"), ("provider_5xx", True, 503)),
+        (json.JSONDecodeError("Unterminated string", '{"verdict": "', 12), ("invalid_json", True, None)),
+        (ai_committee.URLError("temporary DNS failure"), ("network_error", True, None)),
+        (RuntimeError("something strange"), ("unknown", True, None)),
+    ]
+
+    for exc, expected in cases:
+        assert ai_committee._provider_failure_category(exc) == expected
+
+
+@pytest.mark.asyncio
+async def test_multi_provider_failure_memo_categorizes_timeout_without_secret():
+    class TimeoutMember:
+        provider = "openai"
+        model_tag = "openai/gpt-5.5"
+        timeout_seconds = 60
+        api_key = "secret-key-value"
+
+        async def research(self, intent, *, signal_id=None):
+            raise TimeoutError("The read operation timed out secret-key-value")
+
+    class WatchMember:
+        provider = "xai"
+        model_tag = "xai/grok-4.3"
+
+        async def research(self, intent, *, signal_id=None):
+            return _provider_memo("xai", "watch", confidence=0.7)
+
+    committee = MultiProviderResearchCommittee([TimeoutMember(), WatchMember()])
+    intent = TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7)
+
+    round_result = await committee.research_round(intent)
+    failure = round_result.member_memos[0]
+    provider_failure = failure.memo["provider_failure"]
+
+    assert failure.prompt_version == "ai_research_failure/v0"
+    assert failure.validation_passed is False
+    assert "ai_research_provider_timeout" in failure.memo["committee"]["validation_errors"]
+    assert provider_failure["category"] == "timeout"
+    assert provider_failure["timeout_seconds"] == 60
+    assert provider_failure["possible_duplicate_paid_request"] is True
+    assert "secret-key-value" not in json.dumps(failure.memo)
+
+
 @pytest.mark.asyncio
 async def test_real_provider_research_stores_bounded_usage_metadata():
     payload = {
@@ -4674,6 +4732,9 @@ def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
         ai_research_est_output_tokens = 2000
         ai_research_input_price_per_mtok = 5.0
         ai_research_output_price_per_mtok = 25.0
+        ai_research_openai_timeout_seconds = 60
+        ai_research_anthropic_timeout_seconds = 60
+        supervisor_tick_timeout_seconds = 90
         anthropic_api_key = "anthropic-secret"
         openai_api_key = "openai-secret"
         xai_api_key = "xai-secret"
@@ -4690,9 +4751,9 @@ def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
     assert report.attempts_per_round == 3
     assert report.remaining_calls == 3
     assert report.remaining_rounds == 1
-    assert report.provider_timeout_budget_seconds == 8
-    assert report.sequential_timeout_budget_seconds == 24
-    assert report.supervisor_tick_timeout_seconds == 20
+    assert report.provider_timeout_budget_seconds == 60
+    assert report.sequential_timeout_budget_seconds == 128
+    assert report.supervisor_tick_timeout_seconds == 90
     assert any(
         gate.name == "Provider timeout budget" and gate.status == "PASS" for gate in report.gates
     )
@@ -4700,7 +4761,7 @@ def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
     assert "Provider: multi" in text
     assert "Chargeable calls per round: 3" in text
     assert "Full rounds remaining: 1" in text
-    assert "Provider timeout budget: parallel max 8s, sequential sum 24s vs supervisor tick 20s" in text
+    assert "Provider timeout budget: parallel max 60s, sequential sum 128s vs supervisor tick 90s" in text
     assert "[PASS] Provider timeout budget" in text
     assert "Estimated cost per round: $0.3750" in text
     assert "- anthropic: model=claude-opus-4-8, key_present=true, model_availability=not_checked" in text
@@ -4710,6 +4771,35 @@ def test_ai_research_preflight_multi_provider_round_budget_and_no_secret():
     assert "anthropic-secret" not in text
     assert "openai-secret" not in text
     assert "xai-secret" not in text
+
+
+def test_ai_research_preflight_fails_when_provider_timeout_reaches_tick_timeout():
+    class CommitteeSettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_providers = "anthropic,openai,xai"
+        ai_research_anthropic_model = "claude-opus-4-8"
+        ai_research_openai_model = "gpt-5.5"
+        ai_research_xai_model = "grok-4.3"
+        ai_research_max_calls_per_day = 6
+        ai_research_openai_timeout_seconds = 60
+        ai_research_anthropic_timeout_seconds = 60
+        supervisor_tick_timeout_seconds = 60
+        anthropic_api_key = "anthropic-secret"
+        openai_api_key = "openai-secret"
+        xai_api_key = "xai-secret"
+
+    report = build_ai_research_preflight_report(
+        settings=CommitteeSettings(),
+        used_calls=0,
+        model_availability={"xai": "available"},
+    )
+    text = render_ai_research_preflight(report)
+
+    assert report.ready is False
+    assert any(
+        gate.name == "Provider timeout budget" and gate.status == "FAIL" for gate in report.gates
+    )
+    assert "[FAIL] Provider timeout budget" in text
 
 
 def test_ai_research_preflight_fails_when_xai_model_unavailable():
@@ -4999,6 +5089,52 @@ async def test_real_provider_budget_zero_skips_and_persists_audit_row():
         assert memos[0]["prompt_version"] == "ai_research_budget/v0"
         assert memos[0]["validation_passed"] is False
         assert memos[0]["memo"]["budget"]["daily_max"] == 0
+
+
+@pytest.mark.asyncio
+async def test_supervisor_single_provider_failure_memo_uses_structured_metadata():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "single_provider_failure.db")
+        await init_db()
+
+        class FailureSettings(DummySupervisorSettings):
+            ai_research_enabled = True
+            ai_research_provider = "openai"
+            ai_research_model = "gpt-5.5"
+            ai_research_max_calls_per_day = 5
+            openai_api_key = "openai-key"
+
+        class TimeoutCommittee:
+            provider = "openai"
+            model_tag = "openai/gpt-5.5"
+            timeout_seconds = 60
+            api_key = "secret-key-value"
+
+            async def research(self, intent, *, signal_id=None):
+                raise TimeoutError("The read operation timed out secret-key-value")
+
+        supervisor = TradingSupervisor(
+            settings=FailureSettings(),
+            state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+            adapter=object(),
+            order_manager=object(),
+        )
+        supervisor.research_committee = TimeoutCommittee()
+        intent = TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7)
+
+        await supervisor._run_ai_research(intent, signal_id=12)
+
+        memos = await get_latest_ai_research_memos(limit=1)
+        memo = memos[0]["memo"]
+        provider_failure = memo["provider_failure"]
+
+        assert memos[0]["prompt_version"] == "ai_research_failure/v0"
+        assert "ai_research_provider_timeout" in memo["committee"]["validation_errors"]
+        assert provider_failure["provider"] == "openai"
+        assert provider_failure["category"] == "timeout"
+        assert provider_failure["timeout_seconds"] == 60
+        assert provider_failure["possible_duplicate_paid_request"] is True
+        assert "secret-key-value" not in json.dumps(memo)
 
 
 @pytest.mark.asyncio
@@ -14064,6 +14200,85 @@ async def test_supervisor_auto_entry_uses_runtime_entry_cap(monkeypatch):
     assert result.entry_result["order"]["id"] == "entry-runtime-cap"
     assert manager.snapshots[0].today_new_entries == 1
     assert manager.snapshots[0].max_new_positions_per_day == 100
+
+
+@pytest.mark.asyncio
+async def test_supervisor_evaluates_exits_before_entry_ai(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    events = []
+
+    class EntrySettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        auto_exit_enabled = True
+        position_max_loss_pct = -5.0
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 80.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return [
+                {
+                    "symbol": "LOSS",
+                    "qty": 1,
+                    "market_value": 90.0,
+                    "unrealized_pl": -10.0,
+                    "cost_basis": 100.0,
+                }
+            ]
+
+        async def get_open_orders(self):
+            return []
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_latest_entry(symbol):
+        return None
+
+    async def fake_execute_exit(self, decision, *, clock=None):
+        events.append(f"exit:{decision.symbol}:{decision.reason}")
+
+    async def fake_maybe_entry(self, **kwargs):
+        events.append("entry_ai")
+        return {"blocked": True, "reason": "test"}
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    monkeypatch.setattr(TradingSupervisor, "_execute_exit_if_enabled", fake_execute_exit)
+    monkeypatch.setattr(TradingSupervisor, "_maybe_submit_entry", fake_maybe_entry)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    supervisor = TradingSupervisor(
+        settings=EntrySettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=object(),
+    )
+
+    result = await supervisor.tick_once()
+
+    assert events == ["exit:LOSS:position max loss reached", "entry_ai"]
+    assert result.exit_decisions[0].should_exit is True
 
 
 @pytest.mark.asyncio

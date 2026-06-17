@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     reconcile_interval_seconds: int = Field(300, ge=60, alias="RECONCILE_INTERVAL_SECONDS")
     reconcile_lookback_days: int = Field(2, ge=1, alias="RECONCILE_LOOKBACK_DAYS")
     position_monitor_interval_seconds: int = Field(60, ge=15, alias="POSITION_MONITOR_INTERVAL_SECONDS")
-    supervisor_tick_timeout_seconds: int = Field(20, ge=1, alias="SUPERVISOR_TICK_TIMEOUT_SECONDS")
+    supervisor_tick_timeout_seconds: int = Field(90, ge=1, alias="SUPERVISOR_TICK_TIMEOUT_SECONDS")
     auto_entry_enabled: bool = Field(False, alias="AUTO_ENTRY_ENABLED")
     auto_exit_enabled: bool = Field(False, alias="AUTO_EXIT_ENABLED")
     position_max_loss_pct: float = Field(-5.0, alias="POSITION_MAX_LOSS_PCT")
@@ -79,29 +79,29 @@ class Settings(BaseSettings):
     ai_research_xai_model: str = Field("", alias="AI_RESEARCH_XAI_MODEL")
     ai_research_anthropic_model: str = Field("", alias="AI_RESEARCH_ANTHROPIC_MODEL")
     ai_research_gemini_model: str = Field("", alias="AI_RESEARCH_GEMINI_MODEL")
-    ai_research_timeout_seconds: float = Field(8.0, ge=1.0, le=15.0, alias="AI_RESEARCH_TIMEOUT_SECONDS")
+    ai_research_timeout_seconds: float = Field(8.0, ge=1.0, le=60.0, alias="AI_RESEARCH_TIMEOUT_SECONDS")
     ai_research_openai_timeout_seconds: float | None = Field(
-        12.0,
+        60.0,
         ge=1.0,
-        le=15.0,
+        le=60.0,
         alias="AI_RESEARCH_OPENAI_TIMEOUT_SECONDS",
     )
     ai_research_xai_timeout_seconds: float | None = Field(
         None,
         ge=1.0,
-        le=15.0,
+        le=60.0,
         alias="AI_RESEARCH_XAI_TIMEOUT_SECONDS",
     )
     ai_research_anthropic_timeout_seconds: float | None = Field(
-        12.0,
+        60.0,
         ge=1.0,
-        le=15.0,
+        le=60.0,
         alias="AI_RESEARCH_ANTHROPIC_TIMEOUT_SECONDS",
     )
     ai_research_gemini_timeout_seconds: float | None = Field(
         None,
         ge=1.0,
-        le=15.0,
+        le=60.0,
         alias="AI_RESEARCH_GEMINI_TIMEOUT_SECONDS",
     )
     ai_research_anthropic_max_tokens: int = Field(

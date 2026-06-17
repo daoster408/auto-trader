@@ -8,10 +8,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import socket
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import quote
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from auto_trader.core.models import TradeIntent
@@ -77,6 +80,29 @@ class ResearchMemo:
     used_only_provided_data: bool
     validation_passed: bool
     memo: dict[str, Any]
+
+
+class ProviderRequestError(RuntimeError):
+    """Sanitized provider failure with bounded diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        category: str,
+        timeout_seconds: float,
+        elapsed_ms: int,
+        possible_duplicate_paid_request: bool,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.category = category
+        self.timeout_seconds = float(timeout_seconds)
+        self.elapsed_ms = int(elapsed_ms)
+        self.possible_duplicate_paid_request = bool(possible_duplicate_paid_request)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -713,13 +739,25 @@ class HTTPResearchCommittee:
             },
             method="POST",
         )
+        started = time.monotonic()
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
         except Exception as exc:
-            message = str(exc).replace(self.api_key, "[REDACTED]")
-            raise RuntimeError(
-                f"{self.provider} request failed after {self.timeout_seconds:g}s: {message}"
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            category, possible_duplicate_paid_request, status_code = _provider_failure_category(exc)
+            message = _sanitize_provider_error(str(exc), api_key=self.api_key)
+            raise ProviderRequestError(
+                (
+                    f"{self.provider} request failed after {self.timeout_seconds:g}s "
+                    f"({category}): {message}"
+                ),
+                provider=self.provider,
+                category=category,
+                timeout_seconds=self.timeout_seconds,
+                elapsed_ms=elapsed_ms,
+                possible_duplicate_paid_request=possible_duplicate_paid_request,
+                status_code=status_code,
             ) from exc
 
 
@@ -906,6 +944,8 @@ class MultiProviderResearchCommittee:
         except Exception as exc:
             provider = str(getattr(member, "provider", "unknown"))
             model_tag = str(getattr(member, "model_tag", provider))
+            failure = provider_failure_metadata(exc, provider=provider, member=member)
+            validation_errors = ["ai_research_provider_failed", f"ai_research_provider_{failure['category']}"]
             return ResearchMemo(
                 symbol=intent.symbol.upper(),
                 provider=provider,
@@ -923,13 +963,14 @@ class MultiProviderResearchCommittee:
                         "verdict": "watch",
                         "confidence": None,
                         "used_only_provided_data": True,
-                        "validation_errors": ["ai_research_provider_failed"],
+                        "validation_errors": validation_errors,
                         "judge_summary": (
                             "Provider failed during multi-provider advisory research; "
                             "deterministic RiskEngine remains authoritative."
                         ),
                     },
-                    "error": str(exc),
+                    "error": failure["message"],
+                    "provider_failure": failure,
                 },
             )
 
@@ -1474,6 +1515,74 @@ def _provider_usage_metadata(response: dict[str, Any]) -> dict[str, int]:
             if isinstance(value, int) and value >= 0
         }
     return {}
+
+
+def _sanitize_provider_error(message: str, *, api_key: str | None = None, limit: int = 300) -> str:
+    sanitized = str(message or "")
+    if api_key:
+        sanitized = sanitized.replace(api_key, "[REDACTED]")
+    lowered = sanitized.lower()
+    for marker in ("authorization:", "x-api-key:", "api-key:", "bearer "):
+        if marker in lowered:
+            sanitized = "provider error contained credential-like text; redacted"
+            break
+    return _bounded_text(sanitized, limit=limit)
+
+
+def _provider_failure_category(exc: Exception) -> tuple[str, bool, int | None]:
+    message = str(exc).lower()
+    status_code: int | None = None
+    if isinstance(exc, HTTPError):
+        status_code = int(exc.code)
+        if status_code in {401, 403}:
+            return "auth_error", False, status_code
+        if status_code == 408:
+            return "timeout", True, status_code
+        if status_code == 429:
+            return "rate_limited", False, status_code
+        if status_code == 404 and "model" in message:
+            return "model_unavailable", False, status_code
+        if 500 <= status_code <= 599:
+            return "provider_5xx", True, status_code
+        return "http_error", False, status_code
+    if isinstance(exc, (TimeoutError, socket.timeout)) or "timed out" in message or "timeout" in message:
+        return "timeout", True, status_code
+    if isinstance(exc, json.JSONDecodeError) or "json" in message or "unterminated string" in message:
+        return "invalid_json", True, status_code
+    if isinstance(exc, URLError):
+        return "network_error", True, status_code
+    if "rate limit" in message or "too many requests" in message:
+        return "rate_limited", False, status_code
+    if "model" in message and ("not found" in message or "unavailable" in message):
+        return "model_unavailable", False, status_code
+    return "unknown", True, status_code
+
+
+def provider_failure_metadata(exc: Exception, *, provider: str, member: Any) -> dict[str, Any]:
+    if isinstance(exc, ProviderRequestError):
+        category = exc.category
+        possible_duplicate_paid_request = exc.possible_duplicate_paid_request
+        status_code = exc.status_code
+        timeout_seconds = exc.timeout_seconds
+        elapsed_ms = exc.elapsed_ms
+        message = _bounded_text(str(exc), limit=300)
+    else:
+        category, possible_duplicate_paid_request, status_code = _provider_failure_category(exc)
+        timeout_seconds = float(getattr(member, "timeout_seconds", 0.0) or 0.0)
+        elapsed_ms = None
+        message = _sanitize_provider_error(str(exc), api_key=getattr(member, "api_key", None), limit=300)
+    metadata: dict[str, Any] = {
+        "provider": provider,
+        "category": category,
+        "message": message,
+        "timeout_seconds": timeout_seconds,
+        "possible_duplicate_paid_request": possible_duplicate_paid_request,
+    }
+    if elapsed_ms is not None:
+        metadata["elapsed_ms"] = elapsed_ms
+    if status_code is not None:
+        metadata["status_code"] = status_code
+    return metadata
 
 
 def _float(value: Any, default: float = 0.0) -> float:

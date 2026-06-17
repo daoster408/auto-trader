@@ -218,10 +218,10 @@ def build_ai_research_preflight_report(
             remaining_calls is not None and remaining_calls >= max(1, attempts_per_round),
             f"remaining_calls={remaining_calls}" if remaining_calls is not None else "budget count unavailable",
         ),
-        _gate("Timeout bounded", 1.0 <= timeout_seconds <= 15.0, f"timeout_seconds={timeout_seconds:g}"),
-        _warn_gate(
+        _gate("Timeout bounded", 1.0 <= timeout_seconds <= 60.0, f"timeout_seconds={timeout_seconds:g}"),
+        _gate(
             "Provider timeout budget",
-            provider_timeout_budget_seconds <= supervisor_tick_timeout_seconds,
+            provider_timeout_budget_seconds < supervisor_tick_timeout_seconds,
             (
                 f"provider_timeouts={provider_timeout_seconds}, "
                 f"parallel_budget={provider_timeout_budget_seconds:g}s, "

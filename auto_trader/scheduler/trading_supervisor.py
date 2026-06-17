@@ -22,6 +22,7 @@ from auto_trader.intelligence.ai_committee import (
     build_research_packet,
     create_research_committee,
     packet_hash,
+    provider_failure_metadata,
     real_research_providers,
     research_committee_round,
 )
@@ -1785,6 +1786,8 @@ class TradingSupervisor:
                 called_provider=bool(real_providers),
             )
         except Exception as e:
+            failure = provider_failure_metadata(e, provider=provider, member=self.research_committee)
+            validation_errors = ["ai_research_provider_failed", f"ai_research_provider_{failure['category']}"]
             await log_ai_research_memo(
                 signal_id=signal_id,
                 symbol=intent.symbol,
@@ -1803,13 +1806,20 @@ class TradingSupervisor:
                         "verdict": "watch",
                         "confidence": None,
                         "used_only_provided_data": True,
-                        "validation_errors": ["ai_research_provider_failed"],
+                        "validation_errors": validation_errors,
                         "judge_summary": "Real-provider research failed; deterministic RiskEngine remains authoritative.",
                     },
-                    "error": str(e),
+                    "error": failure["message"],
+                    "provider_failure": failure,
                 },
             )
-            log.warning("ai_research_failed", symbol=intent.symbol, provider=provider, error=str(e))
+            log.warning(
+                "ai_research_failed",
+                symbol=intent.symbol,
+                provider=provider,
+                error=failure["message"],
+                error_category=failure["category"],
+            )
             return AIResearchRunResult(
                 symbol=intent.symbol.upper(),
                 verdict="watch",
