@@ -26,6 +26,7 @@ from auto_trader.intelligence.ai_committee import (
     real_research_providers,
     research_committee_round,
 )
+from auto_trader.intelligence.ai_display import compact_ai_vote_lines_from_memo
 from auto_trader.intelligence.ai_paid_prefilter import (
     PREFILTER_MODEL_TAG,
     PREFILTER_PROMPT_VERSION,
@@ -416,7 +417,12 @@ def _has_submitted_entry_order(result: dict[str, Any]) -> bool:
     return bool(order.get("id") or order.get("broker_order_id") or order.get("client_order_id"))
 
 
-def _format_entry_notification(result: dict[str, Any], *, adapter: AlpacaAdapter | None = None) -> str:
+def _format_entry_notification(
+    result: dict[str, Any],
+    *,
+    ai_result: "AIResearchRunResult | None" = None,
+    adapter: AlpacaAdapter | None = None,
+) -> str:
     order = result.get("order") or {}
     risk = result.get("risk_decision") or {}
     symbol = str(order.get("symbol") or (result.get("intent") or {}).get("symbol") or "?").upper()
@@ -427,18 +433,26 @@ def _format_entry_notification(result: dict[str, Any], *, adapter: AlpacaAdapter
     trace = risk.get("trace_id") or "unknown"
     decision_id = risk.get("risk_decision_id") or "unknown"
     risk_status = "approved" if bool(risk.get("approved")) else "not approved"
-    return "\n".join(
+    lines = [
+        f"{label} ENTRY SUBMITTED: {symbol}",
+        f"Qty: {qty:.6f}",
+        f"Order: {_entry_order_action(order)}",
+        f"Status: {status}",
+        f"Risk: {risk_status}, {reason}",
+    ]
+    if ai_result and ai_result.memo and isinstance(ai_result.memo.memo, dict):
+        vote_lines = compact_ai_vote_lines_from_memo(ai_result.memo.memo)
+        if vote_lines:
+            lines.append("AI votes:")
+            lines.extend(vote_lines[:5])
+    lines.extend(
         [
-            f"{label} ENTRY SUBMITTED: {symbol}",
-            f"Qty: {qty:.6f}",
-            f"Order: {_entry_order_action(order)}",
-            f"Status: {status}",
-            f"Risk: {risk_status}, {reason}",
             f"Trace: {trace}",
             f"Risk decision: {decision_id}",
             f"Order ID: {_short_order_id(order)}",
         ]
     )
+    return "\n".join(lines)
 
 
 def _short_journal_text(value: Any, *, limit: int = 260) -> str:
@@ -1390,7 +1404,7 @@ class TradingSupervisor:
                         signal_id=signal_id,
                         error=str(e),
                     )
-                await self._notify(_format_entry_notification(result, adapter=self.adapter))
+                await self._notify(_format_entry_notification(result, ai_result=ai_result, adapter=self.adapter))
             return result
         return last_blocked_result
 

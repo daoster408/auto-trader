@@ -147,6 +147,12 @@ async def _get_conn() -> aiosqlite.Connection:
     return conn
 
 
+async def _get_read_conn() -> aiosqlite.Connection:
+    conn = await aiosqlite.connect(f"{_DB_PATH.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = aiosqlite.Row
+    return conn
+
+
 async def load_system_state() -> tuple[SystemState, dict[str, Any]]:
     """
     Restore last known state + metadata.
@@ -365,23 +371,79 @@ async def log_ai_research_memo(
             return None
 
 
-async def get_latest_ai_research_memos(limit: int = 10) -> list[dict[str, Any]]:
+async def get_latest_ai_research_memos(
+    limit: int = 10,
+    *,
+    symbol: str | None = None,
+    exclude_providers: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
     """Return latest AI/shadow committee memos for audit/status surfaces."""
+    return await _latest_ai_research_memos(
+        limit=limit,
+        symbol=symbol,
+        exclude_providers=exclude_providers,
+        initialize=True,
+    )
+
+
+async def read_latest_ai_research_memos(
+    limit: int = 10,
+    *,
+    symbol: str | None = None,
+    exclude_providers: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """Read latest AI research memos without creating or migrating the database."""
+    return await _latest_ai_research_memos(
+        limit=limit,
+        symbol=symbol,
+        exclude_providers=exclude_providers,
+        initialize=False,
+    )
+
+
+async def _latest_ai_research_memos(
+    *,
+    limit: int,
+    symbol: str | None,
+    exclude_providers: tuple[str, ...],
+    initialize: bool,
+) -> list[dict[str, Any]]:
     async with _DB_LOCK:
         try:
-            await init_db()
-            db = await _get_conn()
+            if initialize:
+                await init_db()
+            elif not _DB_PATH.exists():
+                return []
+            db = await _get_conn() if initialize else await _get_read_conn()
             try:
+                conditions: list[str] = []
+                params: list[Any] = []
+                clean_symbol = str(symbol or "").strip().upper()
+                if clean_symbol:
+                    conditions.append("symbol = ?")
+                    params.append(clean_symbol)
+                clean_excluded = tuple(
+                    str(provider or "").strip().lower()
+                    for provider in exclude_providers
+                    if str(provider or "").strip()
+                )
+                if clean_excluded:
+                    placeholders = ", ".join("?" for _ in clean_excluded)
+                    conditions.append(f"lower(provider) NOT IN ({placeholders})")
+                    params.extend(clean_excluded)
+                where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                params.append(int(limit))
                 cur = await db.execute(
-                    """
+                    f"""
                     SELECT id, created_at, signal_id, symbol, provider, model_tag,
                            prompt_version, input_hash, verdict, confidence,
                            used_only_provided_data, validation_passed, memo_json
                     FROM ai_research_memos
+                    {where_clause}
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (int(limit),),
+                    tuple(params),
                 )
                 rows = await cur.fetchall()
                 return [

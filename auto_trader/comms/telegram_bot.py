@@ -7,6 +7,7 @@ Commands exactly as specified in SOURCE_OF_TRUTH:
 - /kill   ← absolute highest priority, must preempt everything
 - /report
 - /edge [days]
+- /ai [symbol]
 """
 import asyncio
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.risk_profile import VALID_RISK_PROFILES, get_risk_profile
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.edge_report import run_edge_report
+from auto_trader.intelligence.ai_display import compact_ai_decision_line
 from auto_trader.persistence.db import (
     append_journal_entry,
     count_entry_orders_since,
@@ -37,6 +39,7 @@ from auto_trader.persistence.db import (
     get_runtime_config_int,
     get_runtime_config_values,
     reconcile_broker_orders,
+    read_latest_ai_research_memos,
     set_runtime_config_value,
 )
 from auto_trader.utils.logging import get_logger
@@ -45,6 +48,8 @@ from auto_trader.utils.retry import retry_kill_critical
 log = get_logger("auto_trader.comms.telegram_bot")
 
 MAX_EDGE_REPORT_DAYS = 90
+MAX_AI_DECISION_ROWS = 12
+AI_DECISION_LOOKBACK_ROWS = 80
 TELEGRAM_POLLING_RETRY_INITIAL_SECONDS = 2.0
 TELEGRAM_POLLING_RETRY_MAX_SECONDS = 60.0
 
@@ -162,6 +167,66 @@ def _format_journal_entries(entries: list[dict[str, Any]]) -> str:
             content = content[:177] + "..."
         lines.append(f"- {created}: {content}")
     return "\n".join(lines)
+
+
+def _format_ai_decision_rows(rows: list[dict[str, Any]], *, symbol: str | None = None) -> str:
+    clean_symbol = str(symbol or "").strip().upper()
+    filtered = [
+        row
+        for row in rows
+        if str(row.get("provider") or "").lower() not in {"multi", "shadow"}
+        and (not clean_symbol or str(row.get("symbol") or "").upper() == clean_symbol)
+    ][:MAX_AI_DECISION_ROWS]
+    title = f"AI DECISIONS: {clean_symbol}" if clean_symbol else f"AI DECISIONS: latest {MAX_AI_DECISION_ROWS}"
+    if not filtered:
+        return f"{title}\nNo recent provider decisions found."
+    lines = [title, "Read-only persisted memo view; newest first."]
+    for row in filtered:
+        line = compact_ai_decision_line(
+            provider=row.get("provider"),
+            verdict=row.get("verdict"),
+            validation_passed=row.get("validation_passed"),
+            prompt_version=row.get("prompt_version"),
+            confidence=row.get("confidence"),
+            symbol=row.get("symbol"),
+            memo=row.get("memo") if isinstance(row.get("memo"), dict) else None,
+            include_confidence=True,
+        )
+        age = _format_ai_decision_age(row.get("created_at"))
+        lines.append(f"- {line}; {age}")
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        return text[:3850].rstrip() + "\n...truncated; use /ai SYMBOL."
+    return text
+
+
+def _format_ai_decision_age(created_at: Any) -> str:
+    timestamp = _parse_sqlite_timestamp(created_at)
+    if timestamp is None:
+        return "age unknown"
+    seconds = max(0, int((datetime.now(UTC) - timestamp).total_seconds()))
+    if seconds < 120:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 120:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+def _parse_sqlite_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for candidate in (text, text.replace(" ", "T")):
+        try:
+            parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return None
 
 
 def _entry_status(
@@ -668,6 +733,33 @@ class TelegramBot:
         await update.message.reply_text(report)
         log.info("edge_report_requested", days=days)
 
+    async def _ai_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_authorized(update, "/ai"):
+            return
+        args = [str(arg).strip().upper() for arg in (context.args or []) if str(arg).strip()]
+        if len(args) > 1:
+            await update.message.reply_text("Use: /ai [symbol]")
+            return
+        symbol = args[0] if args else None
+        if symbol and (len(symbol) > 12 or not all(ch.isalnum() or ch in {".", "-"} for ch in symbol)):
+            await update.message.reply_text("Use: /ai [symbol]")
+            return
+        try:
+            rows = await asyncio.wait_for(
+                read_latest_ai_research_memos(
+                    limit=AI_DECISION_LOOKBACK_ROWS,
+                    symbol=symbol,
+                    exclude_providers=("multi", "shadow"),
+                ),
+                timeout=4.0,
+            )
+        except Exception as e:
+            log.warning("ai_decision_report_failed", error=str(e), symbol=symbol)
+            await update.message.reply_text("AI DECISIONS unavailable.")
+            return
+        await update.message.reply_text(_format_ai_decision_rows(rows, symbol=symbol))
+        log.info("ai_decision_report_requested", symbol=symbol or "latest")
+
     async def _config_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_authorized(update, "/config"):
             return
@@ -799,7 +891,7 @@ class TelegramBot:
         if not await self._require_authorized(update, "unknown"):
             return
         await update.message.reply_text(
-            "Unknown command. Use /status, /pause, /resume <token>, /kill, /report, /edge, /config"
+            "Unknown command. Use /status, /pause, /resume <token>, /kill, /report, /edge, /ai, /config"
         )
 
     def build(self) -> Application:
@@ -812,6 +904,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("kill", self._kill_handler))
         app.add_handler(CommandHandler("report", self._report_handler))
         app.add_handler(CommandHandler("edge", self._edge_handler))
+        app.add_handler(CommandHandler("ai", self._ai_handler))
         app.add_handler(CommandHandler("config", self._config_handler))
         app.add_handler(CommandHandler("start", self._status_handler))
         app.add_handler(CommandHandler("help", self._status_handler))

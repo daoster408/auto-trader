@@ -92,7 +92,7 @@ from auto_trader.week2_launchpad import build_intelligence_readiness, build_week
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.risk_profile import get_risk_profile
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
-from auto_trader.comms.telegram_bot import TelegramBot
+from auto_trader.comms.telegram_bot import TelegramBot, _format_ai_decision_rows
 from auto_trader.config.settings import Settings
 from auto_trader.core.state_machine import StateMachine
 from auto_trader.execution.order_manager import OrderManager
@@ -125,7 +125,12 @@ from auto_trader.intelligence.ai_paid_prefilter import evaluate_paid_ai_prefilte
 import auto_trader.intelligence.rules_fallback as rules_fallback
 from auto_trader.intelligence.rules_fallback import DiscoveryCandidate, get_simple_rules_signals
 from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_shutdown, _should_emergency_halt_on_shutdown
-from auto_trader.scheduler.trading_supervisor import AIResearchRunResult, TradingSupervisor, _position_stagnation_features
+from auto_trader.scheduler.trading_supervisor import (
+    AIResearchRunResult,
+    TradingSupervisor,
+    _format_entry_notification,
+    _position_stagnation_features,
+)
 from auto_trader.persistence.db import (
     append_journal_entry,
     backfill_exit_reasons_from_journal,
@@ -143,6 +148,7 @@ from auto_trader.persistence.db import (
     get_pending_exits,
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
+    read_latest_ai_research_memos,
     get_runtime_config_bool,
     get_runtime_config_int,
     get_runtime_config_value,
@@ -1263,6 +1269,95 @@ async def test_ai_research_memo_persistence_roundtrip():
         assert memos[0]["verdict"] == "watch"
         assert memos[0]["validation_passed"] is True
         assert memos[0]["memo"]["committee"]["judge_summary"] == "advisory only"
+
+
+@pytest.mark.asyncio
+async def test_latest_ai_research_memos_supports_symbol_scoped_provider_view():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "ai_research_symbol_scoped.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        await log_ai_research_memo(
+            signal_id=1,
+            symbol="TSLA",
+            provider="multi",
+            model_tag="multi/openai+xai",
+            prompt_version=AGGREGATE_PROMPT_VERSION,
+            input_hash="aggregate",
+            verdict="approve",
+            confidence=0.8,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"summary": "aggregate"},
+        )
+        await log_ai_research_memo(
+            signal_id=2,
+            symbol="TSLA",
+            provider="xai",
+            model_tag="xai/grok",
+            prompt_version=PROMPT_VERSION,
+            input_hash="target",
+            verdict="approve",
+            confidence=0.82,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"summary": "target"},
+        )
+        for index in range(85):
+            await log_ai_research_memo(
+                signal_id=100 + index,
+                symbol="POET",
+                provider="openai",
+                model_tag="openai/gpt",
+                prompt_version=PROMPT_VERSION,
+                input_hash=f"other-{index}",
+                verdict="watch",
+                confidence=0.5,
+                used_only_provided_data=True,
+                validation_passed=True,
+                memo={"summary": "other"},
+            )
+
+        global_memos = await get_latest_ai_research_memos(
+            limit=80,
+            exclude_providers=("multi", "shadow"),
+        )
+        symbol_memos = await get_latest_ai_research_memos(
+            limit=80,
+            symbol="tsla",
+            exclude_providers=("multi", "shadow"),
+        )
+
+        assert all(row["symbol"] != "TSLA" for row in global_memos)
+        assert len(symbol_memos) == 1
+        assert symbol_memos[0]["symbol"] == "TSLA"
+        assert symbol_memos[0]["provider"] == "xai"
+        assert symbol_memos[0]["memo"]["summary"] == "target"
+
+
+@pytest.mark.asyncio
+async def test_read_latest_ai_research_memos_does_not_create_missing_db(tmp_path):
+    db_path = tmp_path / "missing_ai_read_only.db"
+    configure_db_path(db_path)
+
+    memos = await read_latest_ai_research_memos(limit=5)
+
+    assert memos == []
+    assert not db_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_read_latest_ai_research_memos_handles_existing_db_without_table(tmp_path):
+    db_path = tmp_path / "empty_ai_read_only.db"
+    db_path.touch()
+    configure_db_path(db_path)
+
+    memos = await read_latest_ai_research_memos(limit=5)
+
+    assert memos == []
+    assert db_path.exists()
+    assert db_path.stat().st_size == 0
 
 
 @pytest.mark.asyncio
@@ -8441,6 +8536,204 @@ async def test_telegram_unauthorized_edge_does_not_read_report(monkeypatch):
     assert update.message.replies == ["Unauthorized."]
 
 
+def test_telegram_ai_formatter_renders_provider_decisions_and_failures_secret_safe():
+    rows = [
+        {
+            "created_at": datetime.now(UTC).isoformat(),
+            "symbol": "TSLA",
+            "provider": "xai",
+            "verdict": "approve",
+            "confidence": 0.82,
+            "validation_passed": True,
+            "prompt_version": PROMPT_VERSION,
+            "memo": {"committee": {"validation_errors": []}},
+        },
+        {
+            "created_at": datetime.now(UTC).isoformat(),
+            "symbol": "TSLA",
+            "provider": "openai",
+            "verdict": "reject",
+            "confidence": 0.74,
+            "validation_passed": True,
+            "prompt_version": PROMPT_VERSION,
+            "memo": {"committee": {"validation_errors": []}},
+        },
+        {
+            "created_at": datetime.now(UTC).isoformat(),
+            "symbol": "TSLA",
+            "provider": "anthropic",
+            "verdict": "watch",
+            "confidence": None,
+            "validation_passed": False,
+            "prompt_version": "ai_research_failure/v0",
+            "memo": {
+                "provider_failure": {
+                    "category": "timeout",
+                    "message": "sk-secret-value should never render",
+                },
+                "committee": {"validation_errors": ["ai_research_provider_timeout"]},
+            },
+        },
+        {
+            "created_at": datetime.now(UTC).isoformat(),
+            "symbol": "TSLA",
+            "provider": "sk-unknown-provider-secret",
+            "verdict": "watch",
+            "confidence": None,
+            "validation_passed": False,
+            "prompt_version": "ai_research_failure/v0",
+            "memo": {
+                "provider_failure": {
+                    "category": "auth_error",
+                    "message": "api-key-secret should never render",
+                },
+                "committee": {"validation_errors": ["ai_research_provider_auth_error"]},
+            },
+        },
+        {
+            "created_at": datetime.now(UTC).isoformat(),
+            "symbol": "TSLA",
+            "provider": "multi",
+            "verdict": "approve",
+            "confidence": 0.7,
+            "validation_passed": True,
+            "prompt_version": AGGREGATE_PROMPT_VERSION,
+            "memo": {"raw": "aggregate row should not be shown by default"},
+        },
+    ]
+
+    rendered = _format_ai_decision_rows(rows)
+
+    assert "AI DECISIONS: latest 12" in rendered
+    assert "Grok: Buy on TSLA (0.82)" in rendered
+    assert "ChatGPT: Reject on TSLA (0.74)" in rendered
+    assert "Claude: Error (timeout) on TSLA" in rendered
+    assert "Provider: Error (auth_error) on TSLA" in rendered
+    assert "Committee" not in rendered
+    assert rendered.count("\n- ") == 4
+    assert len(rendered) < 3900
+    assert "sk-unknown-provider-secret" not in rendered
+    assert "sk-secret-value" not in rendered
+    assert "api-key-secret" not in rendered
+    assert "raw" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_telegram_ai_handler_returns_latest_decisions_without_external_calls(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {}
+
+    async def fake_latest_memos(*, limit, symbol=None, exclude_providers=()):
+        called["limit"] = limit
+        called["symbol"] = symbol
+        called["exclude_providers"] = exclude_providers
+        return [
+            {
+                "created_at": datetime.now(UTC).isoformat(),
+                "symbol": "JGRO",
+                "provider": "xai",
+                "verdict": "approve",
+                "confidence": 0.81,
+                "validation_passed": True,
+                "prompt_version": PROMPT_VERSION,
+                "memo": {"committee": {"validation_errors": []}},
+            }
+        ]
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.read_latest_ai_research_memos", fake_latest_memos)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._ai_handler(update, FakeTelegramContext())
+
+    assert called == {"limit": 80, "symbol": None, "exclude_providers": ("multi", "shadow")}
+    assert len(update.message.replies) == 1
+    assert "AI DECISIONS: latest 12" in update.message.replies[0]
+    assert "Grok: Buy on JGRO" in update.message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_telegram_ai_handler_filters_symbol(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    async def fake_latest_memos(*, limit, symbol=None, exclude_providers=()):
+        assert limit == 80
+        assert symbol == "TSLA"
+        assert exclude_providers == ("multi", "shadow")
+        return [
+            {
+                "created_at": datetime.now(UTC).isoformat(),
+                "symbol": "TSLA",
+                "provider": "openai",
+                "verdict": "approve",
+                "confidence": 0.79,
+                "validation_passed": True,
+                "prompt_version": PROMPT_VERSION,
+                "memo": {"committee": {"validation_errors": []}},
+            },
+            {
+                "created_at": datetime.now(UTC).isoformat(),
+                "symbol": "POET",
+                "provider": "xai",
+                "verdict": "approve",
+                "confidence": 0.77,
+                "validation_passed": True,
+                "prompt_version": PROMPT_VERSION,
+                "memo": {"committee": {"validation_errors": []}},
+            },
+        ]
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.read_latest_ai_research_memos", fake_latest_memos)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._ai_handler(update, FakeTelegramContext(["TSLA"]))
+
+    assert "AI DECISIONS: TSLA" in update.message.replies[0]
+    assert "ChatGPT: Buy on TSLA" in update.message.replies[0]
+    assert "POET" not in update.message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_telegram_unauthorized_ai_does_not_read_memos(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = {"memos": 0}
+
+    async def fake_latest_memos(*, limit, symbol=None, exclude_providers=()):
+        called["memos"] += 1
+        return []
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.read_latest_ai_research_memos", fake_latest_memos)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[999],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._ai_handler(update, FakeTelegramContext())
+
+    assert called == {"memos": 0}
+    assert update.message.replies == ["Unauthorized."]
+
+
 def test_telegram_status_surfaces_runtime_auto_entry_disabled():
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     bot = TelegramBot(
@@ -11532,6 +11825,84 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
     assert any("PAPER ENTRY SUBMITTED: AMPX" in message for message in notifications)
     assert any("Risk: approved, Passed v1 risk gates" in message for message in notifications)
     assert not any("{'approved':" in message or "{'id':" in message for message in notifications)
+
+
+def test_entry_notification_includes_compact_ai_provider_votes():
+    ai_memo = ResearchMemo(
+        symbol="JGRO",
+        provider="multi",
+        model_tag="multi/anthropic+openai+xai",
+        prompt_version=AGGREGATE_PROMPT_VERSION,
+        input_hash="hash123",
+        verdict="approve",
+        confidence=0.72,
+        used_only_provided_data=True,
+        validation_passed=True,
+        memo={
+            "provider_votes": [
+                {
+                    "provider": "xai",
+                    "verdict": "approve",
+                    "confidence": 0.82,
+                    "validation_passed": True,
+                    "validation_errors": [],
+                },
+                {
+                    "provider": "openai",
+                    "verdict": "approve",
+                    "confidence": 0.72,
+                    "validation_passed": True,
+                    "validation_errors": [],
+                },
+                {
+                    "provider": "anthropic",
+                    "verdict": "watch",
+                    "confidence": None,
+                    "validation_passed": False,
+                    "prompt_version": "ai_research_failure/v0",
+                    "validation_errors": ["ai_research_provider_timeout"],
+                },
+            ]
+        },
+    )
+    ai_result = AIResearchRunResult(
+        symbol="JGRO",
+        verdict="approve",
+        validation_passed=True,
+        reason="ai_research_approve",
+        memo=ai_memo,
+        called_provider=True,
+    )
+    result = {
+        "intent": {"symbol": "JGRO", "side": "long"},
+        "order": {
+            "id": "entry-1",
+            "broker_order_id": "entry-1",
+            "symbol": "JGRO",
+            "side": "long",
+            "qty": 0.308617,
+            "order_type": "market",
+            "status": "pending_new",
+            "paper": True,
+        },
+        "risk_decision": {
+            "approved": True,
+            "reason": "Passed v1 risk gates",
+            "trace_id": "c1ce5b14",
+            "risk_decision_id": 246,
+        },
+    }
+
+    message = _format_entry_notification(result, ai_result=ai_result)
+
+    assert "PAPER ENTRY SUBMITTED: JGRO" in message
+    assert "AI votes:" in message
+    assert "Grok: Buy" in message
+    assert "ChatGPT: Buy" in message
+    assert "Claude: Error (timeout)" in message
+    assert "{'provider':" not in message
+    assert "Trace: c1ce5b14" in message
+    assert "Risk decision: 246" in message
 
 
 @pytest.mark.asyncio
