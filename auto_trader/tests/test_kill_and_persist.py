@@ -1304,6 +1304,19 @@ async def test_latest_ai_research_memos_supports_symbol_scoped_provider_view():
             validation_passed=True,
             memo={"summary": "target"},
         )
+        await log_ai_research_memo(
+            signal_id=3,
+            symbol="TSLA",
+            provider="prefilter",
+            model_tag="deterministic_prefilter/v0",
+            prompt_version="ai_paid_prefilter/v0",
+            input_hash="prefilter",
+            verdict="watch",
+            confidence=None,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"summary": "prefilter should not render in /ai"},
+        )
         for index in range(85):
             await log_ai_research_memo(
                 signal_id=100 + index,
@@ -1321,12 +1334,12 @@ async def test_latest_ai_research_memos_supports_symbol_scoped_provider_view():
 
         global_memos = await get_latest_ai_research_memos(
             limit=80,
-            exclude_providers=("multi", "shadow"),
+            exclude_providers=("multi", "shadow", "prefilter"),
         )
         symbol_memos = await get_latest_ai_research_memos(
             limit=80,
             symbol="tsla",
-            exclude_providers=("multi", "shadow"),
+            exclude_providers=("multi", "shadow", "prefilter"),
         )
 
         assert all(row["symbol"] != "TSLA" for row in global_memos)
@@ -1334,6 +1347,52 @@ async def test_latest_ai_research_memos_supports_symbol_scoped_provider_view():
         assert symbol_memos[0]["symbol"] == "TSLA"
         assert symbol_memos[0]["provider"] == "xai"
         assert symbol_memos[0]["memo"]["summary"] == "target"
+
+
+@pytest.mark.asyncio
+async def test_latest_ai_research_memos_excludes_prefilter_crowding_provider_view():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "ai_research_prefilter_crowding.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        await log_ai_research_memo(
+            signal_id=1,
+            symbol="CAPR",
+            provider="xai",
+            model_tag="xai/grok",
+            prompt_version=PROMPT_VERSION,
+            input_hash="provider-target",
+            verdict="approve",
+            confidence=0.82,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={"summary": "provider-target"},
+        )
+        for index in range(85):
+            await log_ai_research_memo(
+                signal_id=100 + index,
+                symbol="CAPR",
+                provider="prefilter",
+                model_tag="deterministic_prefilter/v0",
+                prompt_version="ai_paid_prefilter/v0",
+                input_hash=f"prefilter-{index}",
+                verdict="watch",
+                confidence=None,
+                used_only_provided_data=True,
+                validation_passed=True,
+                memo={"summary": "prefilter"},
+            )
+
+        memos = await get_latest_ai_research_memos(
+            limit=12,
+            symbol="capr",
+            exclude_providers=("multi", "shadow", "prefilter"),
+        )
+
+        assert len(memos) == 1
+        assert memos[0]["provider"] == "xai"
+        assert memos[0]["memo"]["summary"] == "provider-target"
 
 
 @pytest.mark.asyncio
@@ -8600,6 +8659,16 @@ def test_telegram_ai_formatter_renders_provider_decisions_and_failures_secret_sa
             "prompt_version": AGGREGATE_PROMPT_VERSION,
             "memo": {"raw": "aggregate row should not be shown by default"},
         },
+        {
+            "created_at": datetime.now(UTC).isoformat(),
+            "symbol": "TSLA",
+            "provider": "prefilter",
+            "verdict": "watch",
+            "confidence": None,
+            "validation_passed": True,
+            "prompt_version": "ai_paid_prefilter/v0",
+            "memo": {"raw": "prefilter row should not be shown by /ai"},
+        },
     ]
 
     rendered = _format_ai_decision_rows(rows)
@@ -8610,6 +8679,7 @@ def test_telegram_ai_formatter_renders_provider_decisions_and_failures_secret_sa
     assert "Claude: Error (timeout) on TSLA" in rendered
     assert "Provider: Error (auth_error) on TSLA" in rendered
     assert "Committee" not in rendered
+    assert "Prefilter" not in rendered
     assert rendered.count("\n- ") == 4
     assert len(rendered) < 3900
     assert "sk-unknown-provider-secret" not in rendered
@@ -8653,7 +8723,7 @@ async def test_telegram_ai_handler_returns_latest_decisions_without_external_cal
 
     await bot._ai_handler(update, FakeTelegramContext())
 
-    assert called == {"limit": 80, "symbol": None, "exclude_providers": ("multi", "shadow")}
+    assert called == {"limit": 80, "symbol": None, "exclude_providers": ("multi", "shadow", "prefilter")}
     assert len(update.message.replies) == 1
     assert "AI DECISIONS: latest 12" in update.message.replies[0]
     assert "Grok: Buy on JGRO" in update.message.replies[0]
@@ -8666,7 +8736,7 @@ async def test_telegram_ai_handler_filters_symbol(monkeypatch):
     async def fake_latest_memos(*, limit, symbol=None, exclude_providers=()):
         assert limit == 80
         assert symbol == "TSLA"
-        assert exclude_providers == ("multi", "shadow")
+        assert exclude_providers == ("multi", "shadow", "prefilter")
         return [
             {
                 "created_at": datetime.now(UTC).isoformat(),

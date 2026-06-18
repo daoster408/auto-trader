@@ -11,6 +11,7 @@ PROVIDER_DISPLAY_NAMES = {
     "deepseek": "DeepSeek",
     "multi": "Committee",
     "shadow": "Shadow",
+    "prefilter": "Prefilter",
 }
 
 VERDICT_DISPLAY = {

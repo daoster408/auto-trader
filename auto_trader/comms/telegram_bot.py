@@ -50,6 +50,7 @@ log = get_logger("auto_trader.comms.telegram_bot")
 MAX_EDGE_REPORT_DAYS = 90
 MAX_AI_DECISION_ROWS = 12
 AI_DECISION_LOOKBACK_ROWS = 80
+AI_DECISION_EXCLUDED_PROVIDERS = ("multi", "shadow", "prefilter")
 TELEGRAM_POLLING_RETRY_INITIAL_SECONDS = 2.0
 TELEGRAM_POLLING_RETRY_MAX_SECONDS = 60.0
 
@@ -174,7 +175,7 @@ def _format_ai_decision_rows(rows: list[dict[str, Any]], *, symbol: str | None =
     filtered = [
         row
         for row in rows
-        if str(row.get("provider") or "").lower() not in {"multi", "shadow"}
+        if str(row.get("provider") or "").lower() not in set(AI_DECISION_EXCLUDED_PROVIDERS)
         and (not clean_symbol or str(row.get("symbol") or "").upper() == clean_symbol)
     ][:MAX_AI_DECISION_ROWS]
     title = f"AI DECISIONS: {clean_symbol}" if clean_symbol else f"AI DECISIONS: latest {MAX_AI_DECISION_ROWS}"
@@ -749,7 +750,7 @@ class TelegramBot:
                 read_latest_ai_research_memos(
                     limit=AI_DECISION_LOOKBACK_ROWS,
                     symbol=symbol,
-                    exclude_providers=("multi", "shadow"),
+                    exclude_providers=AI_DECISION_EXCLUDED_PROVIDERS,
                 ),
                 timeout=4.0,
             )
