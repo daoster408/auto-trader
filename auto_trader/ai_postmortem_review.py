@@ -54,8 +54,9 @@ POSTMORTEM_MAX_RETRY_AFTER_SECONDS = 120.0
 POSTMORTEM_MAX_HTTP_ERROR_BODY_CHARS = 2_000
 POSTMORTEM_MAX_HTTP_ERROR_HEADERS = 12
 POSTMORTEM_MAX_PROVIDER_JSON_SCAN_CHARS = 24_000
+POSTMORTEM_NORMALIZED_ROW_MAX_CHARS = 1_000
 POSTMORTEM_OPENAI_MAX_OUTPUT_TOKENS = 2_000
-POSTMORTEM_DEEPSEEK_MAX_TOKENS = 2_500
+POSTMORTEM_DEEPSEEK_MAX_TOKENS = 5_000
 POSTMORTEM_ANTHROPIC_MAX_TOKENS = 2_000
 POSTMORTEM_ANTHROPIC_ESCALATION_MAX_TOKENS = 3_000
 POSTMORTEM_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -595,6 +596,7 @@ class DeepSeekPostmortemProvider(XAIPostmortemProvider):
             ],
             "max_tokens": POSTMORTEM_DEEPSEEK_MAX_TOKENS,
             "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
         }
         return self._post_json("https://api.deepseek.com/chat/completions", body, {"Authorization": f"Bearer {self.api_key}"})
 
@@ -608,10 +610,22 @@ class DeepSeekPostmortemProvider(XAIPostmortemProvider):
             _chat_message_content_text(message.get("content") if isinstance(message, dict) else None)
         )
         if not text:
-            raise ValueError("DeepSeek response did not contain text JSON output")
+            finish_reason = choice.get("finish_reason") or choice.get("stop_reason")
+            diagnostic = _deepseek_missing_content_diagnostic(choice)
+            error_type = (
+                "truncated_provider_json"
+                if str(finish_reason or "").lower() in {"length", "max_tokens"}
+                else "malformed_provider_json"
+            )
+            raise PostmortemProviderOutputError(
+                "DeepSeek response did not contain text JSON output",
+                error_type=error_type,
+                response_body=diagnostic,
+                provider_stop_reason=str(finish_reason) if finish_reason is not None else None,
+            )
         finish_reason = choice.get("finish_reason") or choice.get("stop_reason")
         try:
-            return _parse_json_text_or_embedded_object(text)
+            return _normalize_deepseek_postmortem_output(_parse_json_text_or_embedded_object(text))
         except Exception as exc:
             error_type = (
                 "truncated_provider_json"
@@ -624,6 +638,39 @@ class DeepSeekPostmortemProvider(XAIPostmortemProvider):
                 response_body=text,
                 provider_stop_reason=str(finish_reason) if finish_reason is not None else None,
             ) from exc
+
+
+def _deepseek_missing_content_diagnostic(choice: dict[str, Any]) -> str:
+    message = choice.get("message") if isinstance(choice, dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+    content = message.get("content")
+    reasoning = message.get("reasoning_content")
+    diagnostic = {
+        "finish_reason": choice.get("finish_reason") or choice.get("stop_reason"),
+        "message_keys": sorted(str(key) for key in message.keys()),
+        "content_type": type(content).__name__,
+        "content_length": len(content) if isinstance(content, str) else None,
+        "reasoning_content_length": len(reasoning) if isinstance(reasoning, str) else None,
+        "has_tool_calls": bool(message.get("tool_calls")),
+    }
+    return json.dumps(diagnostic, sort_keys=True)
+
+
+def _normalize_deepseek_postmortem_output(output: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(output)
+    normalized_fields: list[str] = []
+    for field in ("lessons", "edge_hypotheses", "budget_leaks", "provider_notes", "operator_recommendations"):
+        value = normalized.get(field)
+        if isinstance(value, str):
+            stripped = value.strip()
+            normalized[field] = [stripped[:POSTMORTEM_NORMALIZED_ROW_MAX_CHARS]] if stripped else []
+            normalized_fields.append(field)
+    if normalized_fields:
+        normalized["normalization_notes"] = [
+            f"deepseek_string_to_singleton_array:{field}" for field in normalized_fields
+        ]
+    return normalized
 
 
 class AnthropicPostmortemProvider(HTTPPostmortemProvider):

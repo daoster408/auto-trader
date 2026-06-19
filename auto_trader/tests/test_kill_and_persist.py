@@ -2497,6 +2497,43 @@ def test_deepseek_postmortem_provider_extracts_json_response():
     assert output["lessons"] == ["Cheap outside reviewer found a pattern."]
 
 
+def test_deepseek_postmortem_provider_normalizes_string_rows():
+    provider = DeepSeekPostmortemProvider("key", model="deepseek-v4-pro", timeout_seconds=1)
+
+    output = provider._extract_output(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "used_only_provided_data": True,
+                                "lessons": "x" * 1200,
+                                "edge_hypotheses": "Single edge hypothesis.",
+                                "budget_leaks": "",
+                                "provider_notes": [],
+                                "operator_recommendations": "Review only.",
+                                "judge_summary": "valid",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+    )
+
+    assert output["lessons"] == ["x" * 1000]
+    assert output["edge_hypotheses"] == ["Single edge hypothesis."]
+    assert output["budget_leaks"] == []
+    assert output["operator_recommendations"] == ["Review only."]
+    assert output["normalization_notes"] == [
+        "deepseek_string_to_singleton_array:lessons",
+        "deepseek_string_to_singleton_array:edge_hypotheses",
+        "deepseek_string_to_singleton_array:budget_leaks",
+        "deepseek_string_to_singleton_array:operator_recommendations",
+    ]
+
+
 def test_deepseek_postmortem_provider_extracts_embedded_json_response():
     provider = DeepSeekPostmortemProvider("key", model="deepseek-v4-pro", timeout_seconds=1)
 
@@ -2616,6 +2653,31 @@ async def test_deepseek_postmortem_malformed_json_has_clear_artifact():
 
 
 @pytest.mark.asyncio
+async def test_deepseek_postmortem_missing_content_has_clear_artifact():
+    provider = DeepSeekPostmortemProvider("deepseek-secret", model="deepseek-v4-pro", timeout_seconds=1)
+    provider._post_json = lambda url, body, headers: {
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {
+                    "content": "",
+                    "reasoning_content": "thinking consumed the budget",
+                },
+            }
+        ]
+    }
+
+    memo = await provider.review({"kind": "ai_postmortem_input", "window_days": 5})
+
+    assert memo.validation_passed is False
+    assert memo.output["error_type"] == "truncated_provider_json"
+    assert memo.output["provider_stop_reason"] == "length"
+    assert "ai_postmortem_provider_json_truncated" in memo.output["validation_errors"]
+    assert "reasoning_content_length" in memo.output["provider_response_body"]
+    assert "deepseek-secret" not in str(memo.output)
+
+
+@pytest.mark.asyncio
 async def test_deepseek_postmortem_truncated_json_has_clear_artifact():
     provider = DeepSeekPostmortemProvider("deepseek-secret", model="deepseek-v4-pro", timeout_seconds=1)
     provider._post_json = lambda url, body, headers: {
@@ -2657,6 +2719,7 @@ def test_postmortem_provider_requests_include_output_caps():
     assert captured[0][1]["max_output_tokens"] == POSTMORTEM_OPENAI_MAX_OUTPUT_TOKENS
     assert captured[1][0] == "https://api.deepseek.com/chat/completions"
     assert captured[1][1]["max_tokens"] == POSTMORTEM_DEEPSEEK_MAX_TOKENS
+    assert captured[1][1]["thinking"] == {"type": "disabled"}
 
 
 def test_live_openai_research_request_remains_without_postmortem_output_cap():
