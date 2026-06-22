@@ -7742,6 +7742,93 @@ def test_edge_report_sanitizes_provider_vote_labels_in_human_report():
     assert "secret-token" not in rendered
 
 
+def _closed_trade(
+    symbol: str,
+    pnl: float,
+    *,
+    exit_reason: str = "broker_reconciliation",
+    ai_verdict: str = "multi:approve",
+    signal_id: int = 1,
+) -> ClosedTradeEvidence:
+    now = datetime.now(UTC)
+    return ClosedTradeEvidence(
+        symbol=symbol,
+        qty=1.0,
+        entry_price=10.0,
+        exit_price=10.0 + pnl,
+        pnl=pnl,
+        pnl_pct=pnl * 10.0,
+        entry_time=now - timedelta(days=1),
+        exit_time=now,
+        exit_reason=exit_reason,
+        ai_verdict=ai_verdict,
+        risk_profile="aggressive",
+        signal_id=signal_id,
+        setup_tags=("profile:aggressive", "relvol:strong"),
+        provider_votes=("xai:approve:high_conf",),
+    )
+
+
+def test_edge_report_payoff_shape_explains_negative_dollars_at_even_win_rate():
+    trades = [
+        _closed_trade("WIN1", 1.0, exit_reason="take profit reached", signal_id=1),
+        _closed_trade("WIN2", 1.0, exit_reason="take profit reached", signal_id=2),
+        _closed_trade("LOSS1", -2.0, exit_reason="position max loss reached", signal_id=3),
+        _closed_trade("LOSS2", -2.0, exit_reason="position max loss reached", signal_id=4),
+    ]
+
+    rendered = render_edge_report(EdgeReport(window_days=14, closed_trades=trades, opportunities=[]))
+    memory_pack = build_scoreboard_memory_pack(
+        EdgeReport(window_days=14, closed_trades=trades, opportunities=[]),
+        generated_at=datetime(2026, 6, 22, tzinfo=UTC),
+    )
+
+    assert "Payoff shape:" in rendered
+    assert "- Win rate: 50.0% (2W/2L)" in rendered
+    assert "- Gross profit/loss: $2.00 / -$4.00" in rendered
+    assert "- Avg win/loss: $1.00 / -$2.00" in rendered
+    assert "- Win/loss payoff ratio: 0.50x" in rendered
+    assert "- Breakeven win rate at this payoff: 66.7% (current 50.0%, gap -16.7 pts)" in rendered
+    assert "- Sample: thin; payoff read is provisional until 10+ closed trades." in rendered
+    assert "- Read: Win rate is not enough at this payoff; average loss is 2.00x the average win." in rendered
+    assert "Payoff by exit reason (weakest first):" in rendered
+    assert "- max loss / stop: n=2, P/L -$4.00, exp -$2.00" in rendered
+    assert "- take profit: n=2, P/L $2.00, exp $1.00" in rendered
+    assert memory_pack["performance"]["payoff_ratio"] == pytest.approx(0.5)
+    assert memory_pack["performance"]["breakeven_win_rate"] == pytest.approx(66.67)
+    assert "payoff=0.50x" not in memory_pack["prompt_context"]
+
+
+def test_edge_report_payoff_shape_shows_when_win_rate_clears_breakeven():
+    trades = [
+        _closed_trade("WIN1", 2.0, exit_reason="take profit reached", signal_id=1),
+        _closed_trade("WIN2", 2.0, exit_reason="take profit reached", signal_id=2),
+        _closed_trade("LOSS1", -1.0, exit_reason="position trailing stop reached", signal_id=3),
+    ]
+
+    rendered = render_edge_report(EdgeReport(window_days=14, closed_trades=trades, opportunities=[]))
+
+    assert "- Win rate: 66.7% (2W/1L)" in rendered
+    assert "- Win/loss payoff ratio: 2.00x" in rendered
+    assert "- Breakeven win rate at this payoff: 33.3% (current 66.7%, gap +33.3 pts)" in rendered
+    assert "- Read: Win rate is clearing the breakeven bar for this payoff shape." in rendered
+
+
+def test_edge_report_payoff_shape_handles_no_losses_yet():
+    trades = [
+        _closed_trade("WIN1", 1.0, exit_reason="take profit reached", signal_id=1),
+        _closed_trade("WIN2", 2.0, exit_reason="take profit reached", signal_id=2),
+    ]
+
+    rendered = render_edge_report(EdgeReport(window_days=14, closed_trades=trades, opportunities=[]))
+
+    assert "- Win rate: 100.0% (2W/0L)" in rendered
+    assert "- Gross profit/loss: $3.00 / $0.00" in rendered
+    assert "- Win/loss payoff ratio: no losses yet" in rendered
+    assert "- Breakeven win rate at this payoff: n/a" in rendered
+    assert "- Read: No losing exits yet; payoff shape is not stressed by losses in this window." in rendered
+
+
 @pytest.mark.asyncio
 async def test_edge_report_treats_malformed_features_as_missing_evidence():
     with tempfile.TemporaryDirectory() as tmp:

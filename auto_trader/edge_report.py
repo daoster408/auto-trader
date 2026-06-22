@@ -559,10 +559,21 @@ def _trade_stats(trades: list[ClosedTradeEvidence]) -> dict[str, float]:
             "expectancy": 0.0,
             "avg_win": 0.0,
             "avg_loss": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "payoff_ratio": 0.0,
+            "breakeven_win_rate": 0.0,
         }
     wins = [trade.pnl for trade in trades if trade.pnl > 0]
     losses = [trade.pnl for trade in trades if trade.pnl < 0]
     realized = sum(trade.pnl for trade in trades)
+    gross_profit = sum(wins)
+    gross_loss = sum(losses)
+    avg_win = (gross_profit / len(wins)) if wins else 0.0
+    avg_loss = (gross_loss / len(losses)) if losses else 0.0
+    loss_size = abs(avg_loss)
+    payoff_ratio = (avg_win / loss_size) if avg_win > 0 and loss_size > 0 else 0.0
+    breakeven_win_rate = (loss_size / (avg_win + loss_size) * 100.0) if avg_win > 0 and loss_size > 0 else 0.0
     return {
         "count": float(len(trades)),
         "wins": float(len(wins)),
@@ -570,8 +581,12 @@ def _trade_stats(trades: list[ClosedTradeEvidence]) -> dict[str, float]:
         "win_rate": (len(wins) / len(trades) * 100.0),
         "realized_pnl": realized,
         "expectancy": realized / len(trades),
-        "avg_win": (sum(wins) / len(wins)) if wins else 0.0,
-        "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "payoff_ratio": payoff_ratio,
+        "breakeven_win_rate": breakeven_win_rate,
     }
 
 
@@ -632,8 +647,89 @@ def _human_group_stats(label: str, trades: list[ClosedTradeEvidence]) -> str:
     sample = "thin" if int(stats["count"]) < GROUP_SAMPLE_MIN_TRADES else "building"
     return (
         f"- {label}: n={int(stats['count'])}, P/L {_money(stats['realized_pnl'])}, "
-        f"exp/trade {_money(stats['expectancy'])}, win {stats['win_rate']:.1f}%, sample={sample}"
+        f"exp/trade {_money(stats['expectancy'])}, win {stats['win_rate']:.1f}%, "
+        f"avg W/L {_money(stats['avg_win'])}/{_money(stats['avg_loss'])}, "
+        f"payoff {_payoff_ratio_text(stats)}, sample={sample}"
     )
+
+
+def _payoff_ratio_text(stats: dict[str, float]) -> str:
+    if stats["avg_win"] <= 0 and stats["avg_loss"] >= 0:
+        return "n/a"
+    if stats["avg_loss"] >= 0:
+        return "no losses yet"
+    if stats["avg_win"] <= 0:
+        return "no wins yet"
+    return f"{stats['payoff_ratio']:.2f}x"
+
+
+def _win_rate_gap_text(stats: dict[str, float]) -> str:
+    if stats["breakeven_win_rate"] <= 0:
+        return "n/a"
+    gap = stats["win_rate"] - stats["breakeven_win_rate"]
+    sign = "+" if gap > 0 else ""
+    return f"{sign}{gap:.1f} pts"
+
+
+def _payoff_read(stats: dict[str, float]) -> str:
+    if int(stats["count"]) == 0:
+        return "Need closed trades before judging payoff shape."
+    if stats["wins"] == 0:
+        return "No winning exits yet; selection or exits are not paying."
+    if stats["losses"] == 0:
+        return "No losing exits yet; payoff shape is not stressed by losses in this window."
+    if stats["expectancy"] > 0:
+        return "Win rate is clearing the breakeven bar for this payoff shape."
+    if stats["win_rate"] >= stats["breakeven_win_rate"]:
+        return "Win rate is near enough, but realized dollars are still flat/down; inspect fees, sizing, and outlier losses."
+    loss_multiple = abs(stats["avg_loss"]) / stats["avg_win"] if stats["avg_win"] > 0 else 0.0
+    return (
+        f"Win rate is not enough at this payoff; average loss is {loss_multiple:.2f}x "
+        "the average win."
+    )
+
+
+def _payoff_group_line(label: str, trades: list[ClosedTradeEvidence]) -> str:
+    stats = _trade_stats(trades)
+    sample = ", sample=thin" if int(stats["count"]) < GROUP_SAMPLE_MIN_TRADES else ""
+    return (
+        f"- {label}: n={int(stats['count'])}, P/L {_money(stats['realized_pnl'])}, "
+        f"exp {_money(stats['expectancy'])}, avg W/L {_money(stats['avg_win'])}/{_money(stats['avg_loss'])}, "
+        f"payoff {_payoff_ratio_text(stats)}{sample}"
+    )
+
+
+def _render_payoff_shape(trades: list[ClosedTradeEvidence], stats: dict[str, float]) -> list[str]:
+    lines = [
+        "Payoff shape:",
+        f"- Gross profit/loss: {_money(stats['gross_profit'])} / {_money(stats['gross_loss'])}",
+        f"- Avg win/loss: {_money(stats['avg_win'])} / {_money(stats['avg_loss'])}",
+        f"- Win/loss payoff ratio: {_payoff_ratio_text(stats)}",
+    ]
+    if stats["breakeven_win_rate"] > 0:
+        lines.append(
+            f"- Breakeven win rate at this payoff: {stats['breakeven_win_rate']:.1f}% "
+            f"(current {stats['win_rate']:.1f}%, gap {_win_rate_gap_text(stats)})"
+        )
+    else:
+        lines.append("- Breakeven win rate at this payoff: n/a")
+    if int(stats["count"]) < HUMAN_SAMPLE_MIN_TRADES:
+        lines.append(
+            f"- Sample: {_human_sample_label(int(stats['count']))}; payoff read is provisional until "
+            f"{HUMAN_SAMPLE_MIN_TRADES}+ closed trades."
+        )
+    lines.append(f"- Read: {_payoff_read(stats)}")
+
+    exit_groups = _group_trades_by_values(trades, lambda trade: [_exit_label(trade.exit_reason)])
+    if exit_groups:
+        lines.append("Payoff by exit reason (weakest first):")
+        sorted_groups = sorted(
+            exit_groups.items(),
+            key=lambda item: (_trade_stats(item[1])["expectancy"], _trade_stats(item[1])["realized_pnl"], item[0]),
+        )
+        for label, group in sorted_groups[:5]:
+            lines.append(_payoff_group_line(label, group))
+    return lines
 
 
 def _outcome_label(outcome: str) -> str:
@@ -817,7 +913,11 @@ def _render_ai_edge_check(trades: list[ClosedTradeEvidence]) -> list[str]:
         provider_groups.sort(key=lambda row: (row[2]["expectancy"], row[2]["realized_pnl"], row[0]), reverse=True)
         lines.append(
             "- Provider vote buckets with enough sample: "
-            + ", ".join(f"{_safe_provider_vote_label(name)} n={int(stats['count'])}" for name, _group, stats in provider_groups[:3])
+            + ", ".join(
+                f"{_safe_provider_vote_label(name)} n={int(stats['count'])} "
+                f"exp={_money(stats['expectancy'])} payoff={_payoff_ratio_text(stats)}"
+                for name, _group, stats in provider_groups[:3]
+            )
         )
     else:
         lines.append("- Provider vote detail: collapsed until each bucket has at least 3 closed trades.")
@@ -905,7 +1005,7 @@ def _format_learning_group(name: str, stats: dict[str, float]) -> str:
     sample = ", thin" if int(stats["count"]) < 3 else ""
     return (
         f"- {name}: n={int(stats['count'])}{sample}, P/L {_money(stats['realized_pnl'])}, "
-        f"exp {_money(stats['expectancy'])}, win {stats['win_rate']:.1f}%"
+        f"exp {_money(stats['expectancy'])}, win {stats['win_rate']:.1f}%, payoff {_payoff_ratio_text(stats)}"
     )
 
 
@@ -1132,6 +1232,12 @@ def build_scoreboard_memory_pack(
             "win_rate": round(float(stats["win_rate"]), 2),
             "wins": int(stats["wins"]),
             "losses": int(stats["losses"]),
+            "avg_win": round(float(stats["avg_win"]), 4),
+            "avg_loss": round(float(stats["avg_loss"]), 4),
+            "gross_profit": round(float(stats["gross_profit"]), 4),
+            "gross_loss": round(float(stats["gross_loss"]), 4),
+            "payoff_ratio": round(float(stats["payoff_ratio"]), 4),
+            "breakeven_win_rate": round(float(stats["breakeven_win_rate"]), 2),
         },
         "positive_observed_tags": positive_tags,
         "negative_observed_tags": negative_tags,
@@ -1187,6 +1293,7 @@ def render_edge_report(report: EdgeReport) -> str:
         ]
     )
     sections = [
+        _render_payoff_shape(trades, stats),
         _render_ai_edge_check(trades),
         _render_candidate_funnel(opportunities),
         _render_main_blockers(opportunities),
