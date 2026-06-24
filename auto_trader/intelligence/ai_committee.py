@@ -26,7 +26,7 @@ from auto_trader.utils.logging import get_logger
 log = get_logger("auto_trader.intelligence.ai_committee")
 
 PROMPT_VERSION = "ai_research_committee/v3"
-AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v4"
+AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v5"
 PATTERN_MEMORY_VERSION = "postmortem_edge_memory/v2"
 CANDIDATE_MEMORY_MATCH_VERSION = "candidate_memory_match/v3"
 CANDIDATE_MEMORY_MATCH_MAX_BYTES = 5000
@@ -986,6 +986,8 @@ def aggregate_research_memos(
     risk_profile = _aggregate_risk_profile(packet)
     unanimous_required = _aggregate_unanimous_required(packet)
     valid_memos = [memo for memo in member_memos if memo.validation_passed]
+    invalid_count = len(member_memos) - len(valid_memos)
+    invalid_providers = [memo.provider for memo in member_memos if not memo.validation_passed]
     valid_rejects = [memo for memo in valid_memos if memo.verdict == "reject"]
     valid_approves = [
         memo
@@ -996,6 +998,9 @@ def aggregate_research_memos(
     if valid_rejects:
         verdict = "reject"
         reason = "valid provider reject overrides approve quorum"
+    elif invalid_count:
+        verdict = "watch"
+        reason = "invalid provider output blocks approve quorum"
     elif unanimous_required and len(valid_approves) == len(member_memos) and len(valid_memos) == len(member_memos):
         verdict = "approve"
         reason = "projected high exposure requires every configured provider to approve"
@@ -1086,6 +1091,8 @@ def aggregate_research_memos(
                 "risk_profile": risk_profile,
                 "unanimous_required": unanimous_required,
                 "valid_provider_count": len(valid_memos),
+                "invalid_provider_count": invalid_count,
+                "invalid_providers": invalid_providers,
                 "approve_count": len(valid_approves),
                 "reject_count": len(valid_rejects),
                 "provider_count": len(member_memos),
@@ -1145,8 +1152,14 @@ def _aggregate_rule_text(risk_profile: str) -> str:
     # High-exposure packets can add a stricter unanimous override; that trigger
     # is recorded separately in quorum.unanimous_required/reason.
     if risk_profile == "aggressive":
-        return "aggressive approve requires at least one valid approve vote with confidence >= 0.65 and no valid reject"
-    return "approve requires at least two valid approve votes with confidence >= 0.65 and no valid reject"
+        return (
+            "aggressive approve requires every provider output to validate, at least one valid approve vote "
+            "with confidence >= 0.65, and no valid reject"
+        )
+    return (
+        "approve requires every provider output to validate, at least two valid approve votes "
+        "with confidence >= 0.65, and no valid reject"
+    )
 
 
 def _aggregate_edge_memory_action(valid_memos: list[ResearchMemo]) -> str:

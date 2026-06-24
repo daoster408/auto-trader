@@ -4259,7 +4259,7 @@ def test_multi_provider_aggregate_approves_only_two_valid_approves_no_reject():
         [
             _provider_memo("anthropic", "approve", confidence=0.72),
             _provider_memo("openai", "approve", confidence=0.68),
-            _provider_memo("xai", "watch", valid=False),
+            _provider_memo("xai", "watch", confidence=0.7),
         ],
         packet=packet,
         input_hash=packet_hash(packet),
@@ -4273,6 +4273,38 @@ def test_multi_provider_aggregate_approves_only_two_valid_approves_no_reject():
     assert aggregate.memo["quorum"]["risk_profile"] == "conservative"
     assert "anthropic sees matching observed edge" in aggregate.memo["committee"]["edge_memory_alignment"]
     assert aggregate.memo["committee"]["edge_memory_action"] == "amplify"
+
+
+def test_multi_provider_aggregate_invalid_provider_blocks_approve_quorum():
+    packet = build_research_packet(
+        TradeIntent(
+            symbol="XHB",
+            side="long",
+            entry_price=114.0,
+            confidence=0.7,
+            features={"research_context": {"risk": {"risk_profile": {"name": "aggressive"}}}},
+        )
+    )
+    aggregate = aggregate_research_memos(
+        "XHB",
+        [
+            _provider_memo("anthropic", "watch", confidence=0.62),
+            _provider_memo("openai", "approve", confidence=0.82),
+            _provider_memo("xai", "approve", confidence=0.81, valid=False),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "watch"
+    assert aggregate.validation_passed is True
+    assert aggregate.memo["quorum"]["approve_count"] == 1
+    assert aggregate.memo["quorum"]["invalid_provider_count"] == 1
+    assert aggregate.memo["quorum"]["invalid_providers"] == ["xai"]
+    assert aggregate.memo["quorum"]["reason"] == "invalid provider output blocks approve quorum"
+    assert "every provider output to validate" in aggregate.memo["quorum"]["rule"]
+    votes = aggregate.memo["provider_votes"]
+    assert any(vote["provider"] == "xai" and vote["validation_passed"] is False for vote in votes)
 
 
 def test_v2_demand_current_evidence_memory_cannot_veto_approve_quorum():
@@ -4336,8 +4368,10 @@ def test_multi_provider_aggregate_aggressive_allows_one_valid_approve_no_reject(
     assert aggregate.validation_passed is True
     assert aggregate.memo["quorum"]["approve_count"] == 1
     assert aggregate.memo["quorum"]["reject_count"] == 0
+    assert aggregate.memo["quorum"]["invalid_provider_count"] == 0
+    assert aggregate.memo["quorum"]["invalid_providers"] == []
     assert aggregate.memo["quorum"]["risk_profile"] == "aggressive"
-    assert "aggressive approve requires at least one valid approve" in aggregate.memo["quorum"]["rule"]
+    assert "aggressive approve requires every provider output to validate" in aggregate.memo["quorum"]["rule"]
 
 
 def test_multi_provider_aggregate_high_exposure_requires_unanimous_approve():
@@ -4409,6 +4443,43 @@ def test_multi_provider_aggregate_high_exposure_accepts_unanimous_approve():
     assert aggregate.memo["quorum"]["approve_count"] == 3
 
 
+def test_multi_provider_aggregate_high_exposure_invalid_blocks_unanimous_approve():
+    packet = build_research_packet(
+        TradeIntent(
+            symbol="SRTY",
+            side="long",
+            entry_price=20.0,
+            confidence=0.7,
+            features={
+                "research_context": {
+                    "risk": {
+                        "risk_profile": {"name": "aggressive"},
+                        "ai_unanimous_required": True,
+                    }
+                }
+            },
+        )
+    )
+
+    aggregate = aggregate_research_memos(
+        "SRTY",
+        [
+            _provider_memo("anthropic", "approve", confidence=0.72),
+            _provider_memo("openai", "approve", confidence=0.68),
+            _provider_memo("xai", "approve", confidence=0.7, valid=False),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "watch"
+    assert aggregate.memo["quorum"]["unanimous_required"] is True
+    assert aggregate.memo["quorum"]["approve_count"] == 2
+    assert aggregate.memo["quorum"]["invalid_provider_count"] == 1
+    assert aggregate.memo["quorum"]["invalid_providers"] == ["xai"]
+    assert aggregate.memo["quorum"]["reason"] == "invalid provider output blocks approve quorum"
+
+
 def test_multi_provider_aggregate_supports_legacy_top_level_risk_profile():
     packet = build_research_packet(
         TradeIntent(
@@ -4451,6 +4522,26 @@ def test_multi_provider_aggregate_reject_overrides_approve_quorum():
     assert aggregate.memo["quorum"]["reject_count"] == 1
 
 
+def test_multi_provider_aggregate_valid_reject_overrides_invalid_provider_output():
+    packet = build_research_packet(TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7))
+    aggregate = aggregate_research_memos(
+        "POET",
+        [
+            _provider_memo("anthropic", "approve", confidence=0.72),
+            _provider_memo("openai", "reject", confidence=0.68),
+            _provider_memo("xai", "approve", confidence=0.9, valid=False),
+        ],
+        packet=packet,
+        input_hash=packet_hash(packet),
+    )
+
+    assert aggregate.verdict == "reject"
+    assert aggregate.memo["quorum"]["reject_count"] == 1
+    assert aggregate.memo["quorum"]["invalid_provider_count"] == 1
+    assert aggregate.memo["quorum"]["invalid_providers"] == ["xai"]
+    assert aggregate.memo["quorum"]["reason"] == "valid provider reject overrides approve quorum"
+
+
 def test_multi_provider_aggregate_invalid_output_cannot_force_approve():
     packet = build_research_packet(TradeIntent(symbol="POET", side="long", entry_price=10.0, confidence=0.7))
     aggregate = aggregate_research_memos(
@@ -4466,6 +4557,9 @@ def test_multi_provider_aggregate_invalid_output_cannot_force_approve():
 
     assert aggregate.verdict == "watch"
     assert aggregate.memo["quorum"]["approve_count"] == 1
+    assert aggregate.memo["quorum"]["invalid_provider_count"] == 1
+    assert aggregate.memo["quorum"]["invalid_providers"] == ["openai"]
+    assert aggregate.memo["quorum"]["reason"] == "invalid provider output blocks approve quorum"
 
 
 @pytest.mark.asyncio
@@ -12064,8 +12158,8 @@ def test_entry_notification_includes_compact_ai_provider_votes():
                     "provider": "xai",
                     "verdict": "approve",
                     "confidence": 0.82,
-                    "validation_passed": True,
-                    "validation_errors": [],
+                    "validation_passed": False,
+                    "validation_errors": ["missing_edge_memory_conflicts"],
                 },
                 {
                     "provider": "openai",
@@ -12117,7 +12211,7 @@ def test_entry_notification_includes_compact_ai_provider_votes():
 
     assert "PAPER ENTRY SUBMITTED: JGRO" in message
     assert "AI votes:" in message
-    assert "Grok: Buy" in message
+    assert "Grok: Error (missing_edge_memory_conflicts)" in message
     assert "ChatGPT: Buy" in message
     assert "Claude: Error (timeout)" in message
     assert "{'provider':" not in message
@@ -13044,7 +13138,7 @@ async def test_ai_entry_gate_systemic_failure_does_not_try_next_candidate(monkey
 
 
 @pytest.mark.asyncio
-async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache_and_edge_memory_action(monkeypatch):
+async def test_ai_entry_gate_ignores_stale_multi_provider_aggregate_cache_version(monkeypatch):
     class GateSettings(DummySupervisorSettings):
         auto_entry_enabled = True
         ai_research_enabled = True
@@ -13113,14 +13207,14 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_model_tag_cache_and_ed
             signal_id=593,
             symbol="IVT",
             provider="multi",
-            model_tag="multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.2",
-            prompt_version="ai_research_aggregate/v1",
+            model_tag="multi/anthropic/claude-opus-4-8+openai/gpt-5.5+xai/grok-4.3",
+            prompt_version="ai_research_aggregate/v4",
             input_hash="old-aggregate",
-            verdict="watch",
-            confidence=0.61,
+            verdict="approve",
+            confidence=0.81,
             used_only_provided_data=True,
             validation_passed=True,
-            memo={"summary": "old xAI model should not cache-hit"},
+            memo={"summary": "old aggregate approval should not cache-hit after quorum rule changes"},
         )
 
         async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):

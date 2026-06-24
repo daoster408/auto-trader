@@ -122,6 +122,10 @@ def _failure_category(*, memo: dict[str, Any] | None, validation_errors: list[An
         text = str(error)
         if text.startswith(FAILURE_PREFIX) and text != "ai_research_provider_failed":
             return _clean_failure_category(text.removeprefix(FAILURE_PREFIX))
+    for error in validation_errors or []:
+        text = str(error)
+        if text.startswith("missing_") or text.startswith("invalid_"):
+            return _clean_failure_category(text)
     return "unknown"
 
 
