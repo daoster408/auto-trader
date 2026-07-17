@@ -476,6 +476,8 @@ class TelegramBot:
                 str(getattr(self.risk.settings, "ai_entry_gate_enabled", False)),
             )
         ).lower() in {"1", "true", "yes", "on", "enabled"}
+        simplified_runtime = bool(getattr(self.risk.settings, "simplified_runtime_enabled", False))
+        ai_provider = str(getattr(self.risk.settings, "ai_research_provider", "shadow") or "shadow")
         risk_profile = self._risk_profile_from_values(runtime_config)
         equity = float(account.get("equity") or health.get("equity") or 0.0)
         snap = self.sm.get_snapshot(
@@ -506,7 +508,18 @@ class TelegramBot:
             f"State allows trading: {self.sm.can_trade()}",
             f"Runtime auto-entry: {auto_entry_enabled}",
             f"Runtime AI entry gate: {ai_entry_gate_enabled}",
-            f"Risk profile: {risk_profile}",
+            (
+                "AI decision path: required before RiskEngine"
+                if ai_entry_gate_enabled
+                else "AI decision path: BYPASSED (AI gate disabled; deterministic RiskEngine path only)"
+            ),
+            f"Runtime mode: {'simplified' if simplified_runtime else 'legacy'}",
+            f"AI provider: {ai_provider if simplified_runtime else 'legacy configured provider set'}",
+            (
+                f"Risk controls: explicit (legacy profile metadata: {risk_profile})"
+                if simplified_runtime
+                else f"Risk profile: {risk_profile}"
+            ),
             f"New entries: {_entry_status(self.sm.can_trade(), auto_entry_enabled, positions, max_positions, today_new_entries, errors, account_tradable)}",
             f"Today new entries: {today_new_entries if today_new_entries is not None else 'unknown'} / {max_positions}",
             f"Alpaca: {account.get('status') or health.get('status')}",
@@ -550,18 +563,36 @@ class TelegramBot:
         )
         ai_entry_gate_source = "runtime" if "ai_entry_gate_enabled" in values else "env default"
         risk_profile_source = "runtime" if "risk_profile" in values else "env default"
+        simplified_runtime = bool(getattr(self.risk.settings, "simplified_runtime_enabled", False))
+        ai_provider = str(getattr(self.risk.settings, "ai_research_provider", "shadow") or "shadow")
+        risk_line = (
+            f"risk_profile: {risk_profile} (legacy metadata; ignored by simplified controls)"
+            if simplified_runtime
+            else f"risk_profile: {risk_profile} ({risk_profile_source})"
+        )
+        usage_lines = [
+            "Use: /config auto_entry on | /config auto_entry off",
+            "     /config ai_gate on | /config ai_gate off",
+            "     /config max_entries <positive integer>",
+        ]
+        if not simplified_runtime:
+            usage_lines.insert(2, "     /config risk_profile conservative | aggressive | risky")
         return "\n".join(
             [
                 "RUNTIME CONFIG",
+                f"simplified_runtime_enabled: {simplified_runtime} (env)",
+                f"ai_research_provider: {ai_provider} (env)",
                 f"auto_entry_enabled: {auto_entry} ({auto_entry_source})",
                 f"ai_entry_gate_enabled: {ai_entry_gate} ({ai_entry_gate_source})",
-                f"risk_profile: {risk_profile} ({risk_profile_source})",
+                (
+                    "ai_decision_path: required before RiskEngine"
+                    if ai_entry_gate
+                    else "ai_decision_path: BYPASSED; deterministic RiskEngine path only"
+                ),
+                risk_line,
                 f"auto_exit_enabled: {bool(getattr(self.risk.settings, 'auto_exit_enabled', False))} (env)",
                 f"max_new_positions_per_day: {max_new_positions} ({max_positions_source})",
-                "Use: /config auto_entry on | /config auto_entry off",
-                "     /config ai_gate on | /config ai_gate off",
-                "     /config risk_profile conservative | aggressive | risky",
-                "     /config max_entries <positive integer>",
+                *usage_lines,
             ]
         )
 
@@ -816,6 +847,12 @@ class TelegramBot:
             )
             return
         if key in {"risk_profile", "profile", "mode"}:
+            if bool(getattr(self.risk.settings, "simplified_runtime_enabled", False)):
+                await update.message.reply_text(
+                    "Risk profiles are parked in simplified mode. Sizing, discovery, and prefilter controls "
+                    "come from explicit reviewed environment settings."
+                )
+                return
             if raw_value not in set(VALID_RISK_PROFILES):
                 await update.message.reply_text("Use: /config risk_profile conservative | aggressive | risky")
                 return

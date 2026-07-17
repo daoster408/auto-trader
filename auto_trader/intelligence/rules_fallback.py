@@ -19,7 +19,7 @@ from typing import Any
 
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.models import TradeIntent
-from auto_trader.core.risk_profile import DiscoveryProfile, get_risk_profile
+from auto_trader.core.risk_profile import DiscoveryProfile, get_risk_profile, resolve_discovery_profile
 from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.fred_client import FredClient
 from auto_trader.intelligence.research_context import (
@@ -187,12 +187,20 @@ async def discover_dynamic_candidates(
     max_candidates: int = 10,
     risk_profile: str = "conservative",
     paper: bool = True,
+    settings: Any | None = None,
 ) -> list[DiscoveryCandidate]:
     """Discover ranked candidates from the broad Alpaca tradable universe."""
-    profile = get_risk_profile(risk_profile, paper=paper)
-    discovery_profile = profile.discovery
-    max_assets = max(max_assets, discovery_profile.max_assets)
-    max_candidates = max(max_candidates, discovery_profile.max_candidates)
+    discovery_profile, control_mode = resolve_discovery_profile(
+        settings,
+        risk_profile=risk_profile,
+        paper=paper,
+    )
+    if control_mode == "explicit":
+        max_assets = discovery_profile.max_assets
+        max_candidates = discovery_profile.max_candidates
+    else:
+        max_assets = max(max_assets, discovery_profile.max_assets)
+        max_candidates = max(max_candidates, discovery_profile.max_candidates)
     assets = await adapter.get_tradable_assets()
     symbols = [a["symbol"] for a in assets if a.get("fractionable")]
 
@@ -228,7 +236,7 @@ async def discover_dynamic_candidates(
         scanned=len(symbols),
         candidates=len(candidates),
         returned=len(ranked),
-        risk_profile=profile.name,
+        risk_profile=control_mode,
     )
     return ranked
 
@@ -240,6 +248,7 @@ async def get_simple_rules_signals(
     fred_client: FredClient | None = None,
     risk_profile: str = "conservative",
     paper: bool = True,
+    settings: Any | None = None,
 ) -> list[TradeIntent]:
     """Return TradeIntents from dynamic market discovery (no watchlist)."""
     profile = get_risk_profile(risk_profile, paper=paper)
@@ -251,12 +260,19 @@ async def get_simple_rules_signals(
     if supports_profile:
         discover_kwargs["risk_profile"] = profile.name
         discover_kwargs["paper"] = paper
+    if "settings" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    ):
+        discover_kwargs["settings"] = settings
     candidates = await discover_dynamic_candidates(adapter, **discover_kwargs)
+    control_mode = "explicit" if settings is not None and bool(
+        getattr(settings, "simplified_runtime_enabled", False)
+    ) else profile.name
     signals: list[TradeIntent] = []
     for candidate in candidates[:max_signals]:
         features: dict[str, Any] = {
             "discovery": _alpaca_candidate_features(candidate),
-            "risk_profile": profile.name,
+            "risk_profile": control_mode,
         }
         research_context = candidate.research_context or {}
         if finnhub_client is not None and finnhub_client.enabled:

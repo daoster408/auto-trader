@@ -17,8 +17,10 @@ from auto_trader.execution.order_manager import OrderManager
 from auto_trader.intelligence.ai_committee import (
     AGGREGATE_PROMPT_VERSION,
     PROMPT_VERSION,
+    SIMPLIFIED_PROMPT_VERSION,
     ResearchMemo,
     ShadowResearchCommittee,
+    UnavailableResearchCommittee,
     build_research_packet,
     create_research_committee,
     packet_hash,
@@ -97,9 +99,18 @@ async def _runtime_entry_cap(settings: Any, *, paper: bool, risk_profile: str) -
     return max(configured, 1)
 
 
+def _single_provider_prompt_version(committee: Any) -> str:
+    return str(getattr(committee, "prompt_version", PROMPT_VERSION) or PROMPT_VERSION)
+
+
+def _include_edge_memory(committee: Any) -> bool:
+    return bool(getattr(committee, "include_edge_memory", True))
+
+
 async def _get_profiled_rules_signals(
     adapter: AlpacaAdapter,
     *,
+    settings: Any,
     max_signals: int,
     finnhub_client: FinnhubClient | None,
     fred_client: FredClient | None,
@@ -107,24 +118,27 @@ async def _get_profiled_rules_signals(
     paper: bool,
 ):
     parameters = inspect.signature(get_simple_rules_signals).parameters
-    supports_profile = "risk_profile" in parameters or any(
+    supports_kwargs = any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
     )
+    supports_profile = "risk_profile" in parameters or supports_kwargs
     if supports_profile:
-        return await get_simple_rules_signals(
-            adapter,
-            max_signals=max_signals,
-            finnhub_client=finnhub_client,
-            fred_client=fred_client,
-            risk_profile=risk_profile,
-            paper=paper,
-        )
-    return await get_simple_rules_signals(
-        adapter,
-        max_signals=max_signals,
-        finnhub_client=finnhub_client,
-        fred_client=fred_client,
-    )
+        kwargs = {
+            "max_signals": max_signals,
+            "finnhub_client": finnhub_client,
+            "fred_client": fred_client,
+            "risk_profile": risk_profile,
+            "paper": paper,
+        }
+    else:
+        kwargs = {
+            "max_signals": max_signals,
+            "finnhub_client": finnhub_client,
+            "fred_client": fred_client,
+        }
+    if "settings" in parameters or supports_kwargs:
+        kwargs["settings"] = settings
+    return await get_simple_rules_signals(adapter, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -706,12 +720,28 @@ class TradingSupervisor:
         self._pending_exit_symbols: set[str] = set()
         self._last_risk_sweep_dates: set[str] = set()
         self.finnhub_client = FinnhubClient(getattr(settings, "finnhub_api_key", None))
-        self.fred_client = FredClient(getattr(settings, "fred_api_key", None))
-        self.research_committee = (
-            create_research_committee(settings)
-            if bool(getattr(settings, "ai_research_enabled", True))
-            else ShadowResearchCommittee()
+        self.fred_client = (
+            None
+            if bool(getattr(settings, "simplified_runtime_enabled", False))
+            else FredClient(getattr(settings, "fred_api_key", None))
         )
+        simplified_runtime = bool(getattr(settings, "simplified_runtime_enabled", False))
+        self._ai_provider_setup_error: str | None = None
+        if bool(getattr(settings, "ai_research_enabled", True)):
+            try:
+                self.research_committee = create_research_committee(settings)
+            except Exception as exc:
+                log.error("ai_research_provider_setup_failed", error=str(exc))
+                self._ai_provider_setup_error = str(exc)
+                self.research_committee = UnavailableResearchCommittee(
+                    self._ai_provider_setup_error,
+                    prompt_version=SIMPLIFIED_PROMPT_VERSION if simplified_runtime else PROMPT_VERSION,
+                )
+        else:
+            self.research_committee = ShadowResearchCommittee(
+                include_edge_memory=not simplified_runtime,
+                prompt_version=SIMPLIFIED_PROMPT_VERSION if simplified_runtime else PROMPT_VERSION,
+            )
 
     def _alert_local_date(self) -> str:
         timezone = ZoneInfo(getattr(self.settings, "report_timezone", "America/Los_Angeles"))
@@ -1141,6 +1171,7 @@ class TradingSupervisor:
         candidate_limit = max(1, ENTRY_CANDIDATE_EVAL_LIMIT)
         signals = await _get_profiled_rules_signals(
             self.adapter,
+            settings=self.settings,
             max_signals=candidate_limit,
             finnhub_client=self.finnhub_client,
             fred_client=self.fred_client,
@@ -1154,6 +1185,7 @@ class TradingSupervisor:
             "ai_entry_gate_enabled",
             default=bool(getattr(self.settings, "ai_entry_gate_enabled", False)),
         )
+        simplified_runtime = bool(getattr(self.settings, "simplified_runtime_enabled", False))
         last_blocked_result: dict[str, Any] | None = None
         real_providers = real_research_providers(self.research_committee)
         evaluations: list[EntryCandidateEvaluation] = []
@@ -1263,7 +1295,11 @@ class TradingSupervisor:
                         model_tag="rules_fallback/v0",
                         features=intent.features,
                     )
-                    packet = build_research_packet(intent, signal_id=signal_id)
+                    packet = build_research_packet(
+                        intent,
+                        signal_id=signal_id,
+                        include_edge_memory=_include_edge_memory(self.research_committee),
+                    )
                     await self._persist_paid_prefilter_block(
                         intent,
                         signal_id=signal_id,
@@ -1338,7 +1374,25 @@ class TradingSupervisor:
             )
             ai_result: AIResearchRunResult | None = None
             paid_research_allowed = ai_gate_enabled or not real_providers
-            if ai_research_enabled and paid_research_allowed:
+            if simplified_runtime and not ai_gate_enabled:
+                log.info(
+                    "simplified_ai_decision_bypassed_gate_disabled",
+                    symbol=intent.symbol.upper(),
+                )
+            elif ai_research_enabled and self._ai_provider_setup_error:
+                if ai_gate_enabled:
+                    ai_result = AIResearchRunResult(
+                        symbol=intent.symbol.upper(),
+                        verdict="watch",
+                        validation_passed=False,
+                        reason="ai_research_provider_setup_failed",
+                    )
+                else:
+                    log.warning(
+                        "ai_research_skipped_provider_setup_failed_gate_disabled",
+                        symbol=intent.symbol.upper(),
+                    )
+            elif ai_research_enabled and paid_research_allowed:
                 ai_result = await self._run_ai_research(intent, signal_id=signal_id, risk_profile=risk_profile)
             elif ai_research_enabled and real_providers:
                 log.info(
@@ -1367,7 +1421,11 @@ class TradingSupervisor:
                         symbol=intent.symbol.upper(),
                         verdict="watch",
                         validation_passed=False,
-                        reason="real_ai_provider_required_for_entry_gate",
+                        reason=(
+                            "ai_research_provider_setup_failed"
+                            if self._ai_provider_setup_error
+                            else "real_ai_provider_required_for_entry_gate"
+                        ),
                     )
                 if not ai_result.approved_for_entry:
                     last_blocked_result = await self._block_entry_for_ai_gate(
@@ -1454,7 +1512,7 @@ class TradingSupervisor:
         model_tag = str(getattr(self.research_committee, "model_tag", provider))
         cache_provider = real_providers[0] if len(real_providers) == 1 else provider
         cache_prompt_versions = (
-            (PROMPT_VERSION, "ai_research_failure/v0")
+            (_single_provider_prompt_version(self.research_committee), "ai_research_failure/v0")
             if len(real_providers) == 1
             else (AGGREGATE_PROMPT_VERSION, "ai_research_failure/v0")
         )
@@ -1569,14 +1627,18 @@ class TradingSupervisor:
         risk_profile: str = "conservative",
     ) -> AIResearchRunResult:
         provider = str(getattr(self.research_committee, "provider", "shadow"))
-        packet = build_research_packet(intent, signal_id=signal_id)
+        packet = build_research_packet(
+            intent,
+            signal_id=signal_id,
+            include_edge_memory=_include_edge_memory(self.research_committee),
+        )
         digest = packet_hash(packet)
         model_tag = str(getattr(self.research_committee, "model_tag", provider))
         real_providers = real_research_providers(self.research_committee)
         if real_providers:
             cache_provider = real_providers[0] if len(real_providers) == 1 else provider
             cache_prompt_versions = (
-                (PROMPT_VERSION, "ai_research_failure/v0")
+                (_single_provider_prompt_version(self.research_committee), "ai_research_failure/v0")
                 if len(real_providers) == 1
                 else (AGGREGATE_PROMPT_VERSION, "ai_research_failure/v0")
             )

@@ -81,34 +81,45 @@ def evaluate_paid_ai_prefilter(
         paper=bool(getattr(settings, "alpaca_paper", True)),
     )
     profile_prefilter = profile.paid_ai_prefilter
-    conservative_prefilter = get_risk_profile("conservative", paper=True).paid_ai_prefilter
-    min_rel_volume = _profile_or_env_float(
-        settings,
-        "ai_paid_prefilter_min_rel_volume",
-        conservative_prefilter.min_rel_volume,
-        profile_prefilter.min_rel_volume,
-    )
-    strong_rel_volume = _profile_or_env_float(
-        settings,
-        "ai_paid_prefilter_strong_rel_volume",
-        conservative_prefilter.strong_rel_volume,
-        profile_prefilter.strong_rel_volume,
-    )
-    high_buffer = abs(
-        _profile_or_env_float(
+    simplified_runtime = bool(getattr(settings, "simplified_runtime_enabled", False))
+    if simplified_runtime:
+        min_rel_volume = float(getattr(settings, "ai_paid_prefilter_min_rel_volume", 1.0))
+        strong_rel_volume = float(getattr(settings, "ai_paid_prefilter_strong_rel_volume", 2.5))
+        high_buffer = abs(float(getattr(settings, "ai_paid_prefilter_high_buffer_pct", 0.002)))
+        block_inverse_overlap = bool(getattr(settings, "ai_paid_prefilter_block_inverse_overlap", True))
+        control_mode = "explicit"
+    else:
+        conservative_prefilter = get_risk_profile("conservative", paper=True).paid_ai_prefilter
+        min_rel_volume = _profile_or_env_float(
             settings,
-            "ai_paid_prefilter_high_buffer_pct",
-            conservative_prefilter.high_buffer_pct,
-            profile_prefilter.high_buffer_pct,
+            "ai_paid_prefilter_min_rel_volume",
+            conservative_prefilter.min_rel_volume,
+            profile_prefilter.min_rel_volume,
         )
-    )
+        strong_rel_volume = _profile_or_env_float(
+            settings,
+            "ai_paid_prefilter_strong_rel_volume",
+            conservative_prefilter.strong_rel_volume,
+            profile_prefilter.strong_rel_volume,
+        )
+        high_buffer = abs(
+            _profile_or_env_float(
+                settings,
+                "ai_paid_prefilter_high_buffer_pct",
+                conservative_prefilter.high_buffer_pct,
+                profile_prefilter.high_buffer_pct,
+            )
+        )
+        block_inverse_overlap = bool(
+            getattr(settings, "ai_paid_prefilter_block_inverse_overlap", profile_prefilter.block_inverse_overlap)
+        ) and profile_prefilter.block_inverse_overlap
+        control_mode = f"legacy_profile:{profile.name}"
 
     reasons: list[str] = []
     if rel_volume is not None and rel_volume < min_rel_volume:
         reasons.append("low_relative_volume")
     if (
-        bool(getattr(settings, "ai_paid_prefilter_block_inverse_overlap", profile_prefilter.block_inverse_overlap))
-        and profile_prefilter.block_inverse_overlap
+        block_inverse_overlap
         and inverse_or_leveraged
         and inverse_overlap
     ):
@@ -138,6 +149,7 @@ def evaluate_paid_ai_prefilter(
         "inverse_overlap": inverse_overlap,
         "position_symbols": position_symbols,
         "risk_profile": profile.name,
+        "risk_control_mode": control_mode,
     }
     return PaidAIPrefilterResult(symbol=symbol, blocked=bool(reasons), reasons=reasons, evidence=evidence)
 

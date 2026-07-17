@@ -23,14 +23,25 @@ class Settings(BaseSettings):
     shutdown_flatten_on_exit: bool = Field(True, alias="SHUTDOWN_FLATTEN_ON_EXIT")
 
     # Risk (v1 defaults - changes require DECISIONS_LOG entry + restart)
+    simplified_runtime_enabled: bool = Field(True, alias="SIMPLIFIED_RUNTIME_ENABLED")
     risk_per_trade_pct: float = Field(0.5, alias="RISK_PER_TRADE_PCT")
     risk_profile: Literal["conservative", "aggressive", "risky"] = Field("conservative", alias="RISK_PROFILE")
+    max_position_notional_pct: float = Field(7.5, gt=0.0, le=100.0, alias="MAX_POSITION_NOTIONAL_PCT")
     max_new_positions_per_day: int = Field(1, alias="MAX_NEW_POSITIONS_PER_DAY")
     max_gross_exposure_pct: float = Field(25.0, alias="MAX_GROSS_EXPOSURE_PCT")
     daily_loss_halt_pct: float = Field(-1.75, alias="DAILY_LOSS_HALT_PCT")
     weekly_loss_halt_pct: float = Field(-4.0, alias="WEEKLY_LOSS_HALT_PCT")
     peak_drawdown_halt_pct: float = Field(-6.0, alias="PEAK_DRAWDOWN_HALT_PCT")
     consecutive_sl_halt: int = Field(2, alias="CONSECUTIVE_SL_HALT")
+    discovery_min_price: float = Field(2.0, gt=0.0, alias="DISCOVERY_MIN_PRICE")
+    discovery_max_price: float = Field(150.0, gt=0.0, alias="DISCOVERY_MAX_PRICE")
+    discovery_min_dollar_volume: float = Field(1_000_000.0, ge=0.0, alias="DISCOVERY_MIN_DOLLAR_VOLUME")
+    discovery_max_spread_pct: float = Field(0.01, ge=0.0, le=1.0, alias="DISCOVERY_MAX_SPREAD_PCT")
+    discovery_min_change_pct: float = Field(0.005, alias="DISCOVERY_MIN_CHANGE_PCT")
+    discovery_max_change_pct: float = Field(0.18, alias="DISCOVERY_MAX_CHANGE_PCT")
+    discovery_min_intraday_pct: float = Field(-0.035, alias="DISCOVERY_MIN_INTRADAY_PCT")
+    discovery_max_assets: int = Field(900, ge=1, alias="DISCOVERY_MAX_ASSETS")
+    discovery_max_candidates: int = Field(12, ge=1, alias="DISCOVERY_MAX_CANDIDATES")
 
     # Supervisor / automation controls (default alert-only)
     reconcile_interval_seconds: int = Field(300, ge=60, alias="RECONCILE_INTERVAL_SECONDS")
@@ -209,6 +220,10 @@ class Settings(BaseSettings):
             raise ValueError("SHUTDOWN_FLATTEN_ON_EXIT=false is only allowed in Alpaca paper mode")
         if self.position_stagnation_min_pnl_pct > self.position_stagnation_max_pnl_pct:
             raise ValueError("POSITION_STAGNATION_MIN_PNL_PCT must be <= POSITION_STAGNATION_MAX_PNL_PCT")
+        if self.discovery_min_price > self.discovery_max_price:
+            raise ValueError("DISCOVERY_MIN_PRICE must be <= DISCOVERY_MAX_PRICE")
+        if self.discovery_min_change_pct > self.discovery_max_change_pct:
+            raise ValueError("DISCOVERY_MIN_CHANGE_PCT must be <= DISCOVERY_MAX_CHANGE_PCT")
         return self
 
 

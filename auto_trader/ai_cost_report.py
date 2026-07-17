@@ -127,9 +127,19 @@ def _estimate_cost(*, input_tokens: int, output_tokens: int, price: ProviderPric
     return input_cost + output_cost
 
 
-async def build_ai_cost_report(*, settings: Any, days: int = 1) -> AICostReport:
+async def build_ai_cost_report(
+    *,
+    settings: Any,
+    days: int = 1,
+    start_utc: datetime | None = None,
+    end_utc: datetime | None = None,
+) -> AICostReport:
     timezone_name = str(getattr(settings, "report_timezone", "America/Los_Angeles") or "America/Los_Angeles")
-    start_utc, end_utc = _utc_window_for_local_days(days=days, timezone_name=timezone_name)
+    if start_utc is None or end_utc is None:
+        start_utc, end_utc = _utc_window_for_local_days(days=days, timezone_name=timezone_name)
+    else:
+        start_utc = start_utc.astimezone(UTC)
+        end_utc = end_utc.astimezone(UTC)
     configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
     db_path = Path(get_configured_db_path())
     if not db_path.exists():

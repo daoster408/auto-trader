@@ -67,6 +67,7 @@ Per session, update:
 ## Strategy Simplicity And Evaluation Rules
 
 - Active target flow: scanner -> deterministic prefilter -> one configured real AI decision -> RiskEngine -> OrderManager -> deterministic exits.
+- Disabling the AI entry gate intentionally bypasses the AI step and leaves the deterministic RiskEngine path; this bypass must be plainly visible to the operator.
 - Primary metrics: net realized dollars, dollar expectancy after losses and costs, average dollar win/loss, profit factor, drawdown, API cost, and incremental AI-added dollars.
 - Track rejected candidates over predefined comparable windows using observed market data. Do not invent fills or cherry-pick a favorable horizon after the outcome is known.
 - A high win rate with negative net dollars is failure.

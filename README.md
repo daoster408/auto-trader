@@ -46,7 +46,7 @@ scanner -> deterministic prefilter -> one real AI decision -> RiskEngine -> Orde
 
 ## Implemented Capabilities
 
-The repository still contains the pre-pivot multi-provider and postmortem machinery until the implementation phase removes it from the active runtime path.
+The repository now defaults to the simplified runtime path. Pre-pivot multi-provider and postmortem machinery remains available only as parked legacy/offline tooling. Oracle is not changed until the reviewed code is intentionally deployed.
 
 - Alpaca paper account connectivity
 - Telegram bot token validation
@@ -55,8 +55,9 @@ The repository still contains the pre-pivot multi-provider and postmortem machin
 - Risk-gated order submission through `OrderManager`
 - Supervised Oracle/systemd paper runner with planned-maintenance restart helper
 - Runtime Telegram config for auto-entry, AI gate, legacy risk profile, and explicit `max_entries`
-- Legacy AI entry gate with paid-prefilter, budget accounting, and multi-provider committee support
-- Legacy scoreboard memory, brain guidance, and paid postmortem tooling
+- Simplified AI entry gate with one configured real provider, deterministic paid-call prefilter, and budget accounting
+- Dollar-first edge reporting with estimated AI cost, net dollars, expectancy, profit factor, and drawdown
+- Parked legacy multi-provider, scoreboard-memory, brain-guidance, and paid-postmortem tooling
 - Launchpad entry-pressure diagnostics that explain likely blockers without placing orders or calling paid AI
 - Deterministic exits for max loss, take profit, trailing stop, max hold, and stagnation
 - Emergency `/kill` and OS-signal halt/flatten path

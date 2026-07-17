@@ -17,9 +17,11 @@ The active target is intentionally small:
 scanner -> deterministic prefilter -> one configured real AI decision -> RiskEngine -> OrderManager -> deterministic exits
 ```
 
+The one-AI step is required only while the AI entry gate is enabled. Disabling that gate is an explicit operator bypass to the deterministic RiskEngine path and must be visible in status/preflight output.
+
 Keep the broker adapter, Oracle runner, state machine, RiskEngine, kill/halt behavior, duplicate-order protection, reconciliation, deterministic exits, persistence, and audit journal.
 
-Park multi-provider committee voting, Gemini/DeepSeek/Fable escalation, FRED-in-entry, and postmortem bias injection. They remain in history and may remain in code until the implementation pass, but they are not part of the target runtime path.
+Multi-provider committee voting, Gemini/DeepSeek/Fable escalation, FRED-in-entry, and postmortem bias injection remain in history and parked legacy/offline code paths. They are not part of the simplified runtime path. The local repository implements this mode; Oracle remains on its prior deployed build until an intentional reviewed deployment.
 
 The primary optimization objective is net dollars after losses and attributable AI cost, with drawdown constrained by explicit risk limits. Win rate is diagnostic only.
 

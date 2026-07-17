@@ -5,13 +5,14 @@ import argparse
 import asyncio
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
+from auto_trader.ai_cost_report import build_ai_cost_report
 from auto_trader.config.settings import get_settings
 from auto_trader.intelligence.ai_paid_prefilter import INVERSE_OR_LEVERAGED_SYMBOLS
 from auto_trader.persistence.db import configure_db_path, get_configured_db_path, init_db
@@ -72,6 +73,9 @@ class EdgeReport:
     window_days: int
     closed_trades: list[ClosedTradeEvidence]
     opportunities: list[OpportunityEvidence]
+    estimated_ai_cost: float | None = None
+    ai_cost_unknown_calls: int = 0
+    ai_cost_unavailable_reason: str | None = None
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -531,6 +535,25 @@ async def build_edge_report(*, db_path: Path | None = None, window_days: int = 7
     )
 
 
+async def _attach_ai_cost(report: EdgeReport, *, settings: Any) -> EdgeReport:
+    end_utc = datetime.now(UTC)
+    start_utc = end_utc - timedelta(days=max(1, int(report.window_days)))
+    try:
+        cost = await build_ai_cost_report(
+            settings=settings,
+            start_utc=start_utc,
+            end_utc=end_utc,
+        )
+    except Exception as exc:
+        return replace(report, ai_cost_unavailable_reason=f"cost estimate failed: {type(exc).__name__}")
+    return replace(
+        report,
+        estimated_ai_cost=None if cost.unavailable_reason else cost.total_estimated_cost,
+        ai_cost_unknown_calls=cost.total_usage_unknown,
+        ai_cost_unavailable_reason=cost.unavailable_reason,
+    )
+
+
 def _money(value: float) -> str:
     sign = "-" if value < 0 else ""
     return f"{sign}${abs(value):,.2f}"
@@ -548,7 +571,7 @@ def _bucket_counts(values: list[str]) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
 
 
-def _trade_stats(trades: list[ClosedTradeEvidence]) -> dict[str, float]:
+def _trade_stats(trades: list[ClosedTradeEvidence]) -> dict[str, Any]:
     if not trades:
         return {
             "count": 0,
@@ -562,6 +585,8 @@ def _trade_stats(trades: list[ClosedTradeEvidence]) -> dict[str, float]:
             "gross_profit": 0.0,
             "gross_loss": 0.0,
             "payoff_ratio": 0.0,
+            "profit_factor": None,
+            "max_realized_drawdown": 0.0,
             "breakeven_win_rate": 0.0,
         }
     wins = [trade.pnl for trade in trades if trade.pnl > 0]
@@ -573,6 +598,17 @@ def _trade_stats(trades: list[ClosedTradeEvidence]) -> dict[str, float]:
     avg_loss = (gross_loss / len(losses)) if losses else 0.0
     loss_size = abs(avg_loss)
     payoff_ratio = (avg_win / loss_size) if avg_win > 0 and loss_size > 0 else 0.0
+    profit_factor = (gross_profit / abs(gross_loss)) if gross_profit > 0 and gross_loss < 0 else None
+    cumulative_pnl = 0.0
+    peak_pnl = 0.0
+    max_realized_drawdown = 0.0
+    for trade in sorted(
+        trades,
+        key=lambda row: row.exit_time or datetime.min.replace(tzinfo=UTC),
+    ):
+        cumulative_pnl += trade.pnl
+        peak_pnl = max(peak_pnl, cumulative_pnl)
+        max_realized_drawdown = max(max_realized_drawdown, peak_pnl - cumulative_pnl)
     breakeven_win_rate = (loss_size / (avg_win + loss_size) * 100.0) if avg_win > 0 and loss_size > 0 else 0.0
     return {
         "count": float(len(trades)),
@@ -586,6 +622,8 @@ def _trade_stats(trades: list[ClosedTradeEvidence]) -> dict[str, float]:
         "gross_profit": gross_profit,
         "gross_loss": gross_loss,
         "payoff_ratio": payoff_ratio,
+        "profit_factor": profit_factor,
+        "max_realized_drawdown": max_realized_drawdown,
         "breakeven_win_rate": breakeven_win_rate,
     }
 
@@ -661,6 +699,13 @@ def _payoff_ratio_text(stats: dict[str, float]) -> str:
     if stats["avg_win"] <= 0:
         return "no wins yet"
     return f"{stats['payoff_ratio']:.2f}x"
+
+
+def _profit_factor_text(stats: dict[str, Any]) -> str:
+    value = stats.get("profit_factor")
+    if value is None:
+        return "n/a (no mix of profits and losses)"
+    return f"{float(value):.2f}x"
 
 
 def _win_rate_gap_text(stats: dict[str, float]) -> str:
@@ -924,7 +969,13 @@ def _render_ai_edge_check(trades: list[ClosedTradeEvidence]) -> list[str]:
     return lines
 
 
-def _summary_lines(trades: list[ClosedTradeEvidence], opportunities: list[OpportunityEvidence], stats: dict[str, float]) -> list[str]:
+def _summary_lines(
+    trades: list[ClosedTradeEvidence],
+    opportunities: list[OpportunityEvidence],
+    stats: dict[str, Any],
+    *,
+    estimated_ai_cost: float | None,
+) -> list[str]:
     approved = [trade for trade in trades if _is_ai_approved(trade.ai_verdict)]
     other = [trade for trade in trades if not _is_ai_approved(trade.ai_verdict)]
     approved_stats = _trade_stats(approved)
@@ -954,10 +1005,12 @@ def _summary_lines(trades: list[ClosedTradeEvidence], opportunities: list[Opport
         lines.append("- Biggest pressure: none; all observed opportunities traded.")
     else:
         lines.append("- Biggest pressure: no opportunity evidence in this window.")
-    if stats["expectancy"] > 0:
-        lines.append("- Scorecard is positive so far, but edge graduation needs more trades.")
+    net_pnl = stats["realized_pnl"] - estimated_ai_cost if estimated_ai_cost is not None else stats["realized_pnl"]
+    if net_pnl > 0:
+        suffix = " after estimated AI cost" if estimated_ai_cost is not None else " before unavailable AI cost"
+        lines.append(f"- Dollar scorecard is positive{suffix}, but edge graduation needs more trades.")
     elif trades:
-        lines.append("- Scorecard is flat/negative so far; keep watching what the AI blocks vs approves.")
+        lines.append("- Dollar scorecard is flat/negative; win rate cannot compensate for losing money.")
     return lines
 
 
@@ -1055,7 +1108,16 @@ def render_learning_brief(report: EdgeReport) -> str:
         "LEARNING BRIEF",
         f"Window: last {report.window_days} days",
         f"Evidence: {int(stats['count'])} closed trades, {len(opportunities)} opportunities",
-        f"Realized P/L: {_money(stats['realized_pnl'])}; expectancy/trade {_money(stats['expectancy'])}; win {stats['win_rate']:.1f}%",
+        f"Realized P/L before AI cost: {_money(stats['realized_pnl'])}",
+        (
+            f"Net after estimated AI cost: {_money(stats['realized_pnl'] - report.estimated_ai_cost)}"
+            if report.estimated_ai_cost is not None
+            else "Net after estimated AI cost: unavailable"
+        ),
+        (
+            f"Dollar expectancy/trade: {_money(stats['expectancy'])}; "
+            f"profit factor {_profit_factor_text(stats)}; win rate (secondary) {stats['win_rate']:.1f}%"
+        ),
         f"Sample: {'thin' if int(stats['count']) < 10 else 'building'}",
         "Setup tags with positive observed P/L:",
     ]
@@ -1123,6 +1185,8 @@ def _memory_group_line(row: dict[str, Any]) -> str:
 def render_scoreboard_memory_context(pack: dict[str, Any]) -> str:
     sample_label = str(pack.get("sample_label") or "thin")
     performance = _dict(pack.get("performance"))
+    estimated_ai_cost = _num(performance.get("estimated_ai_cost"))
+    net_after_ai_cost = _num(performance.get("net_after_estimated_ai_cost"))
     lines = [
         "SCOREBOARD MEMORY PACK",
         "Use as compact context only; this is observed evidence, not order authority.",
@@ -1131,9 +1195,15 @@ def render_scoreboard_memory_context(pack: dict[str, Any]) -> str:
             f"opportunities={pack.get('opportunity_count', 0)}; sample={sample_label}"
         ),
         (
-            f"Observed P/L={_money(_float(performance.get('realized_pnl')))}; "
-            f"expectancy={_money(_float(performance.get('expectancy')))}; "
-            f"win={_float(performance.get('win_rate')):.1f}%"
+            f"Observed P/L before AI cost={_money(_float(performance.get('realized_pnl')))}; "
+            f"estimated AI cost={_money(estimated_ai_cost) if estimated_ai_cost is not None else 'unavailable'}; "
+            f"net={_money(net_after_ai_cost) if net_after_ai_cost is not None else 'unavailable'}; "
+            f"dollar expectancy={_money(_float(performance.get('expectancy')))}"
+        ),
+        (
+            f"Profit factor={performance.get('profit_factor') if performance.get('profit_factor') is not None else 'n/a'}; "
+            f"max realized drawdown={_money(_float(performance.get('max_realized_drawdown')))}; "
+            f"win rate (secondary)={_float(performance.get('win_rate')):.1f}%"
         ),
         f"Caveat: {_list(pack.get('notes'))[0] if _list(pack.get('notes')) else 'Use this to aim questions, not declare truth.'}",
         "Positive setup evidence:",
@@ -1228,6 +1298,15 @@ def build_scoreboard_memory_pack(
         ],
         "performance": {
             "realized_pnl": round(float(stats["realized_pnl"]), 4),
+            "estimated_ai_cost": (
+                None if report.estimated_ai_cost is None else round(float(report.estimated_ai_cost), 4)
+            ),
+            "net_after_estimated_ai_cost": (
+                None
+                if report.estimated_ai_cost is None
+                else round(float(stats["realized_pnl"]) - float(report.estimated_ai_cost), 4)
+            ),
+            "ai_cost_unknown_calls": int(report.ai_cost_unknown_calls),
             "expectancy": round(float(stats["expectancy"]), 4),
             "win_rate": round(float(stats["win_rate"]), 2),
             "wins": int(stats["wins"]),
@@ -1237,6 +1316,10 @@ def build_scoreboard_memory_pack(
             "gross_profit": round(float(stats["gross_profit"]), 4),
             "gross_loss": round(float(stats["gross_loss"]), 4),
             "payoff_ratio": round(float(stats["payoff_ratio"]), 4),
+            "profit_factor": (
+                None if stats["profit_factor"] is None else round(float(stats["profit_factor"]), 4)
+            ),
+            "max_realized_drawdown": round(float(stats["max_realized_drawdown"]), 4),
             "breakeven_win_rate": round(float(stats["breakeven_win_rate"]), 2),
         },
         "positive_observed_tags": positive_tags,
@@ -1280,18 +1363,45 @@ def render_edge_report(report: EdgeReport) -> str:
         f"Window: last {report.window_days} days",
         "",
     ]
-    lines.extend(_summary_lines(trades, opportunities, stats))
+    lines.extend(
+        _summary_lines(
+            trades,
+            opportunities,
+            stats,
+            estimated_ai_cost=report.estimated_ai_cost,
+        )
+    )
     lines.extend(
         [
             "",
-            "Scorecard:",
+            "Dollar scorecard:",
             f"- Closed trades: {int(stats['count'])}",
-            f"- Realized P/L: {_money(stats['realized_pnl'])}",
-            f"- Expectancy/trade: {_money(stats['expectancy'])}",
-            f"- Win rate: {stats['win_rate']:.1f}% ({int(stats['wins'])}W/{int(stats['losses'])}L)",
+            f"- Realized P/L before AI cost: {_money(stats['realized_pnl'])}",
+            (
+                f"- Estimated AI cost: {_money(report.estimated_ai_cost)}"
+                if report.estimated_ai_cost is not None
+                else "- Estimated AI cost: unavailable"
+            ),
+            (
+                f"- Net after estimated AI cost: {_money(stats['realized_pnl'] - report.estimated_ai_cost)}"
+                if report.estimated_ai_cost is not None
+                else "- Net after estimated AI cost: unavailable"
+            ),
+            f"- Dollar expectancy/trade: {_money(stats['expectancy'])}",
             f"- Avg win/loss: {_money(stats['avg_win'])} / {_money(stats['avg_loss'])}",
+            f"- Profit factor: {_profit_factor_text(stats)}",
+            f"- Max realized drawdown: {_money(stats['max_realized_drawdown'])}",
+            f"- Win rate (secondary): {stats['win_rate']:.1f}% ({int(stats['wins'])}W/{int(stats['losses'])}L)",
+            "- Incremental AI-added dollars: not measurable until rejected candidates have observed return outcomes.",
         ]
     )
+    if report.ai_cost_unknown_calls:
+        lines.append(
+            f"- AI cost caveat: {report.ai_cost_unknown_calls} possible billed call(s) had no token usage; "
+            "the estimate may be low."
+        )
+    if report.ai_cost_unavailable_reason:
+        lines.append(f"- AI cost caveat: {report.ai_cost_unavailable_reason}")
     sections = [
         _render_payoff_shape(trades, stats),
         _render_ai_edge_check(trades),
@@ -1311,6 +1421,7 @@ async def run_edge_report(*, window_days: int = 7) -> str:
     settings = get_settings()
     configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
     report = await build_edge_report(window_days=window_days)
+    report = await _attach_ai_cost(report, settings=settings)
     return render_edge_report(report)
 
 
@@ -1318,6 +1429,7 @@ async def run_learning_brief(*, window_days: int = 7) -> str:
     settings = get_settings()
     configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
     report = await build_edge_report(window_days=window_days)
+    report = await _attach_ai_cost(report, settings=settings)
     return render_learning_brief(report)
 
 
@@ -1330,6 +1442,7 @@ async def run_scoreboard_memory_pack(
     settings = get_settings()
     configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
     report = await build_edge_report(window_days=window_days)
+    report = await _attach_ai_cost(report, settings=settings)
     pack = build_scoreboard_memory_pack(report)
     if write_cache:
         write_scoreboard_memory_pack(pack, cache_path or default_scoreboard_memory_pack_path(settings))

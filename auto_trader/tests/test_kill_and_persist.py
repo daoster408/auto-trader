@@ -90,7 +90,7 @@ from auto_trader.friday_recovery_check import build_friday_recovery_report, reco
 from auto_trader.live_preflight import build_live_preflight_report, rehearse_halt_drill
 from auto_trader.week2_launchpad import build_intelligence_readiness, build_week2_launchpad_report, launchpad_exit_code
 from auto_trader.core.risk_engine import RiskEngine
-from auto_trader.core.risk_profile import get_risk_profile
+from auto_trader.core.risk_profile import get_risk_profile, resolve_discovery_profile
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.comms.telegram_bot import TelegramBot, _format_ai_decision_rows
 from auto_trader.config.settings import Settings
@@ -104,8 +104,10 @@ from auto_trader.intelligence.ai_committee import (
     MultiProviderResearchCommittee,
     OpenAIResearchCommittee,
     PROMPT_VERSION,
+    SIMPLIFIED_PROMPT_VERSION,
     ResearchMemo,
     ShadowResearchCommittee,
+    UnavailableResearchCommittee,
     XAIResearchCommittee,
     aggregate_research_memos,
     build_candidate_memory_match,
@@ -115,6 +117,7 @@ from auto_trader.intelligence.ai_committee import (
     normalize_committee_output,
     packet_hash,
     create_research_committee,
+    selected_research_providers,
     validate_committee_output,
 )
 from auto_trader.intelligence.scoreboard_memory import MAX_SCOREBOARD_MEMORY_BYTES
@@ -123,7 +126,11 @@ from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.fred_client import CORE_RISK_SERIES, FredClient
 from auto_trader.intelligence.ai_paid_prefilter import evaluate_paid_ai_prefilter
 import auto_trader.intelligence.rules_fallback as rules_fallback
-from auto_trader.intelligence.rules_fallback import DiscoveryCandidate, get_simple_rules_signals
+from auto_trader.intelligence.rules_fallback import (
+    DiscoveryCandidate,
+    discover_dynamic_candidates,
+    get_simple_rules_signals,
+)
 from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_shutdown, _should_emergency_halt_on_shutdown
 from auto_trader.scheduler.trading_supervisor import (
     AIResearchRunResult,
@@ -451,6 +458,33 @@ def test_settings_bounds_live_ai_provider_reliability_knobs():
             RESUME_TOKEN="resume",
             AI_RESEARCH_ANTHROPIC_MAX_TOKENS=9000,
         )
+
+
+def test_settings_defaults_to_explicit_simplified_runtime_controls():
+    settings = Settings(
+        ALPACA_API_KEY="key",
+        ALPACA_API_SECRET="secret",
+        TELEGRAM_BOT_TOKEN="token",
+        RESUME_TOKEN="resume",
+    )
+
+    assert settings.simplified_runtime_enabled is True
+    assert settings.max_position_notional_pct == 7.5
+    assert settings.discovery_max_assets == 900
+    assert settings.discovery_max_candidates == 12
+
+
+def test_settings_rejects_invalid_explicit_simplified_ranges():
+    common = {
+        "ALPACA_API_KEY": "key",
+        "ALPACA_API_SECRET": "secret",
+        "TELEGRAM_BOT_TOKEN": "token",
+        "RESUME_TOKEN": "resume",
+    }
+    with pytest.raises(ValidationError, match="DISCOVERY_MIN_PRICE"):
+        Settings(**common, DISCOVERY_MIN_PRICE=20, DISCOVERY_MAX_PRICE=10)
+    with pytest.raises(ValidationError, match="MAX_POSITION_NOTIONAL_PCT"):
+        Settings(**common, MAX_POSITION_NOTIONAL_PCT=0)
 
 
 def test_stagnation_features_require_recent_timestamp():
@@ -1504,6 +1538,7 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
             ("anthropic", "ai_research_committee/v1", "paid1"),
             ("anthropic", "ai_research_committee/v2", "paid1-v2"),
             ("anthropic", "ai_research_committee/v3", "paid1-v3"),
+            ("anthropic", "ai_research_single/v1", "paid1-single-v1"),
             ("anthropic", "ai_research_failure/v0", "paid2"),
             ("shadow", "ai_research_committee/v1", "free1"),
             ("multi", "ai_research_failure/v0", "aggregate1"),
@@ -1521,16 +1556,21 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
                 confidence=None,
                 used_only_provided_data=True,
                 validation_passed=prompt_version
-                in {"ai_research_committee/v1", "ai_research_committee/v2", "ai_research_committee/v3"},
+                in {
+                    "ai_research_committee/v1",
+                    "ai_research_committee/v2",
+                    "ai_research_committee/v3",
+                    "ai_research_single/v1",
+                },
                 memo={"committee": {"judge_summary": "audit"}},
             )
 
-        assert await count_ai_research_memos(provider="anthropic", today_utc=True) == 5
-        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 4
+        assert await count_ai_research_memos(provider="anthropic", today_utc=True) == 6
+        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 5
         assert await count_ai_research_chargeable_attempts(provider="openai", today_utc=True) == 1
         assert await count_ai_research_chargeable_attempts(provider="shadow", today_utc=True) == 0
         assert await count_ai_research_chargeable_attempts(provider="multi", today_utc=True) == 0
-        assert await count_ai_research_chargeable_attempts(today_utc=True) == 5
+        assert await count_ai_research_chargeable_attempts(today_utc=True) == 6
 
 
 @pytest.mark.asyncio
@@ -4148,8 +4188,48 @@ def test_research_committee_factory_wires_real_providers_and_requires_keys():
         create_research_committee(MissingModel())
 
 
+def test_simplified_research_factory_uses_only_configured_provider_and_distinct_prompt():
+    class SimplifiedSettings(DummySupervisorSettings):
+        simplified_runtime_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_providers = "anthropic,openai,xai"
+        ai_research_model = ""
+        ai_research_anthropic_model = "claude-opus-4-8"
+        anthropic_api_key = "anthropic-key"
+
+    committee = create_research_committee(SimplifiedSettings())
+
+    assert selected_research_providers(SimplifiedSettings()) == ["anthropic"]
+    assert isinstance(committee, AnthropicResearchCommittee)
+    assert committee.include_edge_memory is False
+    assert committee.prompt_version == SIMPLIFIED_PROMPT_VERSION
+
+
+def test_simplified_research_packet_does_not_load_historical_memory(monkeypatch):
+    def explode(*_args, **_kwargs):
+        raise AssertionError("simplified packet must not load historical memory")
+
+    monkeypatch.setattr(ai_committee, "load_scoreboard_memory_context", explode)
+    monkeypatch.setattr(ai_committee, "load_brain_guidance_context", explode)
+    monkeypatch.setattr(ai_committee, "build_candidate_memory_match", explode)
+
+    packet = build_research_packet(
+        TradeIntent(symbol="POET", side="long", entry_price=10.0),
+        include_edge_memory=False,
+    )
+    context = packet["verified_research_context"]
+    prompt = committee_prompt(packet, include_edge_memory=False)
+
+    assert "scoreboard_memory" not in context
+    assert "brain_guidance" not in context
+    assert "candidate_memory_match" not in context
+    assert "Historical edge memory is intentionally disabled" in prompt
+    assert "loaded observed-edge" not in prompt
+
+
 def test_research_committee_factory_wires_provider_timeouts_and_anthropic_tokens():
     class SettingsWithOverrides(DummySupervisorSettings):
+        simplified_runtime_enabled = False
         ai_research_providers = "anthropic,openai,xai,gemini"
         ai_research_model = "fallback-model"
         ai_research_openai_model = "gpt-5.5"
@@ -4180,6 +4260,7 @@ def test_research_committee_factory_wires_provider_timeouts_and_anthropic_tokens
 
 def test_research_committee_factory_wires_multi_provider_models():
     class MultiSettings(DummySupervisorSettings):
+        simplified_runtime_enabled = False
         ai_research_enabled = True
         ai_research_providers = "anthropic,openai,xai"
         ai_research_model = ""
@@ -5926,6 +6007,50 @@ async def test_fred_client_missing_key_returns_macro_error_without_network():
     assert context["series"] == {}
 
 
+def test_simplified_supervisor_does_not_construct_fred_client(monkeypatch):
+    class SimplifiedSettings(DummySupervisorSettings):
+        simplified_runtime_enabled = True
+        ai_research_enabled = False
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("simplified supervisor must not construct FredClient")
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.FredClient", explode)
+
+    supervisor = TradingSupervisor(
+        settings=SimplifiedSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+
+    assert supervisor.fred_client is None
+    assert supervisor.research_committee.include_edge_memory is False
+    assert supervisor.research_committee.prompt_version == SIMPLIFIED_PROMPT_VERSION
+
+
+def test_simplified_supervisor_stays_up_with_unavailable_provider_when_setup_fails():
+    class BrokenProviderSettings(DummySupervisorSettings):
+        simplified_runtime_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_anthropic_model = "claude-opus-4-8"
+        anthropic_api_key = ""
+
+    supervisor = TradingSupervisor(
+        settings=BrokenProviderSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=object(),
+        order_manager=object(),
+    )
+
+    assert isinstance(supervisor.research_committee, UnavailableResearchCommittee)
+    assert supervisor.research_committee.include_edge_memory is False
+    assert ai_committee.real_research_providers(supervisor.research_committee) == []
+    assert supervisor._ai_provider_setup_error
+
+
 @pytest.mark.asyncio
 async def test_rules_signals_attach_finnhub_enrichment(monkeypatch):
     async def fake_discover(adapter, *, max_assets=750, batch_size=100, max_candidates=10):
@@ -6469,6 +6594,43 @@ def test_week2_launchpad_renders_explicit_max_entries_independent_of_profile():
 
     assert "Risk profile: aggressive" in report
     assert "Today new entries: 7 / 100" in report
+
+
+def test_week2_launchpad_identifies_simplified_single_provider_runtime():
+    class SimplifiedSettings(DummyAiBudgetSupervisorSettings):
+        simplified_runtime_enabled = True
+        max_position_notional_pct = 7.5
+        ai_research_provider = "anthropic"
+        ai_research_providers = "anthropic,openai,xai"
+
+    report, _gates = build_week2_launchpad_report(
+        settings=SimplifiedSettings(),
+        system_state=SystemState.ACTIVE,
+        system_meta={},
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "equity": 401.33,
+            "cash": 360.0,
+            "trading_blocked": False,
+            "account_blocked": False,
+        },
+        clock={"is_open": True},
+        positions=[],
+        open_orders=[],
+        pending_exits=[],
+        runtime_config={"risk_profile": "risky", "auto_entry_enabled": "true", "ai_entry_gate_enabled": "false"},
+        today_new_entries=0,
+        ai_calls_used=2,
+    )
+
+    assert "Runtime mode: simplified" in report
+    assert "Risk controls: explicit max_position_notional=7.5%" in report
+    assert "Legacy risk-profile metadata: risky (ignored" in report
+    assert "AI decision path: BYPASSED (AI gate disabled; deterministic RiskEngine path only)" in report
+    assert "AI providers: anthropic" in report
+    assert "openai" not in report
+    assert "xai" not in report
 
 
 def test_week2_launchpad_entry_pressure_shows_ai_blocks():
@@ -7353,6 +7515,135 @@ def test_risk_profile_controls_paper_sizing_and_live_risky_downgrades():
     assert risky_live_decision.risk_metrics["risk_profile"] == "conservative"
 
 
+def test_simplified_risk_controls_ignore_legacy_profile_and_clamp_live_notional():
+    intent = TradeIntent(symbol="AMPX", side="long", entry_price=10.0)
+
+    class SimplifiedBase(DummySettings):
+        simplified_runtime_enabled = True
+        max_position_notional_pct = 7.5
+
+    class ConservativeSettings(SimplifiedBase):
+        risk_profile = "conservative"
+
+    class AggressiveSettings(SimplifiedBase):
+        risk_profile = "aggressive"
+
+    class LiveSettings(SimplifiedBase):
+        alpaca_paper = False
+        risk_profile = "aggressive"
+
+    conservative = RiskEngine(StateMachine(initial_state=SystemState.ACTIVE), ConservativeSettings()).evaluate(
+        intent, DummySnapshot()
+    )
+    aggressive = RiskEngine(StateMachine(initial_state=SystemState.ACTIVE), AggressiveSettings()).evaluate(
+        intent, DummySnapshot()
+    )
+    live = RiskEngine(StateMachine(initial_state=SystemState.ACTIVE), LiveSettings()).evaluate(intent, DummySnapshot())
+
+    assert conservative.sized_quantity == pytest.approx(0.75)
+    assert aggressive.sized_quantity == conservative.sized_quantity
+    assert conservative.risk_metrics["risk_control_mode"] == "explicit"
+    assert aggressive.risk_metrics["risk_control_mode"] == "explicit"
+    assert live.sized_quantity == pytest.approx(0.5)
+    assert live.risk_metrics["max_position_notional_pct"] == 5.0
+
+
+def test_simplified_discovery_and_prefilter_ignore_legacy_profile_metadata():
+    class SimplifiedSettings(DummySupervisorSettings):
+        simplified_runtime_enabled = True
+        discovery_min_price = 2.0
+        discovery_max_price = 150.0
+        discovery_min_dollar_volume = 1_000_000.0
+        discovery_max_spread_pct = 0.01
+        discovery_min_change_pct = 0.005
+        discovery_max_change_pct = 0.18
+        discovery_min_intraday_pct = -0.035
+        discovery_max_assets = 900
+        discovery_max_candidates = 12
+        ai_paid_prefilter_enabled = True
+        ai_paid_prefilter_min_rel_volume = 1.0
+        ai_paid_prefilter_strong_rel_volume = 2.5
+        ai_paid_prefilter_high_buffer_pct = 0.002
+        ai_paid_prefilter_block_inverse_overlap = True
+
+    conservative_discovery, conservative_mode = resolve_discovery_profile(
+        SimplifiedSettings(), risk_profile="conservative", paper=True
+    )
+    risky_discovery, risky_mode = resolve_discovery_profile(
+        SimplifiedSettings(), risk_profile="risky", paper=True
+    )
+    intent = TradeIntent(
+        symbol="POET",
+        side="long",
+        entry_price=10.0,
+        features={"discovery": {"rel_volume": 0.9, "distance_from_high_pct": -0.02}},
+    )
+    conservative_prefilter = evaluate_paid_ai_prefilter(
+        intent, settings=SimplifiedSettings(), risk_profile="conservative"
+    )
+    risky_prefilter = evaluate_paid_ai_prefilter(intent, settings=SimplifiedSettings(), risk_profile="risky")
+
+    assert conservative_discovery == risky_discovery
+    assert conservative_mode == risky_mode == "explicit"
+    assert conservative_prefilter.reasons == risky_prefilter.reasons
+    assert conservative_prefilter.evidence["risk_control_mode"] == "explicit"
+    assert risky_prefilter.evidence["risk_control_mode"] == "explicit"
+
+
+@pytest.mark.asyncio
+async def test_simplified_discovery_max_settings_are_actual_caps(monkeypatch):
+    class SimplifiedSettings(DummySupervisorSettings):
+        simplified_runtime_enabled = True
+        discovery_min_price = 2.0
+        discovery_max_price = 150.0
+        discovery_min_dollar_volume = 0.0
+        discovery_max_spread_pct = 0.01
+        discovery_min_change_pct = 0.0
+        discovery_max_change_pct = 0.18
+        discovery_min_intraday_pct = -0.035
+        discovery_max_assets = 3
+        discovery_max_candidates = 2
+
+    class FakeAdapter:
+        seen_symbols = []
+
+        async def get_tradable_assets(self):
+            return [{"symbol": f"TST{index}", "fractionable": True} for index in range(10)]
+
+        async def get_stock_snapshots(self, symbols):
+            self.seen_symbols.extend(symbols)
+            return {symbol: {} for symbol in symbols}
+
+    def fake_candidate(symbol, snapshot, *, discovery_profile):
+        return DiscoveryCandidate(
+            symbol=symbol,
+            price=10.0,
+            score=float(symbol[-1]),
+            dollar_volume=1_000_000,
+            rel_volume=2.0,
+            change_pct=0.02,
+            spread_pct=0.001,
+            rationale="test",
+        )
+
+    async def no_sleep(_seconds):
+        return None
+
+    adapter = FakeAdapter()
+    monkeypatch.setattr(rules_fallback, "_candidate_from_snapshot", fake_candidate)
+    monkeypatch.setattr(rules_fallback.asyncio, "sleep", no_sleep)
+
+    candidates = await discover_dynamic_candidates(
+        adapter,
+        max_assets=750,
+        max_candidates=10,
+        settings=SimplifiedSettings(),
+    )
+
+    assert adapter.seen_symbols == ["TST0", "TST1", "TST2"]
+    assert [candidate.symbol for candidate in candidates] == ["TST2", "TST1"]
+
+
 def test_risk_engine_blocks_duplicate_open_position():
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     risk = RiskEngine(sm, DummySettings())
@@ -7633,9 +7924,9 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
         assert "anthropic:approve:high_conf" in trade.provider_votes
         assert "Read me first:" in rendered
         assert "AI edge is not proven yet" in rendered
-        assert "Scorecard:" in rendered
+        assert "Dollar scorecard:" in rendered
         assert "Closed trades: 1" in rendered
-        assert "Realized P/L: $4.00" in rendered
+        assert "Realized P/L before AI cost: $4.00" in rendered
         assert "AI edge check:" in rendered
         assert "- AI-approved trades: n=1, P/L $4.00" in rendered
         assert "sample=thin" in rendered
@@ -7871,14 +8162,26 @@ def test_edge_report_payoff_shape_explains_negative_dollars_at_even_win_rate():
         _closed_trade("LOSS2", -2.0, exit_reason="position max loss reached", signal_id=4),
     ]
 
-    rendered = render_edge_report(EdgeReport(window_days=14, closed_trades=trades, opportunities=[]))
+    report = EdgeReport(
+        window_days=14,
+        closed_trades=trades,
+        opportunities=[],
+        estimated_ai_cost=0.75,
+        ai_cost_unknown_calls=1,
+    )
+    rendered = render_edge_report(report)
     memory_pack = build_scoreboard_memory_pack(
-        EdgeReport(window_days=14, closed_trades=trades, opportunities=[]),
+        report,
         generated_at=datetime(2026, 6, 22, tzinfo=UTC),
     )
 
     assert "Payoff shape:" in rendered
-    assert "- Win rate: 50.0% (2W/2L)" in rendered
+    assert "- Realized P/L before AI cost: -$2.00" in rendered
+    assert "- Estimated AI cost: $0.75" in rendered
+    assert "- Net after estimated AI cost: -$2.75" in rendered
+    assert "- Win rate (secondary): 50.0% (2W/2L)" in rendered
+    assert "- Profit factor: 0.50x" in rendered
+    assert "1 possible billed call(s) had no token usage" in rendered
     assert "- Gross profit/loss: $2.00 / -$4.00" in rendered
     assert "- Avg win/loss: $1.00 / -$2.00" in rendered
     assert "- Win/loss payoff ratio: 0.50x" in rendered
@@ -7889,6 +8192,9 @@ def test_edge_report_payoff_shape_explains_negative_dollars_at_even_win_rate():
     assert "- max loss / stop: n=2, P/L -$4.00, exp -$2.00" in rendered
     assert "- take profit: n=2, P/L $2.00, exp $1.00" in rendered
     assert memory_pack["performance"]["payoff_ratio"] == pytest.approx(0.5)
+    assert memory_pack["performance"]["profit_factor"] == pytest.approx(0.5)
+    assert memory_pack["performance"]["estimated_ai_cost"] == pytest.approx(0.75)
+    assert memory_pack["performance"]["net_after_estimated_ai_cost"] == pytest.approx(-2.75)
     assert memory_pack["performance"]["breakeven_win_rate"] == pytest.approx(66.67)
     assert "payoff=0.50x" not in memory_pack["prompt_context"]
 
@@ -7902,7 +8208,7 @@ def test_edge_report_payoff_shape_shows_when_win_rate_clears_breakeven():
 
     rendered = render_edge_report(EdgeReport(window_days=14, closed_trades=trades, opportunities=[]))
 
-    assert "- Win rate: 66.7% (2W/1L)" in rendered
+    assert "- Win rate (secondary): 66.7% (2W/1L)" in rendered
     assert "- Win/loss payoff ratio: 2.00x" in rendered
     assert "- Breakeven win rate at this payoff: 33.3% (current 66.7%, gap +33.3 pts)" in rendered
     assert "- Read: Win rate is clearing the breakeven bar for this payoff shape." in rendered
@@ -7916,9 +8222,11 @@ def test_edge_report_payoff_shape_handles_no_losses_yet():
 
     rendered = render_edge_report(EdgeReport(window_days=14, closed_trades=trades, opportunities=[]))
 
-    assert "- Win rate: 100.0% (2W/0L)" in rendered
+    assert "- Win rate (secondary): 100.0% (2W/0L)" in rendered
     assert "- Gross profit/loss: $3.00 / $0.00" in rendered
     assert "- Win/loss payoff ratio: no losses yet" in rendered
+    assert "- Profit factor: n/a (no mix of profits and losses)" in rendered
+    assert "inf" not in rendered.lower()
     assert "- Breakeven win rate at this payoff: n/a" in rendered
     assert "- Read: No losing exits yet; payoff shape is not stressed by losses in this window." in rendered
 
@@ -9488,6 +9796,38 @@ async def test_telegram_config_handler_sets_paper_risk_profile(monkeypatch):
     assert "Runtime risk profile set to risky." in update.message.replies[0]
     assert "Risky is paper-only" in update.message.replies[0]
     assert journal == ["Runtime config updated: risk_profile=risky."]
+
+
+@pytest.mark.asyncio
+async def test_telegram_config_handler_rejects_legacy_profile_in_simplified_mode(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    stored = {}
+
+    class SimplifiedSettings(DummySettings):
+        simplified_runtime_enabled = True
+
+    class PaperAdapter:
+        paper = True
+
+    async def fake_set(key, value):
+        stored[key] = value
+        return True
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.set_runtime_config_value", fake_set)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, SimplifiedSettings()),
+        adapter=PaperAdapter(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._config_handler(update, FakeTelegramContext(["risk_profile", "risky"]))
+
+    assert stored == {}
+    assert "Risk profiles are parked in simplified mode" in update.message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -12225,6 +12565,7 @@ async def test_supervisor_auto_entry_logs_shadow_ai_research(monkeypatch):
     logged_memos = []
 
     class EntrySettings(DummySupervisorSettings):
+        simplified_runtime_enabled = False
         auto_entry_enabled = True
         ai_research_enabled = True
 
@@ -12319,6 +12660,61 @@ async def test_supervisor_auto_entry_logs_shadow_ai_research(monkeypatch):
     assert risk_context["entry_limits"]["today_new_entries"] == 0
     assert risk_context["entry_limits"]["max_new_positions_per_day"] == 1
     assert manager.intents[0].features["research_context"]["risk"] == risk_context
+
+
+@pytest.mark.asyncio
+async def test_simplified_gate_disabled_bypasses_shadow_research(monkeypatch):
+    class EntrySettings(DummySupervisorSettings):
+        simplified_runtime_enabled = True
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = False
+        ai_research_provider = "shadow"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            return {"order": {"id": "entry-bypassed-ai"}, "risk_decision": {"approved": True}}
+
+    async def fake_bool(key, *, default):
+        return key == "auto_entry_enabled"
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+        return [TradeIntent(symbol="AMPX", side="long", entry_price=20.0, confidence=0.8)]
+
+    async def fake_log_signal(**kwargs):
+        return 49
+
+    async def explode_ai(*_args, **_kwargs):
+        raise AssertionError("simplified bypass must not run shadow or paid AI research")
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    supervisor = TradingSupervisor(
+        settings=EntrySettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    monkeypatch.setattr(supervisor, "_run_ai_research", explode_ai)
+
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["order"]["id"] == "entry-bypassed-ai"
 
 
 @pytest.mark.asyncio
@@ -14489,6 +14885,75 @@ async def test_ai_entry_gate_requires_real_provider(monkeypatch):
     assert result["blocked"] is True
     assert result["ai_gate"]["reason"] == "real_ai_provider_required_for_entry_gate"
     assert "real_ai_provider_required_for_entry_gate" in journal_entries[0]
+
+
+@pytest.mark.asyncio
+async def test_simplified_ai_entry_gate_blocks_configured_provider_setup_failure(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        simplified_runtime_enabled = True
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "anthropic"
+        ai_research_anthropic_model = "claude-opus-4-8"
+        anthropic_api_key = ""
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            raise AssertionError("OrderManager must not run after provider setup failure")
+
+    journal_entries = []
+
+    async def fake_signals(adapter, max_signals=1, finnhub_client=None, fred_client=None):
+        return [
+            TradeIntent(
+                symbol="POET",
+                side="long",
+                entry_price=10.0,
+                confidence=0.8,
+                features={"discovery": {"score": 6.0, "rel_volume": 2.0}},
+            )
+        ]
+
+    async def fake_bool(key, *, default):
+        return True
+
+    async def fake_log_signal(**kwargs):
+        return 48
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
+
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+    )
+    result = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=1,
+    )
+
+    assert result["blocked"] is True
+    assert result["ai_gate"]["reason"] == "ai_research_provider_setup_failed"
+    assert "ai_research_provider_setup_failed" in journal_entries[0]
 
 
 @pytest.mark.asyncio

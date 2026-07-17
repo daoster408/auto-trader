@@ -212,7 +212,7 @@ The following commands describe capabilities that may still exist in the deploye
 
 AI research is advisory only. It may return a pre-RiskEngine `approve`, `watch`, or `reject` recommendation, but it cannot authorize final trade execution, size orders, override risk gates, or place orders.
 
-`AI_ENTRY_GATE_ENABLED=false` is the safe default. When enabled, real-provider AI research becomes a fail-closed entry filter before `RiskEngine`: only a valid `approve` can continue to RiskEngine and OrderManager. `watch`, `reject`, invalid output, budget exhaustion, provider failure, disabled AI research, or shadow-only research blocks the entry and records an audit journal note. AI still cannot size orders, submit orders, override RiskEngine, bypass `/kill`, bypass `HALTED`, bypass broker/account blocks, or override account loss/drawdown halts.
+`AI_ENTRY_GATE_ENABLED=false` is the safe default and an explicit AI bypass: entries use the deterministic scanner/prefilter/RiskEngine path without an AI decision. The simplified one-provider target is active only when the gate is enabled. When enabled, real-provider AI research becomes a fail-closed entry filter before `RiskEngine`: only a valid `approve` can continue to RiskEngine and OrderManager. `watch`, `reject`, invalid output, budget exhaustion, provider setup/runtime failure, disabled AI research, or shadow/unavailable research blocks the entry and records an audit journal note. AI still cannot size orders, submit orders, override RiskEngine, bypass `/kill`, bypass `HALTED`, bypass broker/account blocks, or override account loss/drawdown halts.
 
 The gate can also be toggled at runtime from Telegram without a deploy:
 

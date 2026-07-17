@@ -30,6 +30,7 @@ CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = (
     "ai_research_committee/v1",
     "ai_research_committee/v2",
     "ai_research_committee/v3",
+    "ai_research_single/v1",
     "ai_research_failure/v0",
 )
 CHARGEABLE_AI_POSTMORTEM_PROMPT_VERSIONS = (

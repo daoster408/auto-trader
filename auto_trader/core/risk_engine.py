@@ -16,6 +16,8 @@ from auto_trader.utils.logging import get_logger
 
 log = get_logger("auto_trader.core.risk_engine")
 
+CONSERVATIVE_LIVE_POSITION_NOTIONAL_PCT = 5.0
+
 
 class RiskEngine:
     """v1 risk gate. Strict, auditable, and non-bypassable."""
@@ -111,9 +113,23 @@ class RiskEngine:
             getattr(snapshot, "risk_profile", getattr(self.settings, "risk_profile", "conservative")),
             paper=bool(getattr(self.settings, "alpaca_paper", True)),
         )
+        simplified_runtime = bool(getattr(self.settings, "simplified_runtime_enabled", False))
+        if simplified_runtime:
+            configured_notional_pct = float(getattr(self.settings, "max_position_notional_pct", 7.5))
+            if not bool(getattr(self.settings, "alpaca_paper", True)):
+                configured_notional_pct = min(
+                    configured_notional_pct,
+                    CONSERVATIVE_LIVE_POSITION_NOTIONAL_PCT,
+                )
+            position_notional_fraction = configured_notional_pct / 100.0
+            risk_control_mode = "explicit"
+        else:
+            configured_notional_pct = profile.early_notional_cap_pct * 100.0
+            position_notional_fraction = profile.early_notional_cap_pct
+            risk_control_mode = f"legacy_profile:{profile.name}"
 
         # 2. Basic per-trade risk budget (v1 bootstrap: fractional long, no leverage)
-        early_notional_cap = snapshot.equity * profile.early_notional_cap_pct
+        early_notional_cap = snapshot.equity * position_notional_fraction
         sized_qty = floor((early_notional_cap / intent.entry_price) * 1_000_000) / 1_000_000
         proposed_notional = intent.entry_price * sized_qty
         max_risk_dollars = snapshot.equity * (self.settings.risk_per_trade_pct / 100.0)
@@ -133,13 +149,15 @@ class RiskEngine:
         if proposed_notional > early_notional_cap:
             return RiskDecision(
                 approved=False,
-                reason="Proposed size exceeds early profile limit",
+                reason="Proposed size exceeds position notional limit",
                 sized_quantity=None,
                 risk_metrics={
                     "proposed_notional": proposed_notional,
                     "early_notional_cap": early_notional_cap,
                     "max_risk": max_risk_dollars,
                     "risk_profile": profile.name,
+                    "risk_control_mode": risk_control_mode,
+                    "max_position_notional_pct": configured_notional_pct,
                 },
                 model_tag=model_tag,
                 trace_id=trace_id,
@@ -185,7 +203,9 @@ class RiskEngine:
                 "state": "ACTIVE",
                 "daily_new_after": self._daily_new_positions + 1,
                 "risk_profile": profile.name,
-                "early_notional_cap_pct": profile.early_notional_cap_pct,
+                "risk_control_mode": risk_control_mode,
+                "max_position_notional_pct": configured_notional_pct,
+                "early_notional_cap_pct": position_notional_fraction,
                 "current_gross_exposure": current_exposure,
                 "projected_gross_exposure": projected,
                 "projected_gross_exposure_pct": projected_exposure_pct,

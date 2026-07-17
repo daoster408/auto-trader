@@ -26,6 +26,7 @@ from auto_trader.utils.logging import get_logger
 log = get_logger("auto_trader.intelligence.ai_committee")
 
 PROMPT_VERSION = "ai_research_committee/v3"
+SIMPLIFIED_PROMPT_VERSION = "ai_research_single/v1"
 AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v5"
 PATTERN_MEMORY_VERSION = "postmortem_edge_memory/v2"
 CANDIDATE_MEMORY_MATCH_VERSION = "candidate_memory_match/v3"
@@ -48,6 +49,15 @@ COMMITTEE_INSTRUCTIONS = (
     "edge_memory_conflicts, edge_memory_action, judge_summary. edge_memory_action must be "
     "one of: amplify, neutral, conflict_review, memory_unavailable, defer_to_current_packet. "
     "Do not wrap the object in committee, assessment, analysis, result, or any other key."
+)
+SIMPLIFIED_COMMITTEE_INSTRUCTIONS = (
+    "You are the sole advisory research model for one trading candidate. Use only the provided JSON packet. "
+    "Do not invent market facts and do not recommend order size. No historical scoreboard or postmortem memory "
+    "is provided; judge the current verified candidate packet directly. Return only valid JSON with exactly these "
+    "top-level keys: symbol, verdict, confidence, used_only_provided_data, bull_case, bear_case, "
+    "edge_memory_alignment, edge_memory_conflicts, edge_memory_action, judge_summary. Set edge_memory_action to "
+    "memory_unavailable and state plainly in both edge_memory text fields that memory is disabled. Verdict must be "
+    "approve, watch, or reject. Do not wrap the object in another key and do not include extra prose."
 )
 COMMITTEE_REQUIRED_FIELDS = [
     "symbol",
@@ -111,12 +121,18 @@ class ResearchRound:
     aggregate_memo: ResearchMemo
 
 
-def build_research_packet(intent: TradeIntent, *, signal_id: int | None = None) -> dict[str, Any]:
+def build_research_packet(
+    intent: TradeIntent,
+    *,
+    signal_id: int | None = None,
+    include_edge_memory: bool = True,
+) -> dict[str, Any]:
     """Build the verified data packet handed to an AI/shadow committee."""
     verified_context = build_verified_research_context(intent)
-    verified_context["scoreboard_memory"] = load_scoreboard_memory_context()
-    verified_context["brain_guidance"] = load_brain_guidance_context()
-    verified_context["candidate_memory_match"] = build_candidate_memory_match(intent, verified_context)
+    if include_edge_memory:
+        verified_context["scoreboard_memory"] = load_scoreboard_memory_context()
+        verified_context["brain_guidance"] = load_brain_guidance_context()
+        verified_context["candidate_memory_match"] = build_candidate_memory_match(intent, verified_context)
     return {
         "generated_at": datetime.now(UTC).isoformat() + "Z",
         "signal_id": signal_id,
@@ -444,15 +460,24 @@ def committee_json_schema(*, strict: bool = True) -> dict[str, Any]:
     return schema
 
 
-def committee_prompt(packet: dict[str, Any]) -> str:
+def committee_prompt(packet: dict[str, Any], *, include_edge_memory: bool = True) -> str:
+    if include_edge_memory:
+        memory_direction = (
+            "For edge_memory_alignment, state which loaded observed-edge/postmortem/"
+            "candidate_memory_match_v3 buckets this candidate confirms. For edge_memory_conflicts, state which "
+            "loaded patterns argue against it. For edge_memory_action, return exactly one advisory label: "
+            "amplify, neutral, conflict_review, memory_unavailable, or defer_to_current_packet; do not change "
+            "sizing or config."
+        )
+    else:
+        memory_direction = (
+            "Historical edge memory is intentionally disabled. Set edge_memory_action to memory_unavailable and "
+            "state that fact plainly in edge_memory_alignment and edge_memory_conflicts. Judge only the current "
+            "verified packet; do not change sizing or config."
+        )
     return (
         "Review this verified candidate packet. Return exactly the required JSON object, "
-        "with no wrapper keys and no extra prose. For edge_memory_alignment, state which "
-        "loaded observed-edge/postmortem/candidate_memory_match_v3 buckets this candidate confirms. For "
-        "edge_memory_conflicts, state which loaded patterns argue against it. For "
-        "edge_memory_action, return exactly one advisory label: amplify, neutral, "
-        "conflict_review, memory_unavailable, or defer_to_current_packet; do not change "
-        "sizing or config.\n\n"
+        f"with no wrapper keys and no extra prose. {memory_direction}\n\n"
         f"{json.dumps(packet, sort_keys=True, default=str)}"
     )
 
@@ -624,8 +649,16 @@ class ShadowResearchCommittee:
     provider = "shadow"
     model_tag = "shadow_ai_committee/v0"
 
+    def __init__(self, *, include_edge_memory: bool = True, prompt_version: str = PROMPT_VERSION) -> None:
+        self.include_edge_memory = bool(include_edge_memory)
+        self.prompt_version = prompt_version
+
     async def research(self, intent: TradeIntent, *, signal_id: int | None = None) -> ResearchMemo:
-        packet = build_research_packet(intent, signal_id=signal_id)
+        packet = build_research_packet(
+            intent,
+            signal_id=signal_id,
+            include_edge_memory=self.include_edge_memory,
+        )
         digest = packet_hash(packet)
         features = intent.features or {}
         discovery = features.get("discovery") or {}
@@ -669,7 +702,7 @@ class ShadowResearchCommittee:
             symbol=intent.symbol.upper(),
             provider=self.provider,
             model_tag=self.model_tag,
-            prompt_version=PROMPT_VERSION,
+            prompt_version=self.prompt_version,
             input_hash=digest,
             verdict=verdict,
             confidence=confidence,
@@ -679,22 +712,53 @@ class ShadowResearchCommittee:
         )
 
 
+class UnavailableResearchCommittee:
+    """Non-decision placeholder used when configured real-provider setup fails."""
+
+    provider = "unavailable"
+    model_tag = "unavailable/configuration_error"
+
+    def __init__(self, reason: str, *, prompt_version: str) -> None:
+        self.reason = reason
+        self.prompt_version = prompt_version
+        self.include_edge_memory = False
+
+    async def research(self, intent: TradeIntent, *, signal_id: int | None = None) -> ResearchMemo:
+        raise RuntimeError("configured AI research provider is unavailable")
+
+
 class HTTPResearchCommittee:
     provider = "http"
 
-    def __init__(self, api_key: str, *, model: str, timeout_seconds: float = 20.0) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str,
+        timeout_seconds: float = 20.0,
+        include_edge_memory: bool = True,
+        prompt_version: str = PROMPT_VERSION,
+        instructions: str = COMMITTEE_INSTRUCTIONS,
+    ) -> None:
         if not api_key:
             raise ValueError(f"{self.provider} research provider requires an API key")
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = float(timeout_seconds)
+        self.include_edge_memory = bool(include_edge_memory)
+        self.prompt_version = prompt_version
+        self.instructions = instructions
 
     @property
     def model_tag(self) -> str:
         return f"{self.provider}/{self.model}"
 
     async def research(self, intent: TradeIntent, *, signal_id: int | None = None) -> ResearchMemo:
-        packet = build_research_packet(intent, signal_id=signal_id)
+        packet = build_research_packet(
+            intent,
+            signal_id=signal_id,
+            include_edge_memory=self.include_edge_memory,
+        )
         digest = packet_hash(packet)
         raw = await asyncio.to_thread(self._call_provider, packet)
         raw_output = self._extract_output(raw)
@@ -706,7 +770,7 @@ class HTTPResearchCommittee:
             symbol=intent.symbol.upper(),
             provider=self.provider,
             model_tag=self.model_tag,
-            prompt_version=PROMPT_VERSION,
+            prompt_version=self.prompt_version,
             input_hash=digest,
             verdict=str(output.get("verdict", "watch")),
             confidence=_nullable_float(output.get("confidence")),
@@ -769,8 +833,8 @@ class OpenAIResearchCommittee(HTTPResearchCommittee):
     def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
         body = {
             "model": self.model,
-            "instructions": COMMITTEE_INSTRUCTIONS,
-            "input": committee_prompt(packet),
+            "instructions": self.instructions,
+            "input": committee_prompt(packet, include_edge_memory=self.include_edge_memory),
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -799,8 +863,11 @@ class XAIResearchCommittee(HTTPResearchCommittee):
         body = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": COMMITTEE_INSTRUCTIONS},
-                {"role": "user", "content": committee_prompt(packet)},
+                {"role": "system", "content": self.instructions},
+                {
+                    "role": "user",
+                    "content": committee_prompt(packet, include_edge_memory=self.include_edge_memory),
+                },
             ],
             "response_format": {
                 "type": "json_schema",
@@ -833,16 +900,31 @@ class AnthropicResearchCommittee(HTTPResearchCommittee):
         model: str,
         timeout_seconds: float = 20.0,
         max_tokens: int = 2200,
+        include_edge_memory: bool = True,
+        prompt_version: str = PROMPT_VERSION,
+        instructions: str = COMMITTEE_INSTRUCTIONS,
     ) -> None:
-        super().__init__(api_key, model=model, timeout_seconds=timeout_seconds)
+        super().__init__(
+            api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            include_edge_memory=include_edge_memory,
+            prompt_version=prompt_version,
+            instructions=instructions,
+        )
         self.max_tokens = int(max_tokens)
 
     def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
         body = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "system": COMMITTEE_INSTRUCTIONS,
-            "messages": [{"role": "user", "content": committee_prompt(packet)}],
+            "system": self.instructions,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": committee_prompt(packet, include_edge_memory=self.include_edge_memory),
+                }
+            ],
         }
         return self._post_json(
             "https://api.anthropic.com/v1/messages",
@@ -871,7 +953,14 @@ class GeminiResearchCommittee(HTTPResearchCommittee):
             "contents": [
                 {
                     "role": "user",
-                    "parts": [{"text": f"{COMMITTEE_INSTRUCTIONS}\n\n{committee_prompt(packet)}"}],
+                    "parts": [
+                        {
+                            "text": (
+                                f"{self.instructions}\n\n"
+                                f"{committee_prompt(packet, include_edge_memory=self.include_edge_memory)}"
+                            )
+                        }
+                    ],
                 }
             ],
             "generationConfig": {
@@ -1236,16 +1325,22 @@ async def research_committee_round(
 
 
 def create_research_committee(settings: Any) -> ResearchCommittee:
+    simplified = bool(getattr(settings, "simplified_runtime_enabled", False))
     providers = selected_research_providers(settings)
     if len(providers) > 1:
-        return MultiProviderResearchCommittee([_create_single_research_committee(settings, provider) for provider in providers])
+        return MultiProviderResearchCommittee(
+            [_create_single_research_committee(settings, provider, simplified=False) for provider in providers]
+        )
     provider = providers[0]
-    return _create_single_research_committee(settings, provider)
+    return _create_single_research_committee(settings, provider, simplified=simplified)
 
 
 def selected_research_providers(settings: Any) -> list[str]:
+    simplified = bool(getattr(settings, "simplified_runtime_enabled", False))
     raw_providers = str(getattr(settings, "ai_research_providers", "") or "").strip()
-    if raw_providers:
+    if simplified:
+        providers = [str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()]
+    elif raw_providers:
         providers = [provider.strip().lower() for provider in raw_providers.split(",") if provider.strip()]
     else:
         providers = [str(getattr(settings, "ai_research_provider", "shadow") or "shadow").lower()]
@@ -1264,12 +1359,23 @@ def real_research_providers(committee: ResearchCommittee) -> list[str]:
     if isinstance(committee, MultiProviderResearchCommittee):
         return [provider for provider in committee.provider_names if provider != "shadow"]
     provider = str(getattr(committee, "provider", "shadow"))
-    return [] if provider == "shadow" else [provider]
+    return [] if provider in {"shadow", "unavailable"} else [provider]
 
 
-def _create_single_research_committee(settings: Any, provider: str) -> ResearchCommittee:
+def _create_single_research_committee(
+    settings: Any,
+    provider: str,
+    *,
+    simplified: bool,
+) -> ResearchCommittee:
+    include_edge_memory = not simplified
+    prompt_version = SIMPLIFIED_PROMPT_VERSION if simplified else PROMPT_VERSION
+    instructions = SIMPLIFIED_COMMITTEE_INSTRUCTIONS if simplified else COMMITTEE_INSTRUCTIONS
     if provider == "shadow":
-        return ShadowResearchCommittee()
+        return ShadowResearchCommittee(
+            include_edge_memory=include_edge_memory,
+            prompt_version=prompt_version,
+        )
     model = _required_model(settings, provider)
     timeout_seconds = research_provider_timeout_seconds(settings, provider)
     if provider == "openai":
@@ -1277,12 +1383,18 @@ def _create_single_research_committee(settings: Any, provider: str) -> ResearchC
             _required_key(settings, "openai_api_key", provider),
             model=model,
             timeout_seconds=timeout_seconds,
+            include_edge_memory=include_edge_memory,
+            prompt_version=prompt_version,
+            instructions=instructions,
         )
     if provider == "xai":
         return XAIResearchCommittee(
             _required_key(settings, "xai_api_key", provider),
             model=model,
             timeout_seconds=timeout_seconds,
+            include_edge_memory=include_edge_memory,
+            prompt_version=prompt_version,
+            instructions=instructions,
         )
     if provider == "anthropic":
         return AnthropicResearchCommittee(
@@ -1290,12 +1402,18 @@ def _create_single_research_committee(settings: Any, provider: str) -> ResearchC
             model=model,
             timeout_seconds=timeout_seconds,
             max_tokens=_anthropic_max_tokens(settings),
+            include_edge_memory=include_edge_memory,
+            prompt_version=prompt_version,
+            instructions=instructions,
         )
     if provider == "gemini":
         return GeminiResearchCommittee(
             _required_key(settings, "gemini_api_key", provider),
             model=model,
             timeout_seconds=timeout_seconds,
+            include_edge_memory=include_edge_memory,
+            prompt_version=prompt_version,
+            instructions=instructions,
         )
     raise ValueError(f"unsupported AI_RESEARCH_PROVIDER={provider}")
 

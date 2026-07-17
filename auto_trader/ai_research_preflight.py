@@ -58,6 +58,7 @@ class ProviderReadiness:
 @dataclass(frozen=True)
 class AIResearchPreflightReport:
     ready: bool
+    simplified_runtime_enabled: bool
     provider: str
     model: str
     key_present: bool
@@ -157,6 +158,7 @@ def build_ai_research_preflight_report(
 ) -> AIResearchPreflightReport:
     """Build a zero-network readiness report for paid AI research."""
     providers = selected_research_providers(settings)
+    simplified_runtime_enabled = bool(getattr(settings, "simplified_runtime_enabled", False))
     provider = providers[0] if len(providers) == 1 else "multi"
     enabled = bool(getattr(settings, "ai_research_enabled", True))
     effective_ai_entry_gate_enabled = (
@@ -203,6 +205,11 @@ def build_ai_research_preflight_report(
 
     gates = [
         _gate("AI enabled", enabled, f"AI_RESEARCH_ENABLED={str(enabled).lower()}"),
+        _gate(
+            "Runtime provider path",
+            not simplified_runtime_enabled or len(provider_reports) == 1,
+            "single configured provider" if simplified_runtime_enabled else "legacy provider selection",
+        ),
         _gate("Real provider selected", real_provider, f"AI_RESEARCH_PROVIDER={provider}"),
         _gate("Explicit model", all_models_present, "all provider models are set" if all_models_present else model),
         _gate("Provider model available", model_availability_ok, model_availability_detail),
@@ -233,6 +240,7 @@ def build_ai_research_preflight_report(
     ready = not any(gate.status == "FAIL" for gate in gates)
     return AIResearchPreflightReport(
         ready=ready,
+        simplified_runtime_enabled=simplified_runtime_enabled,
         provider=provider,
         model=model,
         key_present=key_present,
@@ -261,10 +269,16 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
     lines = [
         "AI RESEARCH PREFLIGHT",
         f"State: {state}",
+        f"Runtime mode: {'simplified' if report.simplified_runtime_enabled else 'legacy'}",
         f"Provider: {report.provider}",
         f"Model: {model}",
         f"Key present: {str(report.key_present).lower()}",
         f"AI entry gate enabled: {str(report.ai_entry_gate_enabled).lower()}",
+        (
+            "AI decision path: required before RiskEngine"
+            if report.ai_entry_gate_enabled
+            else "AI decision path: BYPASSED (AI gate disabled; deterministic RiskEngine path only)"
+        ),
         f"Chargeable daily calls: used {used} / max {report.max_calls}; remaining {remaining}",
         f"Chargeable calls per round: {report.attempts_per_round}",
         f"Full rounds remaining: {rounds}",

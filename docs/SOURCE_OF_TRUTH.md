@@ -64,6 +64,7 @@ Required output bundle per major milestone:
 - Live capital progression: Start at $100, then $200, then cap at $400
 - Hosting preference: Free or near-free; Oracle first, fallback to low-cost VPS
 - Simplified target flow: scanner -> deterministic prefilter -> one configured real AI decision -> RiskEngine -> OrderManager -> deterministic exits
+- AI gate disabled means the AI step is explicitly bypassed; enabled means one valid real-provider approval is required fail-closed before RiskEngine
 - Parked experiments: multi-provider committee, Gemini/DeepSeek/Fable escalation, FRED-in-entry, and postmortem bias injection
 - Live readiness: inactive calendar time does not count as evidence
 

@@ -7,7 +7,7 @@ RiskEngine.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 
 RiskProfileName = Literal["conservative", "aggressive", "risky"]
@@ -137,3 +137,29 @@ def normalize_risk_profile(value: object, *, paper: bool) -> RiskProfileName:
 
 def get_risk_profile(value: object, *, paper: bool) -> RiskProfile:
     return _PROFILES[normalize_risk_profile(value, paper=paper)]
+
+
+def resolve_discovery_profile(
+    settings: Any | None,
+    *,
+    risk_profile: object,
+    paper: bool,
+) -> tuple[DiscoveryProfile, str]:
+    """Return explicit simplified controls or the parked legacy profile."""
+    if settings is not None and bool(getattr(settings, "simplified_runtime_enabled", False)):
+        return (
+            DiscoveryProfile(
+                min_price=float(getattr(settings, "discovery_min_price", 2.0)),
+                max_price=float(getattr(settings, "discovery_max_price", 150.0)),
+                min_dollar_volume=float(getattr(settings, "discovery_min_dollar_volume", 1_000_000.0)),
+                max_spread_pct=float(getattr(settings, "discovery_max_spread_pct", 0.01)),
+                min_change_pct=float(getattr(settings, "discovery_min_change_pct", 0.005)),
+                max_change_pct=float(getattr(settings, "discovery_max_change_pct", 0.18)),
+                min_intraday_pct=float(getattr(settings, "discovery_min_intraday_pct", -0.035)),
+                max_assets=int(getattr(settings, "discovery_max_assets", 900)),
+                max_candidates=int(getattr(settings, "discovery_max_candidates", 12)),
+            ),
+            "explicit",
+        )
+    profile = get_risk_profile(risk_profile, paper=paper)
+    return profile.discovery, profile.name

@@ -587,6 +587,7 @@ def build_week2_launchpad_report(
 ) -> tuple[str, list[LaunchpadGate]]:
     snapshot_errors = errors or []
     paper = bool(getattr(settings, "alpaca_paper", True))
+    simplified_runtime = bool(getattr(settings, "simplified_runtime_enabled", False))
     profile = get_risk_profile(runtime_config.get("risk_profile") or getattr(settings, "risk_profile", "conservative"), paper=paper)
     max_entries = _runtime_int(
         runtime_config,
@@ -685,9 +686,21 @@ def build_week2_launchpad_report(
         f"Account: {account.get('status')}, {account.get('account_status')}",
         f"Equity: ${_float(account.get('equity')):.2f}",
         f"Cash: ${_float(account.get('cash')):.2f}",
-        f"Risk profile: {profile.name}",
+        f"Runtime mode: {'simplified' if simplified_runtime else 'legacy'}",
+        (
+            "Risk controls: "
+            f"explicit max_position_notional={float(getattr(settings, 'max_position_notional_pct', 7.5) or 7.5):g}%"
+            if simplified_runtime
+            else f"Risk profile: {profile.name}"
+        ),
+        *([f"Legacy risk-profile metadata: {profile.name} (ignored by simplified risk sizing and discovery)"] if simplified_runtime else []),
         f"Runtime auto-entry: {runtime_auto_entry}",
         f"Runtime AI entry gate: {ai_gate_enabled}",
+        (
+            "AI decision path: required before RiskEngine"
+            if ai_gate_enabled
+            else "AI decision path: BYPASSED (AI gate disabled; deterministic RiskEngine path only)"
+        ),
         f"AI providers: {', '.join(providers) if providers else 'none'}",
         f"AI paid budget: {ai_used_text} / {max_ai_calls}",
         f"Today new entries: {today_new_entries if today_new_entries is not None else 'unavailable'} / {max_entries}",
