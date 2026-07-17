@@ -1421,3 +1421,32 @@ Append-only by day. Do not remove past entries.
   - All 11 repository Markdown files covered; no runtime/config/service/order/position change.
 - Confidence:
   - high
+
+## 2026-07-17 (America/Los_Angeles) - Simplified Runtime Implementation
+
+- Date (local): 2026-07-17
+- Date (UTC): 2026-07-17
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- DONE:
+  - Implemented the simplified runtime mode and single-provider AI decision path.
+  - Removed scoreboard/brain/candidate-memory and FRED side effects from simplified entry packets.
+  - Replaced profile-driven discovery, paid-prefilter, and position-notional behavior with validated explicit numeric controls.
+  - Made the edge report dollar-first, including estimated AI cost, net dollars, dollar expectancy, average dollar win/loss, profit factor, and realized drawdown; win rate is secondary.
+  - Fixed Reviewer/Optimizer findings for provider setup fail-closed behavior, actual discovery caps, and exact gate-off AI bypass behavior.
+  - Completed a read-only Oracle audit: `HALTED`, flat, no open orders, no pending exits, service active.
+- IN_PROGRESS:
+  - None.
+- NEXT:
+  - Restore GitHub authentication and push local commits.
+  - Only then perform a planned-maintenance Oracle deployment and verify simplified mode/provider through launchpad/preflight.
+- BLOCKED:
+  - GitHub HTTPS credentials are unavailable and SSH authentication is not configured; deployment is intentionally blocked behind source sync.
+- Evidence:
+  - Local implementation commit: `c60003e`.
+  - Reviewer: `APPROVE`.
+  - Optimizer: `APPROVE` after required fixes.
+  - Full suite: `377 passed`, 2 warnings.
+  - Ruff, compileall, and `git diff --check`: passed.
+- Confidence:
+  - high

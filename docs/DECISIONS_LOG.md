@@ -205,3 +205,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: Win rate counts a small gain and a large gain equally and can hide a losing payoff structure. An 80% win rate with negative net dollars is failure.
 - Impact: Primary evaluation becomes net realized dollars after losses and attributable AI costs, dollar expectancy/trade, average dollar win/loss, profit factor, drawdown, and incremental AI-added dollars versus a comparably measured deterministic baseline. Win rate remains secondary. Idle calendar time does not count toward the active evidence sample.
 - Confidence: high
+
+- UTC timestamp: 2026-07-17T15:18:22Z
+- Local timestamp (`America/Los_Angeles`): 2026-07-17 08:18:22 PDT
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- Decision: Implement the simplified runtime as the repository default while requiring an explicit AI-entry-gate enablement for the one-provider AI decision.
+- Rationale: Complexity must not masquerade as edge. Gate-on mode should test one real model's incremental dollar value; gate-off mode should be an exact, visible deterministic baseline with no paid or shadow AI calls.
+- Impact: Simplified mode ignores legacy provider lists and profile-driven behavior, omits memory/FRED entry side effects, blocks configured-provider setup failures fail-closed, and reports dollars/cost/payoff before win rate. Oracle remains unchanged until reviewed commits can be pushed and intentionally deployed.
+- Confidence: high

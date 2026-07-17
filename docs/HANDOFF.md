@@ -302,3 +302,16 @@ Quick resume file for any AI session. Update at end of every work session.
 - Live gate: requires an active sample of closed trades and comparable rejected candidates. Three inactive weeks do not count.
 - Runtime warning: do not assume Oracle is already in one-provider mode. Audit service, state, positions, orders, runtime config, provider config, and deployed commit before any mutation or restart.
 - Next implementation owner: Engineer, after a fresh intended-delta review with the standing Reviewer and Optimizer.
+
+## 2026-07-17 Simplified Runtime Implementation Handoff
+
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- Timestamp: 2026-07-17T15:18:22Z / 2026-07-17 08:18:22 PDT
+- Status: Simplified runtime implementation completed, tested, approved by Reviewer and Optimizer, and committed locally as `c60003e`; Oracle deployment has not occurred.
+- Implemented: one configured AI provider in simplified gate-on mode, no entry-memory/FRED loading, explicit discovery/prefilter/notional controls, and dollar-first edge reporting with estimated AI cost.
+- Gate-off behavior: explicitly bypasses all AI research and uses the deterministic prefilter -> RiskEngine -> OrderManager path.
+- Fail-closed behavior: invalid provider/key/model preserves service liveness but blocks AI-gated entries as `ai_research_provider_setup_failed`; it cannot fall back to shadow.
+- Oracle read-only audit: service active; bot `HALTED`; paper account connected and flat; no open orders or pending exits; no resume, config mutation, restart, or paid AI call performed.
+- Evidence: `377 passed`; Ruff passed; compileall passed; `git diff --check` passed; Reviewer `APPROVE`; Optimizer `APPROVE` after required fixes.
+- Blocker: local `main` is ahead of `origin/main`, but HTTPS push cannot authenticate and GitHub SSH authentication is unavailable. Do not deploy until the reviewed commits are pushed or the source-sync policy is explicitly changed.
