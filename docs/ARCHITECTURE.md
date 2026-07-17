@@ -1,13 +1,27 @@
 # ARCHITECTURE
 
 **Project**: AUTO-TRADER  
-**Version**: v0 (initial)  
-**Date**: 2026-06-01  
-**Role**: Architect  
-**Session AI/model**: xai/grok-build-0.1  
-**Status**: Design package for Engineer handoff. Aligned to SOURCE_OF_TRUTH v1 constraints.
+**Version**: v1 simplification target (preserves v0 history below)
+**Date**: 2026-07-16
+**Role**: Architect/Engineer
+**Session AI/model**: openai/gpt-5
+**Status**: Documentation target only. The Oracle runtime has not yet been changed to this design.
 
 ---
+
+## Current Pivot
+
+The active target is intentionally small:
+
+```text
+scanner -> deterministic prefilter -> one configured real AI decision -> RiskEngine -> OrderManager -> deterministic exits
+```
+
+Keep the broker adapter, Oracle runner, state machine, RiskEngine, kill/halt behavior, duplicate-order protection, reconciliation, deterministic exits, persistence, and audit journal.
+
+Park multi-provider committee voting, Gemini/DeepSeek/Fable escalation, FRED-in-entry, and postmortem bias injection. They remain in history and may remain in code until the implementation pass, but they are not part of the target runtime path.
+
+The primary optimization objective is net dollars after losses and attributable AI cost, with drawdown constrained by explicit risk limits. Win rate is diagnostic only.
 
 ## 1. Executive Summary
 
@@ -17,7 +31,7 @@ Zero separate UI/dashboard for v1.
 Strict risk engine is the only path to order submission.  
 `/kill` is non-bypassable and always flattens + halts.  
 Single-process Python application optimized for free/near-free Oracle ARM VPS hosting.  
-Provider-agnostic AI signal layer with safe fallback rules for bootstrap.  
+Provider-agnostic single-provider AI research layer with fail-closed validation.
 All actions, signals, risk decisions, and outcomes fully audited (append-only, UTC canonical).
 
 **Key Guarantees (Non-Negotiable)**:
@@ -37,7 +51,7 @@ Telegram (commands + alerts)
           ↕
    [Core Orchestrator / Scheduler]
           ↕
-   [Signal Engine]  ←→  [LLM Abstraction]  ←→  (OpenAI / Anthropic / xAI / Rules Fallback)
+   [Signal Engine]  <->  [One Configured LLM Provider]
           ↕
    [Risk Engine]  (the gate)
           ↕
@@ -146,7 +160,9 @@ auto_trader/
 2. **Daily Cycle (market day)**
    - Pre-open (via clock API): refresh universe (assets API + filters)
    - Signal window(s): SignalEngine.run(universe) → list[SignalCandidate]
-   - For each candidate:
+   - For each candidate that passes the deterministic prefilter:
+     - One configured real AI provider returns a validated `approve`, `watch`, or `reject` research decision.
+     - Only a valid AI `approve` continues; failure, timeout, invalid output, `watch`, or `reject` fails closed before RiskEngine.
      - RiskEngine.evaluate(candidate, snapshot) → RiskDecision (approved/rejected + sized qty + reason)
      - If approved: OrderManager.submit(approved_order)
      - Log everything with model tag if AI involved
@@ -263,9 +279,27 @@ class LLMClient(ABC):
 
 **Cost guard**: max 1-2 LLM calls per scan cycle initially.
 
-### 9.1 AI Committee Decision Layer
+### 9.1 Simplified Single-Provider Entry Decision
 
-The AI committee is an advisory/ranking layer, not the execution authority.
+Required target flow:
+
+```text
+Dynamic scanner -> deterministic prefilter -> verified data packet -> one configured real AI provider -> output validator -> RiskEngine -> OrderManager -> Alpaca
+```
+
+Rules:
+
+- The AI receives only pre-fetched, timestamped, source-labeled facts.
+- The AI returns one structured research decision: `approve`, `watch`, or `reject`, with confidence and concise rationale.
+- Any provider timeout, transport error, invalid structure, unsupported fact, `watch`, or `reject` blocks the candidate before RiskEngine.
+- A valid AI `approve` is permission to ask RiskEngine, not permission to trade.
+- RiskEngine alone decides approval, quantity, exposure, and whether an order can proceed.
+- The provider, model, prompt version, input hash, validation result, cost, trace ID, and final trade outcome are audited.
+- One runtime provider is configured at a time. Provider choice is based on valid-response reliability and incremental dollar edge, not brand or raw win rate.
+
+### 9.2 Historical Multi-Provider Committee (Parked)
+
+The committee design below records the previous experiment. It is parked and is not the active target or currently authorized implementation direction.
 
 Required flow:
 
@@ -296,14 +330,15 @@ Implementation phases:
 3. Veto authority: AI can reject candidates, but cannot force trades.
 4. Approval required: AI approval becomes required before trade, but RiskEngine remains the final execution gate.
 
-Initial policy: use Phase 1 after the local/paper trading loop is proven. Do not use AI committee for the first paper trade.
+Historical policy: these phases describe the prior committee experiment and do not authorize reactivation without an explicit decision and a new Reviewer/Optimizer cycle.
 
 ---
 
 ## 10. Journaling & Reporting
 
 - **Daily Journal**: Date, market regime note, signals considered + risk decisions, trades executed + rationale, realized PnL, open positions mark-to-market, risk metrics, model tags used.
-- **Weekly Summary**: Win rate, expectancy, max DD, exposure stats, lessons.
+- **Weekly Summary**: Net realized dollars, dollar expectancy after losses/costs, average dollar win/loss, profit factor, max drawdown, AI cost, incremental AI-added dollars versus the deterministic baseline, and secondary win rate.
+- **Rejected-candidate comparison**: Observe predefined comparable holding windows from market data; never invent fills or choose a favorable horizon after the result.
 - Delivered via Telegram EOD + on `/report`.
 - Stored for audit + future backtesting.
 

@@ -57,3 +57,11 @@ Tracks model/provider usage and outcomes for accountability and tuning.
 - Live results snapshot: N/A
 - Cost snapshot: N/A
 - Notes: Delivered complete ARCHITECTURE.md package aligned to SOURCE_OF_TRUTH. First GROK Build session for AUTO-TRADER.
+
+## 2026-07-16 Simplification Policy
+
+- Runtime target: one configured real AI provider per candidate that passes the deterministic prefilter.
+- Provider selection: use observed valid-response reliability, incremental net dollars versus the deterministic baseline, drawdown, and API cost. Brand reputation and raw win rate are insufficient.
+- No runtime provider is selected or changed by this documentation pass. The existing Oracle configuration must be audited before implementation.
+- Multi-provider voting, Gemini/DeepSeek/Fable escalation, and paid postmortem panels are parked experiments. Historical entries remain for audit.
+- Future result entries must record net realized dollars, dollar expectancy after losses/costs, average dollar win/loss, profit factor, drawdown, API cost, and the comparable deterministic-baseline result when available.

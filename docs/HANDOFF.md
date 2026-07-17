@@ -286,3 +286,19 @@ Quick resume file for any AI session. Update at end of every work session.
 - Next: Reviewer re-review or Engineer to wire OrderManager + first paper order (now safe on hardened base). Then full 4-role cycle.
 
 (End of file - total ~80 lines, append-only)
+
+## 2026-07-16 Simplification Pivot Handoff
+
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- Timestamp: 2026-07-17T05:30:41Z / 2026-07-16 22:30:41 PDT
+- Status: Documentation target approved by Reviewer and Optimizer; runtime implementation not started.
+- Target flow: scanner -> deterministic prefilter -> one configured real AI decision -> RiskEngine -> OrderManager -> deterministic exits.
+- Keep: Oracle/Alpaca, state persistence, RiskEngine-only order authority, `/kill`, `HALTED`, broker/account blocks, duplicate-order protection, reconciliation, deterministic exits, audit journal, and concise Telegram operations.
+- Park: multi-provider voting, Gemini/DeepSeek/Fable escalation, FRED-in-entry, postmortem bias injection, and profile-label-driven target configuration.
+- Primary evidence: net realized dollars after losses and attributable AI costs, dollar expectancy/trade, average dollar win/loss, profit factor, drawdown, and incremental AI-added dollars versus the deterministic baseline.
+- Secondary evidence: win rate. A high win rate with negative net dollars is failure.
+- Counterfactual rule: measure rejected candidates from observed prices over predefined comparable windows; do not invent fills or choose horizons after seeing results.
+- Live gate: requires an active sample of closed trades and comparable rejected candidates. Three inactive weeks do not count.
+- Runtime warning: do not assume Oracle is already in one-provider mode. Audit service, state, positions, orders, runtime config, provider config, and deployed commit before any mutation or restart.
+- Next implementation owner: Engineer, after a fresh intended-delta review with the standing Reviewer and Optimizer.

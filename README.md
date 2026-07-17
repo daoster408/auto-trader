@@ -2,7 +2,9 @@
 
 Fully automated US equities swing trading system.
 
-**Status**: Paper evidence phase on Oracle. The bot is actively paper trading with deterministic risk controls, automatic entries/exits, an AI entry gate, multi-provider AI research, launchpad diagnostics, and postmortem/scoreboard learning. The current goal is to prove whether AI approvals add real edge before any live-money cutover.
+**Status**: Simplification pivot documented on 2026-07-16. The target is one auditable AI research decision between the deterministic prefilter and RiskEngine. The existing Oracle runtime has not yet been changed by this documentation pass and must be audited before restart or reactivation.
+
+**Primary outcome**: Make more dollars than the deterministic baseline after losses and API costs. Win rate is supporting context only; an 80% win rate with negative net P/L is failure.
 
 ## Non-Negotiables
 
@@ -10,7 +12,7 @@ Fully automated US equities swing trading system.
 - `/kill` always works, preempts strategy logic, cancels orders, flattens positions, and sets `HALTED`.
 - Paper trading only until explicit live cutover approval.
 - All decisions audited. UTC canonical storage.
-- AI can approve/block candidate flow before RiskEngine when the AI entry gate is enabled, but cannot override RiskEngine, sizing, `/kill`, `HALTED`, stale-data blocks, exposure limits, loss limits, duplicate-position guards, or account/broker blocks.
+- One configured real AI provider may approve/block candidate flow before RiskEngine when the simplified AI entry gate is implemented and enabled. AI cannot override RiskEngine, sizing, `/kill`, `HALTED`, stale-data blocks, explicit exposure/loss limits, duplicate-position guards, or account/broker blocks.
 
 See `docs/SOURCE_OF_TRUTH.md`, `docs/ARCHITECTURE.md`, and `docs/OPERATING_RULES.md`.
 
@@ -31,7 +33,20 @@ scripts/run_bot.sh
 ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_week2_launchpad.sh
 ```
 
-## Current Capabilities
+## Simplified Target Flow
+
+```text
+scanner -> deterministic prefilter -> one real AI decision -> RiskEngine -> OrderManager -> deterministic exits
+```
+
+- Keep Oracle, Alpaca, RiskEngine, halt/kill behavior, duplicate-order protection, deterministic exits, journaling, and Telegram operations.
+- Park multi-provider voting, Gemini/DeepSeek/Fable escalation, FRED-in-entry, and postmortem-bias prompt injection.
+- Configure risk with explicit numeric limits rather than relying on labels such as `conservative`, `aggressive`, or `risky`.
+- Keep old components available for audit and possible later experiments; do not treat them as the active target.
+
+## Implemented Capabilities
+
+The repository still contains the pre-pivot multi-provider and postmortem machinery until the implementation phase removes it from the active runtime path.
 
 - Alpaca paper account connectivity
 - Telegram bot token validation
@@ -39,9 +54,9 @@ ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_week2_
 - Free Alpaca IEX snapshots for discovery inputs
 - Risk-gated order submission through `OrderManager`
 - Supervised Oracle/systemd paper runner with planned-maintenance restart helper
-- Runtime Telegram config for auto-entry, AI gate, risk profile, and explicit `max_entries`
-- AI entry gate with paid-prefilter, budget accounting, and multi-provider committee support
-- Scoreboard memory, brain guidance, and explicit paid postmortem tooling
+- Runtime Telegram config for auto-entry, AI gate, legacy risk profile, and explicit `max_entries`
+- Legacy AI entry gate with paid-prefilter, budget accounting, and multi-provider committee support
+- Legacy scoreboard memory, brain guidance, and paid postmortem tooling
 - Launchpad entry-pressure diagnostics that explain likely blockers without placing orders or calling paid AI
 - Deterministic exits for max loss, take profit, trailing stop, max hold, and stagnation
 - Emergency `/kill` and OS-signal halt/flatten path
@@ -70,4 +85,4 @@ See `docs/RUNBOOK.md` and `deploy/systemd/auto-trader.service.example` for repea
 
 This project follows an append-only documentation contract. Never delete history from `docs/`.
 
-**Do not trade live until the paper evidence proves entries, exits, rejects, reconnects, `/kill`, restart behavior, reporting, and AI-added edge over a multi-week window.**
+**Do not trade live until an active evidence sample proves entries, exits, rejects, reconnects, `/kill`, restart behavior, reporting, positive net dollars after costs, acceptable drawdown, and incremental AI-added dollar value versus the deterministic baseline. Idle calendar weeks do not count.**

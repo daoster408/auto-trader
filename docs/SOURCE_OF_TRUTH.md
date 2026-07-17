@@ -7,7 +7,7 @@ If any other document conflicts with this one, this file wins.
 
 - Project: AUTO-TRADER
 - Scope: Fully automated US equities swing trading system
-- Execution venue: Alpaca (paper first, live by end of month 1)
+- Execution venue: Alpaca (paper first; live only after the evidence gate passes)
 - Primary operator interface: Telegram + Alpaca platform
 - UI requirement: No separate dashboard required for v1
 
@@ -16,25 +16,26 @@ If any other document conflicts with this one, this file wins.
 Build an automated trading platform that can:
 
 1. Trade US equities with minimal manual intervention.
-2. Balance aggressiveness and conservatism via strict risk controls.
-3. Produce daily and weekly journals with trade rationale and account performance.
-4. Reach live trading within month 1 using small real capital.
+2. Use explicit numeric risk controls rather than ambiguous profile labels.
+3. Produce clear journals and scoreboards centered on dollars won or lost.
+4. Prove that one AI research decision adds net dollar value versus the deterministic baseline before live trading.
 
 ## Team Operating Model
 
-The build process uses four collaborating agents.
+The build process uses four working roles.
 
-- Architect: Designs scalable system architecture.
-- Engineer: Builds implementation from approved architecture.
-- Reviewer: Performs senior-level code review and risk checks.
-- Optimizer: Improves performance, reliability, and scalability.
+- Architect: Inline design role in the current Codex thread.
+- Engineer: Inline implementation role in the current Codex thread.
+- Reviewer: Standing thread for senior-level correctness and risk review.
+- Optimizer: Standing thread for performance, reliability, and maintainability review.
 
 Required workflow order:
 
-1. Architect designs.
-2. Engineer implements.
-3. Reviewer critiques and requests improvements.
-4. Optimizer production-hardens.
+1. Architect designs inline when useful.
+2. Intended non-trivial delta goes to the standing Reviewer and Optimizer.
+3. Engineer implements.
+4. Actual diff and verification go back to Reviewer and Optimizer.
+5. Engineer applies required fixes until both approve.
 
 Required output bundle per major milestone:
 
@@ -59,11 +60,16 @@ Required output bundle per major milestone:
 - Account type: Cash
 - Fractional shares: Enabled where `fractionable=true`
 - Paper trading: Start immediately; visible initial trades in week 1
-- Live launch target: By end of month 1
+- Live launch target: Evidence-gated; the former month-1 calendar target does not authorize a launch
 - Live capital progression: Start at $100, then $200, then cap at $400
 - Hosting preference: Free or near-free; Oracle first, fallback to low-cost VPS
+- Simplified target flow: scanner -> deterministic prefilter -> one configured real AI decision -> RiskEngine -> OrderManager -> deterministic exits
+- Parked experiments: multi-provider committee, Gemini/DeepSeek/Fable escalation, FRED-in-entry, and postmortem bias injection
+- Live readiness: inactive calendar time does not count as evidence
 
-## Risk Profile (v1 Defaults)
+## Explicit Risk Controls
+
+The values below describe the documented baseline. This 2026-07-16 documentation pivot does not change deployed Oracle runtime values.
 
 - Per-trade risk: 0.5% of equity
 - Max new positions per day (initial): 1
@@ -74,6 +80,23 @@ Required output bundle per major milestone:
 - Consecutive stop-loss halt: 2
 
 All threshold changes must be logged in `docs/DECISIONS_LOG.md`.
+
+Profile labels such as `conservative`, `aggressive`, and `risky` are legacy shorthand and are not the target control surface. The target exposes explicit values for max entries/day, per-position size, gross exposure, daily/weekly loss halts, drawdown halt, stop/profit/trailing/stagnation exits, and AI spend.
+
+## Edge And Success Criteria
+
+Primary measures:
+
+- Net realized P/L in dollars after losses and attributable API costs
+- Dollar expectancy per closed trade
+- Average dollar win versus average dollar loss
+- Profit factor
+- Peak-to-trough drawdown
+- Incremental AI-added dollars versus the deterministic scanner/prefilter baseline
+
+Win rate is secondary. An 80% win rate with negative net dollars is failure.
+
+Rejected candidates must be measured from observed market prices over predefined windows comparable to the actual holding policy. They are counterfactual evidence, not imaginary broker fills. Do not select the comparison window after seeing the outcome.
 
 ## System States
 
@@ -89,12 +112,12 @@ All threshold changes must be logged in `docs/DECISIONS_LOG.md`.
 - `/kill`: Cancel all orders, flatten all positions, set `HALTED`, send incident report
 - `/report`: On-demand latest daily/weekly performance summary
 
-## Phase Plan
+## Current Phase Plan
 
-- Week 1: First paper trades executing and visible
-- Week 2: Risk engine hardening + kill-switch reliability
-- Week 3: AI signal abstraction + stock universe discovery improvements
-- Week 4: Burn-in + live cutover preparation + live launch
+1. Audit the dormant Oracle runtime and preserve current state before changing it.
+2. Remove parked intelligence layers from the active entry path while keeping history and code available for audit.
+3. Run the simplified one-provider path and collect an active sample of closed trades plus comparably measured rejected candidates.
+4. Consider live money only when dollar-first edge and operational readiness are both demonstrated. No calendar deadline overrides this gate.
 
 ## Timekeeping Standard
 

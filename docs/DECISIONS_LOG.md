@@ -187,3 +187,21 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: Day 3 market-open validation proved the AMPX close filled and the broker position disappeared, but the durable pending-exit marker remained. A matched filled broker close is enough evidence to clear the marker and complete the exit lifecycle.
 - Impact: Supervisor reconciliation now clears matched filled pending exits, removes them from memory, appends a completion journal entry, and sends one Telegram completion alert; rejected/canceled/expired closes still clear as retry-able failures.
 - Confidence: high
+
+- UTC timestamp: 2026-07-17T05:30:41Z
+- Local timestamp (`America/Los_Angeles`): 2026-07-16 22:30:41 PDT
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- Decision: Pivot the active target from a multi-provider AI committee and recursive postmortem memory to one configured real AI research decision between the deterministic prefilter and RiskEngine.
+- Rationale: The system accumulated provider voting, escalation, macro, postmortem, and profile machinery faster than it accumulated evidence of dollar edge. Three inactive calendar weeks are not a trading result, but the operational complexity itself reduced trust and usability.
+- Impact: Multi-provider voting, Gemini/DeepSeek/Fable escalation, FRED-in-entry, and postmortem bias injection are parked. Oracle/Alpaca, RiskEngine authority, kill/halts, duplicate protection, deterministic exits, persistence, and audit remain. This entry documents a target only; deployed Oracle runtime/config is unchanged until a separate reviewed implementation.
+- Confidence: high
+
+- UTC timestamp: 2026-07-17T05:30:41Z
+- Local timestamp (`America/Los_Angeles`): 2026-07-16 22:30:41 PDT
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- Decision: Make dollar outcomes the primary definition of edge and live readiness.
+- Rationale: Win rate counts a small gain and a large gain equally and can hide a losing payoff structure. An 80% win rate with negative net dollars is failure.
+- Impact: Primary evaluation becomes net realized dollars after losses and attributable AI costs, dollar expectancy/trade, average dollar win/loss, profit factor, drawdown, and incremental AI-added dollars versus a comparably measured deterministic baseline. Win rate remains secondary. Idle calendar time does not count toward the active evidence sample.
+- Confidence: high

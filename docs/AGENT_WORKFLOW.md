@@ -1,15 +1,16 @@
 # AGENT WORKFLOW
 
-Defines responsibilities and handoff rules for the 4-agent build team.
+Defines responsibilities and handoff rules for the inline build roles and standing review threads.
 
 ## Roles
 
 - Architect
   - Owns system design, module boundaries, data flow, and deployment topology.
-  - Produces architecture docs before implementation starts.
+  - Is an inline working role in the current Codex thread, not a standing subagent.
 - Engineer
   - Implements features according to architecture and operating rules.
   - Adds tests, logging hooks, and risk-gate integration.
+  - Is an inline working role in the current Codex thread, not a standing subagent.
 - Reviewer
   - Performs senior-level code review with focus on correctness, safety, and maintainability.
   - Blocks merges for risk bypass, missing tests, or unclear failure handling.
@@ -19,11 +20,11 @@ Defines responsibilities and handoff rules for the 4-agent build team.
 
 ## Required Sequence
 
-1. Architect delivers design package.
-2. Engineer builds implementation package.
-3. Reviewer produces review package and required changes.
-4. Engineer applies required changes.
-5. Optimizer produces production-grade package.
+1. Use an inline Architect pass when design judgment is needed.
+2. Send the intended non-trivial delta to the standing Reviewer and Optimizer.
+3. Implement as Engineer.
+4. Send the actual diff and verification evidence to both standing threads.
+5. Apply required changes and repeat review until both approve.
 
 ## Standing Subagent Rule
 
@@ -42,7 +43,7 @@ Defines responsibilities and handoff rules for the 4-agent build team.
 
 For each major milestone, provide:
 
-1. Complete architecture
+1. Sufficient architecture for the change
 2. Full implementation
 3. Review feedback
 4. Final optimized version

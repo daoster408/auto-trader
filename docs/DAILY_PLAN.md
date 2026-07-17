@@ -1391,3 +1391,33 @@ Append-only by day. Do not remove past entries.
   - `git diff --check`: clean.
 - Confidence:
   - high
+
+## 2026-07-16 (America/Los_Angeles) - Simplification Pivot Documentation
+
+- Date (local): 2026-07-16
+- Date (UTC): 2026-07-17
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- DONE:
+  - Audited all repository Markdown files for stale multi-provider, postmortem, risk-profile, and win-rate-first guidance.
+  - Documented the target flow: scanner -> deterministic prefilter -> one configured real AI decision -> RiskEngine -> OrderManager -> deterministic exits.
+  - Parked multi-provider voting, Gemini/DeepSeek/Fable escalation, FRED-in-entry, and postmortem bias injection without deleting their historical record.
+  - Made net realized dollars, dollar expectancy after losses/costs, average dollar win/loss, profit factor, drawdown, API cost, and incremental AI-added dollars the primary scorecard.
+  - Declared win rate secondary and explicitly insufficient when net dollars are negative.
+  - Required rejected-candidate comparisons to use observed prices and predefined comparable windows rather than imaginary fills or hindsight-selected horizons.
+  - Clarified that this documentation pass does not change Oracle runtime, config, orders, positions, or service state.
+- IN_PROGRESS:
+  - None.
+- NEXT:
+  - Audit the dormant Oracle deployment read-only before changing or restarting it.
+  - Design the bounded implementation delta that removes parked layers from the active entry path.
+  - Implement, test, review, commit, push, and deploy through planned maintenance only after the user proceeds.
+- BLOCKED:
+  - None.
+- Evidence:
+  - Reviewer: APPROVE.
+  - Optimizer: APPROVE; one non-blocking wording clarification applied to the legacy AI runbook section.
+  - `git diff --check`: clean.
+  - All 11 repository Markdown files covered; no runtime/config/service/order/position change.
+- Confidence:
+  - high

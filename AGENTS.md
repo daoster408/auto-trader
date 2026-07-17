@@ -16,3 +16,11 @@
 - Capital safety beats speed.
 - AI research is advisory only. RiskEngine remains the only authority for approval, sizing, and order flow.
 - Any config change that can increase live or paper trading risk must be reviewed and logged.
+
+## Simplified Strategy And Evidence Rule
+
+- The active target design is: scanner -> deterministic prefilter -> one configured real AI research decision -> RiskEngine -> OrderManager -> deterministic exits.
+- Multi-provider committees, AI escalation panels, FRED-in-entry, and postmortem bias injection are parked experiments unless the user explicitly reactivates them.
+- Evaluate edge in dollars first: net realized P/L, dollar expectancy after losses and costs, average dollar win/loss, profit factor, drawdown, API cost, and incremental AI-added dollars versus the deterministic baseline.
+- Win rate is secondary. A high win rate with negative net dollars is a failed result.
+- Inactive calendar time is not evidence. Live-money readiness requires an active sample of closed trades and comparably measured rejected candidates.

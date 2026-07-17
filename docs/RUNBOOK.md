@@ -4,7 +4,8 @@ Operational notes for supervised paper-trading runs. Keep live-money changes exp
 
 ## Current Mode
 
-- Week 2 is the paper evidence phase: let the Oracle runner trade, then use scoreboard/postmortem evidence to prove whether the AI gate adds edge before live money.
+- On 2026-07-16 the project adopted a simplification target. This documentation pass does not change the deployed Oracle code, configuration, service state, positions, or orders.
+- The prior multi-provider/postmortem runtime may still be installed on Oracle. Perform a read-only state and configuration audit before any restart or reactivation.
 - As of 2026-06-03 09:35 PDT, Oracle VM is the single active paper runner.
 - The laptop bot is stopped; do not start it unless intentionally migrating back from Oracle.
 - `AUTO_ENTRY_ENABLED=false` is the service env default. Runtime Telegram config can override it in SQLite; trust `/status` and `/config` for the effective active-runner entry state.
@@ -12,6 +13,20 @@ Operational notes for supervised paper-trading runs. Keep live-money changes exp
 - Current positions, open orders, runtime max entries, AI gate state, and AI budget usage are live operational state; check `/status`, `/config`, or the Week 2 launchpad instead of trusting a static doc snapshot.
 - `/kill` remains the emergency path: cancel all orders, flatten all positions, and persist `HALTED`.
 - RiskEngine remains the only path to any order.
+
+## Simplified Target (Not Yet Deployed)
+
+```text
+scanner -> deterministic prefilter -> one configured real AI decision -> RiskEngine -> OrderManager -> deterministic exits
+```
+
+Keep Oracle/Alpaca operations, state persistence, RiskEngine, halt/kill behavior, duplicate-order protection, reconciliation, deterministic exits, journaling, and concise Telegram alerts.
+
+Park multi-provider voting, Gemini/DeepSeek/Fable escalation, FRED-in-entry, and postmortem-bias prompt injection. Existing commands and environment settings for those features are documented below only because the pre-pivot runtime may still contain them; they are not the active target.
+
+Replace profile labels in the target control surface with explicit numeric settings for entries/day, position size, gross exposure, daily/weekly loss halts, drawdown halt, stop/profit/trailing/stagnation exits, and AI spend.
+
+The primary score is net realized dollars after losses and attributable API costs. Also track dollar expectancy/trade, average dollar win/loss, profit factor, drawdown, and incremental AI-added dollars versus the deterministic baseline. Win rate is secondary and cannot rescue negative net dollars.
 
 ## Local Laptop Run
 
@@ -181,9 +196,9 @@ Before leaving Finnhub enabled unattended:
 - Confirm supervisor ticks do not time out.
 - Watch API-budget logs; Finnhub calls are nonessential and should be disabled if free-tier limits or latency become noisy.
 
-### Optional FRED Macro Context
+### Legacy Optional FRED Macro Context (Parked)
 
-FRED can help the AI research packet with macro regime context: interest rates, inflation, credit stress, unemployment, liquidity, and broad risk-on/risk-off backdrop. It is not ticker-specific market data and must not be treated as a standalone buy/sell signal.
+FRED support remains documented for historical operation and possible later experiments, but FRED-in-entry is parked in the simplified target. It is not ticker-specific market data and must not be treated as a standalone buy/sell signal.
 
 ```bash
 FRED_API_KEY=...
@@ -191,9 +206,11 @@ FRED_API_KEY=...
 
 FRED context is added to the `macro` lane in AI research packets through a cached daily Core Risk Pack: short/long Treasury yields, 10Y-2Y curve spread, high-yield credit spread, CPI, unemployment, VIX, and Fed balance sheet assets. Missing keys, API errors, and API-budget deferrals are recorded as macro context errors; they must not crash the supervisor or approve/block trades by themselves.
 
-### Optional AI Research Preflight
+### Legacy AI Research Operations
 
-AI research is advisory only. It may write research memos for candidates, but it must not approve trades, size orders, override risk gates, or place orders.
+The following commands describe capabilities that may still exist in the deployed pre-pivot runtime. Do not interpret them as proof that the simplified one-provider target has been deployed.
+
+AI research is advisory only. It may return a pre-RiskEngine `approve`, `watch`, or `reject` recommendation, but it cannot authorize final trade execution, size orders, override risk gates, or place orders.
 
 `AI_ENTRY_GATE_ENABLED=false` is the safe default. When enabled, real-provider AI research becomes a fail-closed entry filter before `RiskEngine`: only a valid `approve` can continue to RiskEngine and OrderManager. `watch`, `reject`, invalid output, budget exhaustion, provider failure, disabled AI research, or shadow-only research blocks the entry and records an audit journal note. AI still cannot size orders, submit orders, override RiskEngine, bypass `/kill`, bypass `HALTED`, bypass broker/account blocks, or override account loss/drawdown halts.
 
@@ -261,7 +278,7 @@ Before any paid provider call, the deterministic paid-AI prefilter can block obv
 AI_PAID_PREFILTER_ENABLED=false
 ```
 
-Risk profiles control how wide the paper experiment funnel is:
+Legacy risk profiles control how wide the currently implemented experiment funnel is. The simplified target will use explicit numeric settings instead:
 
 - `conservative`: current live-readiness posture; 5% early notional cap, strict discovery and paid-AI prefilter thresholds.
 - `aggressive`: paper-only wider opportunity search; 7.5% early notional cap, moderately looser discovery/prefilter thresholds.
@@ -304,7 +321,7 @@ AI_RESEARCH_INPUT_PRICE_PER_MTOK=5.0
 AI_RESEARCH_OUTPUT_PRICE_PER_MTOK=25.0
 ```
 
-For the multi-provider advisory committee, keep single-provider mode parked and set the provider list plus provider-specific models:
+The following multi-provider configuration is retained for historical diagnosis only. The committee is parked and should not be reactivated as part of the simplified target:
 
 ```bash
 AI_RESEARCH_PROVIDERS=anthropic,openai,xai
@@ -319,7 +336,7 @@ One committee round consumes one chargeable call per selected real provider; wit
 
 The default `AI_RESEARCH_MAX_CALLS_PER_DAY=0` intentionally reports `NOT_READY`, even when a key is present.
 
-### Future Risk Profiles / YOLO Mode
+### Legacy Future Risk Profile Notes (Parked)
 
 Future risk profiles should be explicit, for example `conservative | aggressive | yolo`. `conservative` is the current default. `aggressive` and `yolo` must be introduced behind paper-first controls and audit labels. `yolo` must remain paper-only by default and must never bypass kill switch, HALTED state, broker/account blocks, daily/weekly/drawdown halts, duplicate-position guards, the AI entry gate when enabled, or RiskEngine.
 
@@ -381,7 +398,9 @@ Before live money:
 - Keep `SHUTDOWN_FLATTEN_ON_EXIT=true`.
 - Keep Telegram allowlist populated.
 - Start with minimal capital.
-- Confirm paper evidence covers entries, exits, rejects, reconnects, `/kill`, restart, and reporting.
+- Confirm active-sample evidence covers entries, exits, rejects, reconnects, `/kill`, restart, and reporting. Idle weeks do not count.
+- Confirm positive net realized dollars after losses and attributable AI costs, positive dollar expectancy, acceptable profit factor/drawdown, and incremental AI-added dollars versus the deterministic baseline. Win rate alone is insufficient.
+- Measure rejected candidates using observed prices over predefined comparable windows; do not invent fills or choose the horizon after seeing the outcome.
 - Run the live cutover preflight from the intended runner:
 
 ```bash
