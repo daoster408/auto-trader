@@ -108,12 +108,16 @@ class AlpacaAdapter:
             return {"ok": False, "status": "ERROR", "error": str(e)}
 
     @retry_external
+    async def _get_account_with_retry(self) -> Any:
+        """Fetch the raw account while allowing transient transport retries."""
+        client = self._get_client()
+        self._record_api_call("account", essential=True)
+        return await asyncio.to_thread(client.get_account)
+
     async def get_account_snapshot(self) -> dict[str, Any]:
-        """Real equity/cash snapshot from Alpaca (retried)."""
+        """Return an account snapshot, failing closed after retries exhaust."""
         try:
-            client = self._get_client()
-            self._record_api_call("account", essential=True)
-            account = await asyncio.to_thread(client.get_account)
+            account = await self._get_account_with_retry()
             return {
                 "equity": float(getattr(account, "equity", 0.0)),
                 "cash": float(getattr(account, "cash", 0.0)),

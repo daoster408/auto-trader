@@ -7392,6 +7392,98 @@ async def test_positions_snapshot_strict_raises_on_broker_failure(monkeypatch):
         await adapter.get_positions_snapshot(strict=True)
 
 
+@pytest.mark.asyncio
+async def test_account_snapshot_retries_transient_transport_failure(monkeypatch):
+    """A dropped account connection should recover before surfacing an ERROR snapshot."""
+    from types import SimpleNamespace
+
+    from tenacity import wait_none
+
+    adapter = AlpacaAdapter("key", "secret", paper=True)
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = 0
+
+        def get_account(self):
+            self.calls += 1
+            if self.calls < 3:
+                raise ConnectionError("remote disconnected")
+            return SimpleNamespace(
+                equity="100.00",
+                cash="80.00",
+                buying_power="80.00",
+                status="ACTIVE",
+                trading_blocked=False,
+                account_blocked=False,
+            )
+
+    client = FlakyClient()
+    monkeypatch.setattr(adapter, "_get_client", lambda: client)
+    monkeypatch.setattr(AlpacaAdapter._get_account_with_retry.retry, "wait", wait_none())
+
+    snapshot = await adapter.get_account_snapshot()
+
+    assert snapshot["status"] == "CONNECTED"
+    assert snapshot["equity"] == 100.0
+    assert client.calls == 3
+    assert adapter.api_budget.snapshot().by_endpoint["account"] == 3
+
+
+@pytest.mark.asyncio
+async def test_account_snapshot_exhausted_transport_failure_returns_error(monkeypatch):
+    """Exhausted retries must return no stale account data and remain fail-closed."""
+    from tenacity import wait_none
+
+    adapter = AlpacaAdapter("key", "secret", paper=True)
+
+    class OfflineClient:
+        def __init__(self):
+            self.calls = 0
+
+        def get_account(self):
+            self.calls += 1
+            raise ConnectionError("account transport unavailable")
+
+    client = OfflineClient()
+    monkeypatch.setattr(adapter, "_get_client", lambda: client)
+    monkeypatch.setattr(AlpacaAdapter._get_account_with_retry.retry, "wait", wait_none())
+
+    snapshot = await adapter.get_account_snapshot()
+
+    assert snapshot == {
+        "equity": 0.0,
+        "cash": 0.0,
+        "status": "ERROR",
+        "error": "account transport unavailable",
+    }
+    assert client.calls == 5
+    assert adapter.api_budget.snapshot().by_endpoint["account"] == 5
+
+
+@pytest.mark.asyncio
+async def test_account_snapshot_does_not_retry_non_transient_failure(monkeypatch):
+    """Deterministic broker failures must not be retried as transport noise."""
+    adapter = AlpacaAdapter("key", "secret", paper=True)
+
+    class RejectedClient:
+        def __init__(self):
+            self.calls = 0
+
+        def get_account(self):
+            self.calls += 1
+            raise RuntimeError("authentication rejected")
+
+    client = RejectedClient()
+    monkeypatch.setattr(adapter, "_get_client", lambda: client)
+
+    snapshot = await adapter.get_account_snapshot()
+
+    assert snapshot["status"] == "ERROR"
+    assert snapshot["error"] == "authentication rejected"
+    assert client.calls == 1
+
+
 def test_risk_engine_sizes_fractional_quantity_under_early_cap():
     """Small paper accounts should use fractional size instead of forcing one share."""
     sm = StateMachine(initial_state=SystemState.ACTIVE)
@@ -10218,6 +10310,61 @@ async def test_telegram_snapshot_gather_surfaces_returned_error_dicts(monkeypatc
     assert snapshot["health"]["market_open"] is None
     assert "Market open: None" in status
     assert "Warnings: account unavailable: account returned error; market clock unavailable: clock returned error" in status
+
+
+@pytest.mark.asyncio
+async def test_supervisor_exhausted_account_failure_blocks_entry_flow(monkeypatch):
+    """An unavailable account must never reach candidate, RiskEngine, or order flow."""
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "equity": 0.0,
+                "cash": 0.0,
+                "status": "ERROR",
+                "error": "account transport unavailable",
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    entry_called = False
+
+    async def fail_if_entry_runs(self, **kwargs):
+        nonlocal entry_called
+        entry_called = True
+        raise AssertionError("entry flow must not run without an account snapshot")
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr(TradingSupervisor, "_maybe_submit_entry", fail_if_entry_runs)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=object(),
+    )
+
+    result = await supervisor.tick_once()
+
+    assert entry_called is False
+    assert result.entry_result is None
+    assert result.errors == ["account unavailable: account transport unavailable"]
 
 
 @pytest.mark.asyncio
