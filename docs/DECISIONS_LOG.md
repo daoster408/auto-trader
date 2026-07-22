@@ -214,3 +214,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: Complexity must not masquerade as edge. Gate-on mode should test one real model's incremental dollar value; gate-off mode should be an exact, visible deterministic baseline with no paid or shadow AI calls.
 - Impact: Simplified mode ignores legacy provider lists and profile-driven behavior, omits memory/FRED entry side effects, blocks configured-provider setup failures fail-closed, and reports dollars/cost/payoff before win rate. Oracle remains unchanged until reviewed commits can be pushed and intentionally deployed.
 - Confidence: high
+
+- UTC timestamp: 2026-07-22T06:53:00Z
+- Local timestamp (`America/Los_Angeles`): 2026-07-21 23:53:00 PDT
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- Decision: Defer `auto-trader.service` from Ubuntu `needrestart` automatic service restarts while keeping unattended security updates enabled.
+- Rationale: A SQLite security update caused `needrestart` to issue an unmarked `systemctl restart auto-trader.service`. The bot correctly treated SIGTERM as an emergency, persisted `HALTED`, and queued closes for all open positions, even though no trading-risk threshold had fired.
+- Impact: Oracle installs a narrow `override_rc` rule for `auto-trader.service`; deferred application restarts must use `scripts/oracle_safe_restart.sh`. The recovery canceled all 10 queued close orders, retained all 10 positions, verified zero open orders, and restored `ACTIVE` before this prevention change.
+- Confidence: high

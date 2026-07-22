@@ -167,6 +167,15 @@ For env reloads or restarts without syncing code, use the safe restart helper, w
 ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_safe_restart.sh
 ```
 
+Ubuntu's `unattended-upgrades` may invoke `needrestart` after replacing a library used by the bot. An automatic `systemctl restart auto-trader.service` bypasses the maintenance marker and is therefore unsafe while `SHUTDOWN_FLATTEN_ON_EXIT=true`. Install and verify the Oracle guard once:
+
+```bash
+ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_install_needrestart_guard.sh
+CHECK_ONLY=true ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-key> scripts/oracle_install_needrestart_guard.sh
+```
+
+The guard leaves security updates enabled but tells `needrestart` to defer only `auto-trader.service`. It does not restart the bot. Apply a deferred application restart later with `scripts/oracle_safe_restart.sh`, followed by a read-only launchpad check of state, positions, and open orders.
+
 The currently running process must already support the maintenance marker. The script checks a runtime capability marker written by the active systemd `MainPID`; checking files on disk is not enough. If the script reports that the remote service does not support planned maintenance, it will refuse the normal path before syncing code. For the one-time first rollout of the maintenance feature in paper mode only, use the guarded bootstrap path:
 
 ```bash
