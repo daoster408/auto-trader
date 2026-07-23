@@ -1383,7 +1383,7 @@ async def get_pending_exits(limit: int = 10) -> list[dict[str, Any]]:
 
 
 async def clear_pending_exit(symbol: str) -> bool:
-    """Clear a pending exit after a trusted position snapshot proves the symbol is gone."""
+    """Clear a pending exit after its matched broker close order is terminal."""
     clean_symbol = symbol.upper()
     async with _DB_LOCK:
         try:

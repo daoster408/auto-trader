@@ -12238,12 +12238,18 @@ async def test_supervisor_filled_exit_alert_does_not_invent_missing_held_time(mo
 
 
 @pytest.mark.asyncio
-async def test_supervisor_clears_persisted_pending_exit_after_position_disappears(monkeypatch):
+async def test_supervisor_retains_pending_exit_until_terminal_order_reconciliation(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
+    notifications = []
+    journal_entries = []
     cleared = []
+    pending_symbols = {"AMPX"}
 
     class FakeAdapter:
         paper = True
+
+        def __init__(self):
+            self.recent_orders = []
 
         async def get_account_snapshot(self):
             return {
@@ -12259,47 +12265,112 @@ async def test_supervisor_clears_persisted_pending_exit_after_position_disappear
             return {"is_open": True, "source": "alpaca"}
 
         async def get_recent_orders(self, days=2):
-            return []
+            return list(self.recent_orders)
 
         async def get_positions_snapshot(self, *, strict=False):
             return []
 
     async def fake_reconcile(orders):
-        return 0
+        return len(orders)
 
     async def fake_count(start_utc_iso):
         return 0
 
     async def fake_pending_symbols():
-        return {"AMPX"}
+        return set(pending_symbols)
 
     async def fake_pending_lookup(symbol):
-        return {"symbol": symbol, "broker_order_id": "exit-1"}
+        if symbol != "AMPX" or symbol not in pending_symbols:
+            return None
+        return {
+            "symbol": symbol,
+            "broker_order_id": "exit-1",
+            "client_order_id": "exit-1",
+            "reason": "position max loss reached",
+        }
 
     async def fake_pending_clear(symbol):
+        pending_symbols.discard(symbol)
         cleared.append(symbol)
         return True
+
+    async def fake_latest_entry(symbol, *, before_utc_iso=None):
+        assert symbol == "AMPX"
+        assert before_utc_iso == "2026-07-23T13:30:00+00:00"
+        return {
+            "symbol": symbol,
+            "side": "buy",
+            "qty": 1.0,
+            "status": "filled",
+            "avg_fill_price": 20.0,
+            "submitted_at": "2026-07-21T13:30:00+00:00",
+            "filled_at": "2026-07-21T13:30:01+00:00",
+        }
+
+    async def fake_journal_entry(**kwargs):
+        journal_entries.append(kwargs["content"])
+        return len(journal_entries)
+
+    async def fake_notify(message):
+        notifications.append(message)
 
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_symbols", fake_pending_symbols)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
     monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal_entry)
 
+    adapter = FakeAdapter()
     supervisor = TradingSupervisor(
         settings=DummySupervisorSettings(),
         state_machine=sm,
-        adapter=FakeAdapter(),
+        adapter=adapter,
         order_manager=object(),
+        notifier=fake_notify,
     )
     supervisor._pending_exit_symbols.add("AMPX")
+    supervisor._last_reconcile_at = datetime.now(UTC)
 
-    result = await supervisor.tick_once()
+    first_result = await supervisor.tick_once()
 
-    assert result.positions == []
-    assert result.exit_decisions == []
-    assert cleared == ["AMPX"]
+    assert first_result.positions == []
+    assert first_result.exit_decisions == []
+    assert pending_symbols == {"AMPX"}
+    assert cleared == []
     assert supervisor._pending_exit_symbols == set()
+
+    adapter.recent_orders = [
+        {
+            "id": "exit-1",
+            "client_order_id": "exit-1",
+            "broker_order_id": "exit-1",
+            "symbol": "AMPX",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "filled_qty": 1.0,
+            "avg_fill_price": 18.0,
+            "submitted_at": "2026-07-23T13:30:00+00:00",
+            "filled_at": "2026-07-23T13:32:00+00:00",
+        }
+    ]
+    supervisor._last_reconcile_at = None
+
+    second_result = await supervisor.tick_once()
+
+    assert second_result.positions == []
+    assert pending_symbols == set()
+    assert cleared == ["AMPX"]
+    assert len([message for message in notifications if "PAPER EXIT FILLED: AMPX" in message]) == 1
+    assert len([entry for entry in journal_entries if "Auto-exit completed for AMPX" in entry]) == 1
+
+    await supervisor.reconcile_once()
+
+    assert cleared == ["AMPX"]
+    assert len([message for message in notifications if "PAPER EXIT FILLED: AMPX" in message]) == 1
+    assert len([entry for entry in journal_entries if "Auto-exit completed for AMPX" in entry]) == 1
 
 
 @pytest.mark.asyncio

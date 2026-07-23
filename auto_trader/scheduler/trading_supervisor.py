@@ -48,7 +48,7 @@ from auto_trader.persistence.db import (
     get_latest_ai_research_memo_for_symbol,
     get_latest_entry_order_for_symbol,
     get_pending_exit_for_symbol,
-    get_pending_exit_symbols,
+    get_pending_exit_symbols,  # noqa: F401 - retained for existing test monkeypatch surface
     get_runtime_config_bool,
     get_runtime_config_int,  # noqa: F401 - retained for existing test monkeypatch surface
     get_runtime_config_value,
@@ -921,10 +921,7 @@ class TradingSupervisor:
         return ExitDecision(symbol=symbol, should_exit=False, reason="hold", metrics=metrics)
 
     async def _sync_persisted_pending_exits(self, open_symbols: set[str]) -> None:
-        """Keep memory pending exits aligned with durable state after trusted position reads."""
-        persisted = await get_pending_exit_symbols()
-        for symbol in persisted - open_symbols:
-            await clear_pending_exit(symbol)
+        """Prune in-memory exits without inferring broker order status from positions."""
         self._pending_exit_symbols.intersection_update(open_symbols)
 
     async def _find_open_close_order(
