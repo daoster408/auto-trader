@@ -57,6 +57,51 @@ CREATE TABLE IF NOT EXISTS ai_research_memos (
     memo_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ai_candidate_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT,
+    memo_id INTEGER NOT NULL UNIQUE REFERENCES ai_research_memos(id),
+    signal_id INTEGER REFERENCES signals(id),
+    symbol TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model_tag TEXT NOT NULL,
+    policy_tag TEXT NOT NULL,
+    decision_at TEXT NOT NULL,
+    decision_session_date TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('approve','watch','reject')),
+    confidence REAL,
+    reference_price REAL,
+    price_source TEXT NOT NULL,
+    comparison_notional REAL NOT NULL DEFAULT 30.0,
+    d0_session_date TEXT,
+    d0_close REAL,
+    d0_return_pct REAL,
+    d0_hypothetical_pnl REAL,
+    d1_session_date TEXT,
+    d1_close REAL,
+    d1_return_pct REAL,
+    d1_hypothetical_pnl REAL,
+    d3_session_date TEXT,
+    d3_close REAL,
+    d3_return_pct REAL,
+    d3_hypothetical_pnl REAL,
+    d5_session_date TEXT,
+    d5_close REAL,
+    d5_return_pct REAL,
+    d5_hypothetical_pnl REAL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','partial','resolved','invalid_reference')),
+    last_error TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_candidate_outcome_session
+ON ai_candidate_outcomes (provider, model_tag, policy_tag, symbol, decision_session_date);
+
+CREATE INDEX IF NOT EXISTS idx_ai_candidate_outcome_pending
+ON ai_candidate_outcomes (status, decision_session_date);
+
 CREATE TABLE IF NOT EXISTS orders (
     client_order_id TEXT PRIMARY KEY,
     broker_order_id TEXT,

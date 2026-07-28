@@ -5,7 +5,7 @@ import argparse
 import asyncio
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -69,10 +69,26 @@ class OpportunityEvidence:
 
 
 @dataclass(frozen=True)
+class CandidateOutcomeEvidence:
+    symbol: str
+    provider: str
+    model_tag: str
+    policy_tag: str
+    verdict: str
+    decision_at: datetime | None
+    comparison_notional: float
+    price_source: str
+    status: str
+    horizon_returns: dict[int, float] = field(default_factory=dict)
+    horizon_pnl: dict[int, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class EdgeReport:
     window_days: int
     closed_trades: list[ClosedTradeEvidence]
     opportunities: list[OpportunityEvidence]
+    candidate_outcomes: list[CandidateOutcomeEvidence] = field(default_factory=list)
     estimated_ai_cost: float | None = None
     ai_cost_unknown_calls: int = 0
     ai_cost_unavailable_reason: str | None = None
@@ -377,16 +393,32 @@ async def _fetch_rows(db_path: Path) -> dict[str, list[dict[str, Any]]]:
             ORDER BY created_at, id
             """
         )
+        outcomes_cur = await db.execute(
+            """
+            SELECT id, created_at, updated_at, resolved_at, memo_id, signal_id,
+                   symbol, provider, model_tag, policy_tag, decision_at,
+                   decision_session_date, verdict, confidence, reference_price,
+                   price_source, comparison_notional, status, last_error,
+                   d0_session_date, d0_close, d0_return_pct, d0_hypothetical_pnl,
+                   d1_session_date, d1_close, d1_return_pct, d1_hypothetical_pnl,
+                   d3_session_date, d3_close, d3_return_pct, d3_hypothetical_pnl,
+                   d5_session_date, d5_close, d5_return_pct, d5_hypothetical_pnl
+            FROM ai_candidate_outcomes
+            ORDER BY decision_at, id
+            """
+        )
         orders = [dict(row) for row in await orders_cur.fetchall()]
         signals = [dict(row) for row in await signals_cur.fetchall()]
         risks = [dict(row) for row in await risks_cur.fetchall()]
         memos = [dict(row) for row in await memos_cur.fetchall()]
+        outcomes = [dict(row) for row in await outcomes_cur.fetchall()]
 
         return {
             "orders": orders,
             "signals": signals,
             "risk_decisions": risks,
             "ai_memos": memos,
+            "candidate_outcomes": outcomes,
         }
 
 
@@ -524,6 +556,43 @@ def _build_opportunities(rows: dict[str, list[dict[str, Any]]], *, since: dateti
     return opportunities
 
 
+def _build_candidate_outcomes(
+    rows: dict[str, list[dict[str, Any]]],
+    *,
+    since: datetime,
+) -> list[CandidateOutcomeEvidence]:
+    evidence: list[CandidateOutcomeEvidence] = []
+    for row in rows.get("candidate_outcomes", []):
+        decision_at = _parse_dt(row.get("decision_at"))
+        if decision_at is None or decision_at < since:
+            continue
+        horizon_returns: dict[int, float] = {}
+        horizon_pnl: dict[int, float] = {}
+        for horizon in (0, 1, 3, 5):
+            return_value = _num(row.get(f"d{horizon}_return_pct"))
+            pnl_value = _num(row.get(f"d{horizon}_hypothetical_pnl"))
+            if return_value is not None:
+                horizon_returns[horizon] = return_value
+            if pnl_value is not None:
+                horizon_pnl[horizon] = pnl_value
+        evidence.append(
+            CandidateOutcomeEvidence(
+                symbol=str(row.get("symbol") or "").upper(),
+                provider=str(row.get("provider") or "unknown").lower(),
+                model_tag=str(row.get("model_tag") or "unknown"),
+                policy_tag=str(row.get("policy_tag") or "unknown"),
+                verdict=str(row.get("verdict") or "watch").lower(),
+                decision_at=decision_at,
+                comparison_notional=_float(row.get("comparison_notional"), 30.0),
+                price_source=str(row.get("price_source") or "model_packet.price_unavailable"),
+                status=str(row.get("status") or "pending"),
+                horizon_returns=horizon_returns,
+                horizon_pnl=horizon_pnl,
+            )
+        )
+    return evidence
+
+
 async def build_edge_report(*, db_path: Path | None = None, window_days: int = 7) -> EdgeReport:
     await init_db()
     since = datetime.now(UTC) - timedelta(days=max(1, int(window_days)))
@@ -532,6 +601,7 @@ async def build_edge_report(*, db_path: Path | None = None, window_days: int = 7
         window_days=window_days,
         closed_trades=_build_closed_trades(rows, since=since),
         opportunities=_build_opportunities(rows, since=since),
+        candidate_outcomes=_build_candidate_outcomes(rows, since=since),
     )
 
 
@@ -723,8 +793,13 @@ def _payoff_read(stats: dict[str, float]) -> str:
         return "No winning exits yet; selection or exits are not paying."
     if stats["losses"] == 0:
         return "No losing exits yet; payoff shape is not stressed by losses in this window."
-    if stats["expectancy"] > 0:
+    if stats["expectancy"] > 0 and stats["win_rate"] >= stats["breakeven_win_rate"]:
         return "Win rate is clearing the breakeven bar for this payoff shape."
+    if stats["expectancy"] > 0:
+        return (
+            "Realized expectancy is positive, but the headline win rate is below the calculated "
+            "breakeven rate; flat trades and the small sample can create this mismatch."
+        )
     if stats["win_rate"] >= stats["breakeven_win_rate"]:
         return "Win rate is near enough, but realized dollars are still flat/down; inspect fees, sizing, and outlier losses."
     loss_multiple = abs(stats["avg_loss"]) / stats["avg_win"] if stats["avg_win"] > 0 else 0.0
@@ -930,6 +1005,97 @@ def _render_signal_quality_notes(trades: list[ClosedTradeEvidence], opportunitie
     common = _bucket_counts(opportunity_tags)[:4]
     if common:
         lines.append("- Common candidate tags: " + ", ".join(f"{_tag_label(tag)} ({count})" for tag, count in common))
+    return lines
+
+
+def _candidate_horizon_stats(
+    outcomes: list[CandidateOutcomeEvidence],
+    horizon: int,
+) -> dict[str, float]:
+    resolved = [row for row in outcomes if horizon in row.horizon_returns]
+    if not resolved:
+        return {"count": 0.0, "avg_return_pct": 0.0, "hypothetical_pnl": 0.0}
+    return {
+        "count": float(len(resolved)),
+        "avg_return_pct": sum(row.horizon_returns[horizon] for row in resolved) / len(resolved),
+        "hypothetical_pnl": sum(row.horizon_pnl.get(horizon, 0.0) for row in resolved),
+    }
+
+
+def _candidate_outcome_groups(
+    outcomes: list[CandidateOutcomeEvidence],
+) -> dict[str, list[CandidateOutcomeEvidence]]:
+    groups: dict[str, list[CandidateOutcomeEvidence]] = {}
+    for row in outcomes:
+        key = f"{row.policy_tag} ({row.model_tag})"
+        groups.setdefault(key, []).append(row)
+    return groups
+
+
+def _candidate_selection_lift(
+    outcomes: list[CandidateOutcomeEvidence],
+    *,
+    horizon: int = 5,
+) -> dict[str, float] | None:
+    approved = [row for row in outcomes if row.verdict == "approve"]
+    not_approved = [row for row in outcomes if row.verdict in {"watch", "reject"}]
+    approved_stats = _candidate_horizon_stats(approved, horizon)
+    not_approved_stats = _candidate_horizon_stats(not_approved, horizon)
+    if approved_stats["count"] <= 0 or not_approved_stats["count"] <= 0:
+        return None
+    spread = approved_stats["avg_return_pct"] - not_approved_stats["avg_return_pct"]
+    comparison_notional = approved[0].comparison_notional if approved else 30.0
+    estimated_added = comparison_notional * (spread / 100.0) * approved_stats["count"]
+    return {
+        "approved_count": approved_stats["count"],
+        "not_approved_count": not_approved_stats["count"],
+        "spread_pct": spread,
+        "estimated_added": estimated_added,
+    }
+
+
+def _render_candidate_outcomes(outcomes: list[CandidateOutcomeEvidence]) -> list[str]:
+    lines = [
+        "AI decision outcomes (observed hypothetical; no rejected stock was purchased):",
+        "- Basis: model-packet reference price and a fixed $30 hypothetical position.",
+    ]
+    if not outcomes:
+        return lines + ["- No resolved provider-decision outcomes in this window yet."]
+    pending = sum(1 for row in outcomes if row.status in {"pending", "partial"})
+    invalid = sum(1 for row in outcomes if row.status == "invalid_reference")
+    if pending or invalid:
+        lines.append(f"- Data status: {pending} pending/partial, {invalid} invalid reference.")
+
+    for label, group in sorted(
+        _candidate_outcome_groups(outcomes).items(),
+        key=lambda item: (-len(item[1]), item[0]),
+    )[:4]:
+        approved = [row for row in group if row.verdict == "approve"]
+        not_approved = [row for row in group if row.verdict in {"watch", "reject"}]
+        lines.append(
+            f"- {label}: decisions={len(group)}, approved={len(approved)}, "
+            f"watch/reject={len(not_approved)}"
+        )
+        for horizon in (0, 1, 3, 5):
+            approved_stats = _candidate_horizon_stats(approved, horizon)
+            not_approved_stats = _candidate_horizon_stats(not_approved, horizon)
+            if approved_stats["count"] <= 0 and not_approved_stats["count"] <= 0:
+                continue
+            spread = approved_stats["avg_return_pct"] - not_approved_stats["avg_return_pct"]
+            spread_text = (
+                f", selection spread {_pct(spread)}"
+                if approved_stats["count"] > 0 and not_approved_stats["count"] > 0
+                else ""
+            )
+            lines.append(
+                f"  D{horizon}: approved n={int(approved_stats['count'])}, "
+                f"avg {_pct(approved_stats['avg_return_pct'])}, "
+                f"$30 hypothetical {_money(approved_stats['hypothetical_pnl'])}; "
+                f"watch/reject n={int(not_approved_stats['count'])}, "
+                f"avg {_pct(not_approved_stats['avg_return_pct'])}, "
+                f"$30 hypothetical {_money(not_approved_stats['hypothetical_pnl'])}"
+                f"{spread_text}"
+            )
     return lines
 
 
@@ -1357,7 +1523,11 @@ def write_scoreboard_memory_pack(pack: dict[str, Any], path: Path) -> Path:
 def render_edge_report(report: EdgeReport) -> str:
     trades = report.closed_trades
     opportunities = report.opportunities
+    candidate_outcomes = report.candidate_outcomes
     stats = _trade_stats(trades)
+    outcome_groups = _candidate_outcome_groups(candidate_outcomes)
+    primary_outcomes = max(outcome_groups.values(), key=len) if outcome_groups else []
+    selection_lift = _candidate_selection_lift(primary_outcomes)
     lines = [
         "EDGE REPORT",
         f"Window: last {report.window_days} days",
@@ -1392,7 +1562,13 @@ def render_edge_report(report: EdgeReport) -> str:
             f"- Profit factor: {_profit_factor_text(stats)}",
             f"- Max realized drawdown: {_money(stats['max_realized_drawdown'])}",
             f"- Win rate (secondary): {stats['win_rate']:.1f}% ({int(stats['wins'])}W/{int(stats['losses'])}L)",
-            "- Incremental AI-added dollars: not measurable until rejected candidates have observed return outcomes.",
+            (
+                f"- Observed D5 AI selection lift: {_money(selection_lift['estimated_added'])} "
+                f"across {int(selection_lift['approved_count'])} approved $30 hypotheticals "
+                f"(approved minus watch/reject spread {_pct(selection_lift['spread_pct'])})."
+                if selection_lift is not None
+                else "- Observed D5 AI selection lift: pending approved and watch/reject outcomes."
+            ),
         ]
     )
     if report.ai_cost_unknown_calls:
@@ -1405,6 +1581,7 @@ def render_edge_report(report: EdgeReport) -> str:
     sections = [
         _render_payoff_shape(trades, stats),
         _render_ai_edge_check(trades),
+        _render_candidate_outcomes(candidate_outcomes),
         _render_candidate_funnel(opportunities),
         _render_main_blockers(opportunities),
         _render_signal_quality_notes(trades, opportunities),

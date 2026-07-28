@@ -295,6 +295,15 @@ Legacy risk profiles control how wide the currently implemented experiment funne
 
 Entry capacity is an explicit operator setting, not a risk-profile side effect. `/config max_entries N` accepts a positive integer, records the old/new value in the journal, and is shown in `/config`, `/status`, and launchpad. Changing `risk_profile` does not clamp or mutate `max_new_positions_per_day`.
 
+The passive AI candidate outcome ledger registers the first validated real single-provider decision for each provider/model/policy/symbol/market-session. It excludes shadow, prefilter, multi-provider aggregate, budget, failure, postmortem, and invalid rows. A bounded background resolver fetches completed Alpaca/IEX daily bars in batches and records:
+
+- `D0`: the decision session close;
+- `D1`: the next completed trading-session close;
+- `D3`: the third completed trading-session close after D0;
+- `D5`: the fifth completed trading-session close after D0.
+
+The reference price is the price in the model packet, not an order fill. Returns and `$30 hypothetical P/L` are observation-only evidence for comparing approved versus watch/reject decisions. They never enter realized P/L, RiskEngine, sizing, order submission, exits, runtime config, or AI prompts. Missing bars remain pending and retry silently; resolver failures do not block or alert trading.
+
 If `ALPACA_PAPER=false`, all experiment profiles normalize back to `conservative`. No risk profile bypasses `HALTED`, kill switch, broker/account blocks, daily/weekly loss halts, drawdown halts, duplicate-position guards, AI entry gate, or RiskEngine. Runtime changes:
 
 ```text

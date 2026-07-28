@@ -223,3 +223,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: A SQLite security update caused `needrestart` to issue an unmarked `systemctl restart auto-trader.service`. The bot correctly treated SIGTERM as an emergency, persisted `HALTED`, and queued closes for all open positions, even though no trading-risk threshold had fired.
 - Impact: Oracle installs a narrow `override_rc` rule for `auto-trader.service`; deferred application restarts must use `scripts/oracle_safe_restart.sh`. The recovery canceled all 10 queued close orders, retained all 10 positions, verified zero open orders, and restored `ACTIVE` before this prevention change.
 - Confidence: high
+
+- UTC timestamp: 2026-07-28T06:56:09Z
+- Local timestamp (`America/Los_Angeles`): 2026-07-27 23:56:09 PDT
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- Decision: Measure every validated single-provider AI decision against completed D0/D1/D3/D5 market-session outcomes before changing provider or voting policy.
+- Rationale: Realized trades alone cannot show whether Grok adds selection edge because rejected opportunities were not graded. Model choice and committee structure should be decided from comparable dollar evidence, not intuition or win rate.
+- Impact: A passive, model-agnostic ledger stores one provider/model/policy/symbol/session decision, a model-packet reference price, and fixed `$30` hypothetical outcomes. Resolution is bounded, batched, silent, and outside trading authority. Realized and hypothetical dollars remain separate. Runtime entry capacity may be raised to 12, but existing RiskEngine sizing, gross-exposure, halt, duplicate, and exit controls remain authoritative.
+- Confidence: high

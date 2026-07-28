@@ -57,6 +57,7 @@ The repository now defaults to the simplified runtime path. Pre-pivot multi-prov
 - Runtime Telegram config for auto-entry, AI gate, legacy risk profile, and explicit `max_entries`
 - Simplified AI entry gate with one configured real provider, deterministic paid-call prefilter, and budget accounting
 - Dollar-first edge reporting with estimated AI cost, net dollars, expectancy, profit factor, and drawdown
+- Passive AI candidate outcome ledger comparing validated single-provider approvals with watch/reject decisions at completed D0/D1/D3/D5 trading-session closes using clearly labeled $30 hypothetical outcomes
 - Parked legacy multi-provider, scoreboard-memory, brain-guidance, and paid-postmortem tooling
 - Launchpad entry-pressure diagnostics that explain likely blockers without placing orders or calling paid AI
 - Deterministic exits for max loss, take profit, trailing stop, max hold, and stagnation

@@ -7,7 +7,7 @@ Fast startup on ARM via lazy client.
 """
 import asyncio
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -322,6 +322,78 @@ class AlpacaAdapter:
             return snapshots
         except Exception as e:
             log.error("stock_snapshots_failed", requested=len(clean_symbols), error=str(e))
+            raise
+
+    @retry_external
+    async def get_stock_daily_bars(
+        self,
+        symbols: list[str],
+        *,
+        start: date,
+        end: date,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Fetch completed IEX daily bars in bounded multi-symbol pages."""
+        clean_symbols = list(dict.fromkeys(s.upper() for s in symbols if s))[:100]
+        if not clean_symbols or end <= start:
+            return {}
+        self._defer_nonessential_if_needed("bars.daily.outcomes")
+
+        def _fetch() -> dict[str, list[dict[str, Any]]]:
+            results: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in clean_symbols}
+            page_token: str | None = None
+            for _ in range(20):
+                params: dict[str, Any] = {
+                    "symbols": ",".join(clean_symbols),
+                    "timeframe": "1Day",
+                    "start": f"{start.isoformat()}T00:00:00Z",
+                    "end": f"{end.isoformat()}T00:00:00Z",
+                    "feed": "iex",
+                    "adjustment": "all",
+                    "sort": "asc",
+                    "limit": 10000,
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                req = Request(
+                    f"https://data.alpaca.markets/v2/stocks/bars?{urlencode(params)}",
+                    headers={
+                        "APCA-API-KEY-ID": self.api_key,
+                        "APCA-API-SECRET-KEY": self.api_secret,
+                    },
+                )
+                self._record_api_call("bars.daily.outcomes", essential=False)
+                with urlopen(req, timeout=20) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                bars = payload.get("bars")
+                if isinstance(bars, dict):
+                    for symbol, values in bars.items():
+                        if symbol.upper() in results and isinstance(values, list):
+                            results[symbol.upper()].extend(value for value in values if isinstance(value, dict))
+                page_token = str(payload.get("next_page_token") or "").strip() or None
+                if page_token is None:
+                    break
+            else:
+                raise RuntimeError("Alpaca daily-bar pagination exceeded 20 pages")
+            return {symbol: values for symbol, values in results.items() if values}
+
+        try:
+            bars = await asyncio.to_thread(_fetch)
+            log.info(
+                "stock_daily_bars_loaded",
+                requested=len(clean_symbols),
+                returned=len(bars),
+                start=start.isoformat(),
+                end=end.isoformat(),
+            )
+            return bars
+        except Exception as e:
+            log.error(
+                "stock_daily_bars_failed",
+                requested=len(clean_symbols),
+                start=start.isoformat(),
+                end=end.isoformat(),
+                error=str(e),
+            )
             raise
 
     @retry_kill_critical

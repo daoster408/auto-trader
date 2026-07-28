@@ -35,6 +35,7 @@ from auto_trader.intelligence.ai_paid_prefilter import (
     PREFILTER_PROVIDER,
     evaluate_paid_ai_prefilter,
 )
+from auto_trader.intelligence.candidate_outcomes import resolve_candidate_outcomes
 from auto_trader.intelligence.finnhub_client import FinnhubClient
 from auto_trader.intelligence.fred_client import FredClient
 from auto_trader.intelligence.research_context import build_risk_research_context, with_research_context
@@ -70,6 +71,7 @@ ENTRY_CANDIDATE_EVAL_LIMIT = 10
 AI_ENTRY_GATE_CANDIDATE_BLOCK_VERDICTS = {"watch", "reject"}
 AI_HIGH_EXPOSURE_UNANIMOUS_REASON = "projected gross exposure exceeds unanimous AI threshold"
 STAGNATION_SNAPSHOT_MAX_AGE_MINUTES = 20
+OUTCOME_RESOLUTION_INTERVAL_SECONDS = 3600
 
 
 async def _runtime_risk_profile(settings: Any, *, paper: bool) -> str:
@@ -715,6 +717,8 @@ class TradingSupervisor:
         self.order_manager = order_manager
         self.notifier = notifier
         self._last_reconcile_at: datetime | None = None
+        self._last_outcome_resolution_at: datetime | None = None
+        self._outcome_resolution_task: asyncio.Task[None] | None = None
         self._seen_alert_keys: set[str] = set()
         self._position_high_values: dict[str, float] = {}
         self._pending_exit_symbols: set[str] = set()
@@ -806,6 +810,55 @@ class TradingSupervisor:
             )
 
         return await self.sm.halt(reason, flatten_callback=flatten)
+
+    def _completed_market_data_date(self, clock: dict[str, Any] | None) -> datetime:
+        market_now = datetime.now(ZoneInfo("America/New_York"))
+        if bool((clock or {}).get("is_open")):
+            return market_now - timedelta(days=1)
+        if (market_now.hour, market_now.minute) >= (16, 10):
+            return market_now
+        return market_now - timedelta(days=1)
+
+    async def _resolve_candidate_outcomes_background(
+        self,
+        *,
+        completed_through: datetime,
+    ) -> None:
+        try:
+            await resolve_candidate_outcomes(
+                self.adapter,
+                completed_through=completed_through.date(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(
+                "ai_candidate_outcome_resolution_deferred",
+                completed_through=completed_through.date().isoformat(),
+                error=str(e),
+            )
+
+    def _schedule_candidate_outcome_resolution(self, clock: dict[str, Any] | None) -> None:
+        now = datetime.now(UTC)
+        if self._outcome_resolution_task is not None and not self._outcome_resolution_task.done():
+            return
+        if self._outcome_resolution_task is not None:
+            try:
+                self._outcome_resolution_task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+        if (
+            self._last_outcome_resolution_at is not None
+            and (now - self._last_outcome_resolution_at).total_seconds()
+            < OUTCOME_RESOLUTION_INTERVAL_SECONDS
+        ):
+            return
+        self._last_outcome_resolution_at = now
+        self._outcome_resolution_task = asyncio.create_task(
+            self._resolve_candidate_outcomes_background(
+                completed_through=self._completed_market_data_date(clock),
+            )
+        )
 
     async def _enforce_account_risk_halts(self, account: dict[str, Any]) -> dict[str, Any] | None:
         if self.sm.state == SystemState.HALTED:
@@ -2119,7 +2172,11 @@ class TradingSupervisor:
         )
         while not stop_event.is_set():
             try:
-                await asyncio.wait_for(self.tick_once(), timeout=float(self.settings.supervisor_tick_timeout_seconds))
+                result = await asyncio.wait_for(
+                    self.tick_once(),
+                    timeout=float(self.settings.supervisor_tick_timeout_seconds),
+                )
+                self._schedule_candidate_outcome_resolution(result.clock)
             except asyncio.TimeoutError:
                 await self._notify_persisted_once("supervisor-timeout", "SUPERVISOR WARNING: tick timed out.")
             except Exception as e:

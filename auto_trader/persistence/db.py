@@ -15,6 +15,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
@@ -25,6 +26,7 @@ log = get_logger("auto_trader.persistence.db")
 
 _DB_PATH: Path = Path("auto_trader.db")
 _DB_LOCK = asyncio.Lock()  # single writer guarantee (simple & cheap for v1)
+_OUTCOME_BACKFILL_COMPLETE = False
 CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = (
     "ai_research_committee/v0",
     "ai_research_committee/v1",
@@ -41,6 +43,10 @@ CHARGEABLE_AI_POSTMORTEM_ESCALATION_PROMPT_VERSIONS = (
     "ai_postmortem_escalation/v0",
     "ai_postmortem_escalation_failure/v0",
 )
+TRACKED_AI_OUTCOME_PROMPT_VERSIONS = ("ai_research_single/v1",)
+TRACKED_AI_OUTCOME_VERDICTS = {"approve", "watch", "reject"}
+TRACKED_AI_OUTCOME_EXCLUDED_PROVIDERS = {"multi", "prefilter", "shadow"}
+AI_OUTCOME_COMPARISON_NOTIONAL = 30.0
 EXIT_SIDES = {"sell", "close", "sell_short", "buy_to_cover"}
 ADMINISTRATIVE_EXIT_RATIONALES = {"", "broker_reconciliation", "unknown"}
 AUTO_EXIT_JOURNAL_RE = re.compile(
@@ -65,6 +71,100 @@ def _is_exit_side(side: Any) -> bool:
 
 def _is_administrative_exit_rationale(value: Any) -> bool:
     return str(value or "").strip().lower() in ADMINISTRATIVE_EXIT_RATIONALES
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _positive_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _candidate_reference_price(memo: dict[str, Any]) -> tuple[float | None, str]:
+    packet = _dict(memo.get("input_packet"))
+    context = _dict(packet.get("verified_research_context"))
+    market = _dict(context.get("market"))
+    quote = _dict(market.get("quote"))
+    technical = _dict(context.get("technical"))
+    daily_bar = _dict(market.get("daily_bar"))
+    candidates = (
+        (quote.get("ask_price"), "model_packet.market.quote.ask_price"),
+        (quote.get("latest_trade_price"), "model_packet.market.quote.latest_trade_price"),
+        (technical.get("price"), "model_packet.technical.price"),
+        (daily_bar.get("close"), "model_packet.market.daily_bar.close"),
+    )
+    for raw_price, source in candidates:
+        price = _positive_float(raw_price)
+        if price is not None:
+            return price, source
+    return None, "model_packet.price_unavailable"
+
+
+def _candidate_policy_tag(provider: str) -> str:
+    safe_provider = re.sub(r"[^a-z0-9]+", "_", provider.strip().lower()).strip("_")
+    return f"single_{safe_provider or 'unknown'}"
+
+
+async def _register_ai_candidate_outcome(
+    db: aiosqlite.Connection,
+    *,
+    memo_id: int | None,
+    signal_id: int | None,
+    symbol: str,
+    provider: str,
+    model_tag: str,
+    prompt_version: str,
+    verdict: str,
+    confidence: float | None,
+    validation_passed: bool,
+    memo: dict[str, Any],
+    decision_at: datetime,
+) -> None:
+    """Register one passive outcome row for a validated single-provider decision."""
+    clean_provider = provider.strip().lower()
+    clean_verdict = verdict.strip().lower()
+    if (
+        memo_id is None
+        or not validation_passed
+        or prompt_version not in TRACKED_AI_OUTCOME_PROMPT_VERSIONS
+        or clean_provider in TRACKED_AI_OUTCOME_EXCLUDED_PROVIDERS
+        or clean_verdict not in TRACKED_AI_OUTCOME_VERDICTS
+    ):
+        return
+    reference_price, price_source = _candidate_reference_price(memo)
+    status = "pending" if reference_price is not None else "invalid_reference"
+    session_date = decision_at.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    await db.execute(
+        """
+        INSERT OR IGNORE INTO ai_candidate_outcomes (
+            memo_id, signal_id, symbol, provider, model_tag, policy_tag,
+            decision_at, decision_session_date, verdict, confidence,
+            reference_price, price_source, comparison_notional, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            memo_id,
+            signal_id,
+            symbol.upper(),
+            clean_provider,
+            model_tag,
+            _candidate_policy_tag(clean_provider),
+            _utc_iso(decision_at),
+            session_date,
+            clean_verdict,
+            confidence,
+            reference_price,
+            price_source,
+            AI_OUTCOME_COMPARISON_NOTIONAL,
+            status,
+        ),
+    )
 
 
 async def _pending_exit_reason_for_order(
@@ -99,8 +199,9 @@ async def _pending_exit_reason_for_order(
 
 def configure_db_path(path: str | Path) -> None:
     """Called at startup from settings so DB location is configurable."""
-    global _DB_PATH
+    global _DB_PATH, _OUTCOME_BACKFILL_COMPLETE
     _DB_PATH = Path(path).expanduser().resolve()
+    _OUTCOME_BACKFILL_COMPLETE = False
 
 
 def get_configured_db_path() -> Path:
@@ -116,6 +217,7 @@ async def init_db() -> None:
         return
 
     async with aiosqlite.connect(_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         schema = schema_path.read_text()
         await db.executescript(schema)
         await _ensure_column(
@@ -124,6 +226,7 @@ async def init_db() -> None:
             column="signal_id",
             definition="INTEGER REFERENCES signals(id)",
         )
+        await _backfill_ai_candidate_outcomes(db)
         await db.commit()
     log.info("db_initialized", path=str(_DB_PATH), size_kb=round(_DB_PATH.stat().st_size / 1024, 1) if _DB_PATH.exists() else 0)
 
@@ -136,10 +239,64 @@ async def _ensure_column(
     definition: str,
 ) -> None:
     cur = await db.execute(f"PRAGMA table_info({table})")
-    rows = await cur.fetchall()
+    rows = list(await cur.fetchall())
     if any(str(row[1]) == column for row in rows):
         return
     await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _db_datetime(value: Any) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now(UTC)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.now(UTC)
+    return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+async def _backfill_ai_candidate_outcomes(db: aiosqlite.Connection) -> None:
+    """Register existing valid single-provider memos once after this schema lands."""
+    global _OUTCOME_BACKFILL_COMPLETE
+    if _OUTCOME_BACKFILL_COMPLETE:
+        return
+    placeholders = ",".join("?" for _ in TRACKED_AI_OUTCOME_PROMPT_VERSIONS)
+    cur = await db.execute(
+        f"""
+        SELECT m.id, m.created_at, m.signal_id, m.symbol, m.provider, m.model_tag,
+               m.prompt_version, m.verdict, m.confidence, m.validation_passed, m.memo_json
+        FROM ai_research_memos AS m
+        LEFT JOIN ai_candidate_outcomes AS o ON o.memo_id = m.id
+        WHERE o.id IS NULL
+          AND m.prompt_version IN ({placeholders})
+          AND m.validation_passed = 1
+        ORDER BY m.id
+        LIMIT 5000
+        """,
+        TRACKED_AI_OUTCOME_PROMPT_VERSIONS,
+    )
+    rows = list(await cur.fetchall())
+    for row in rows:
+        try:
+            memo = json.loads(row["memo_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            memo = {}
+        await _register_ai_candidate_outcome(
+            db,
+            memo_id=int(row["id"]),
+            signal_id=row["signal_id"],
+            symbol=str(row["symbol"]),
+            provider=str(row["provider"]),
+            model_tag=str(row["model_tag"]),
+            prompt_version=str(row["prompt_version"]),
+            verdict=str(row["verdict"]),
+            confidence=row["confidence"],
+            validation_passed=bool(row["validation_passed"]),
+            memo=memo if isinstance(memo, dict) else {},
+            decision_at=_db_datetime(row["created_at"]),
+        )
+    _OUTCOME_BACKFILL_COMPLETE = len(rows) < 5000
 
 
 async def _get_conn() -> aiosqlite.Connection:
@@ -328,6 +485,7 @@ async def log_ai_research_memo(
     memo: dict[str, Any],
 ) -> int | None:
     """Persist an AI/shadow committee research memo. Advisory only; never an order gate."""
+    decision_at = datetime.now(UTC)
     async with _DB_LOCK:
         try:
             await init_db()
@@ -355,8 +513,22 @@ async def log_ai_research_memo(
                         json.dumps(memo, sort_keys=True),
                     ),
                 )
-                await db.commit()
                 memo_id = int(cur.lastrowid) if cur.lastrowid is not None else None
+                await _register_ai_candidate_outcome(
+                    db,
+                    memo_id=memo_id,
+                    signal_id=signal_id,
+                    symbol=str(symbol),
+                    provider=str(provider),
+                    model_tag=str(model_tag),
+                    prompt_version=str(prompt_version),
+                    verdict=str(verdict),
+                    confidence=confidence,
+                    validation_passed=validation_passed,
+                    memo=memo,
+                    decision_at=decision_at,
+                )
+                await db.commit()
                 log.info(
                     "ai_research_memo_logged",
                     symbol=symbol,
@@ -689,6 +861,104 @@ async def _count_ai_postmortem_chargeable_attempts(
                 error=str(e),
             )
             return None
+
+
+async def get_pending_ai_candidate_outcomes(limit: int = 1000) -> list[dict[str, Any]]:
+    """Return a bounded passive-evidence backlog for market-data resolution."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT id, memo_id, signal_id, symbol, provider, model_tag, policy_tag,
+                           decision_at, decision_session_date, verdict, confidence,
+                           reference_price, price_source, comparison_notional, status,
+                           d0_session_date, d0_close, d0_return_pct, d0_hypothetical_pnl,
+                           d1_session_date, d1_close, d1_return_pct, d1_hypothetical_pnl,
+                           d3_session_date, d3_close, d3_return_pct, d3_hypothetical_pnl,
+                           d5_session_date, d5_close, d5_return_pct, d5_hypothetical_pnl
+                    FROM ai_candidate_outcomes
+                    WHERE status IN ('pending', 'partial')
+                    ORDER BY decision_session_date, id
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                )
+                return [dict(row) for row in await cur.fetchall()]
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("ai_candidate_outcome_pending_read_failed", error=str(e))
+            raise
+
+
+def _candidate_outcome_update_sql(
+    outcome_id: int,
+    *,
+    horizons: dict[int, dict[str, Any]],
+    status: str,
+    last_error: str | None,
+    now: str,
+) -> tuple[str, tuple[Any, ...]]:
+    allowed_statuses = {"pending", "partial", "resolved", "invalid_reference"}
+    if status not in allowed_statuses:
+        raise ValueError(f"invalid candidate outcome status: {status}")
+    assignments = ["updated_at = ?", "status = ?", "last_error = ?"]
+    params: list[Any] = [now, status, last_error]
+    for horizon in (0, 1, 3, 5):
+        value = horizons.get(horizon)
+        if not value:
+            continue
+        prefix = f"d{horizon}"
+        assignments.extend(
+            [
+                f"{prefix}_session_date = ?",
+                f"{prefix}_close = ?",
+                f"{prefix}_return_pct = ?",
+                f"{prefix}_hypothetical_pnl = ?",
+            ]
+        )
+        params.extend(
+            [
+                value.get("session_date"),
+                value.get("close"),
+                value.get("return_pct"),
+                value.get("hypothetical_pnl"),
+            ]
+        )
+    if status == "resolved":
+        assignments.append("resolved_at = COALESCE(resolved_at, ?)")
+        params.append(now)
+    params.append(int(outcome_id))
+    return (
+        f"UPDATE ai_candidate_outcomes SET {', '.join(assignments)} WHERE id = ?",
+        tuple(params),
+    )
+
+
+async def update_ai_candidate_outcomes_batch(updates: list[dict[str, Any]]) -> None:
+    """Persist one bounded resolver pass in a single SQLite transaction."""
+    if not updates:
+        return
+    now = _utc_iso(datetime.now(UTC))
+    async with _DB_LOCK:
+        await init_db()
+        db = await _get_conn()
+        try:
+            for update in updates:
+                sql, params = _candidate_outcome_update_sql(
+                    int(update["outcome_id"]),
+                    horizons=update.get("horizons") or {},
+                    status=str(update.get("status") or "pending"),
+                    last_error=update.get("last_error"),
+                    now=now,
+                )
+                await db.execute(sql, params)
+            await db.commit()
+        finally:
+            await db.close()
 
 
 async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | None = None, rationale: str | None = None) -> bool:
