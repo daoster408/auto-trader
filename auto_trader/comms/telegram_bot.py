@@ -48,6 +48,7 @@ from auto_trader.utils.retry import retry_kill_critical
 log = get_logger("auto_trader.comms.telegram_bot")
 
 MAX_EDGE_REPORT_DAYS = 90
+EDGE_REPORT_TIMEOUT_SECONDS = 30.0
 MAX_AI_DECISION_ROWS = 12
 AI_DECISION_LOOKBACK_ROWS = 80
 AI_DECISION_EXCLUDED_PROVIDERS = ("multi", "shadow", "prefilter")
@@ -755,10 +756,32 @@ class TelegramBot:
             await update.message.reply_text(f"Use: /edge [days], where days is 1-{MAX_EDGE_REPORT_DAYS}.")
             return
         try:
-            report = await asyncio.wait_for(run_edge_report(window_days=days), timeout=8.0)
+            report = await asyncio.wait_for(
+                run_edge_report(window_days=days),
+                timeout=EDGE_REPORT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "edge_report_failed",
+                error="timeout",
+                exception_type="TimeoutError",
+                days=days,
+                timeout_seconds=EDGE_REPORT_TIMEOUT_SECONDS,
+            )
+            await update.message.reply_text(
+                "EDGE REPORT timed out while reading the evidence ledger. Please retry in a moment."
+            )
+            return
         except Exception as e:
-            log.warning("edge_report_failed", error=str(e), days=days)
-            await update.message.reply_text(f"EDGE REPORT unavailable: {e}")
+            log.warning(
+                "edge_report_failed",
+                error=str(e),
+                exception_type=type(e).__name__,
+                days=days,
+            )
+            await update.message.reply_text(
+                "EDGE REPORT unavailable due to an internal report error. Please retry in a moment."
+            )
             return
         if len(report) > 3900:
             report = report[:3850].rstrip() + "\n...truncated; use /edge with fewer days."

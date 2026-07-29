@@ -358,7 +358,12 @@ def _confidence_band(value: Any) -> str:
     return "low_conf"
 
 
-async def _fetch_rows(db_path: Path) -> dict[str, list[dict[str, Any]]]:
+async def _fetch_rows(
+    db_path: Path,
+    *,
+    since: datetime | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    cutoff = since.astimezone(UTC).isoformat().replace("+00:00", "Z") if since else None
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         orders_cur = await db.execute(
@@ -370,13 +375,6 @@ async def _fetch_rows(db_path: Path) -> dict[str, list[dict[str, Any]]]:
             ORDER BY COALESCE(filled_at, submitted_at, ''), rowid
             """
         )
-        signals_cur = await db.execute(
-            """
-            SELECT id, created_at, symbol, thesis, confidence, source, model_tag, features_json
-            FROM signals
-            ORDER BY created_at, id
-            """
-        )
         risks_cur = await db.execute(
             """
             SELECT id, created_at, signal_id, approved, reason, symbol, side, proposed_qty, sized_qty,
@@ -385,16 +383,63 @@ async def _fetch_rows(db_path: Path) -> dict[str, list[dict[str, Any]]]:
             ORDER BY created_at, id
             """
         )
+        orders = [dict(row) for row in await orders_cur.fetchall()]
+        risks = [dict(row) for row in await risks_cur.fetchall()]
+        order_risk_ids = {
+            int(row["risk_decision_id"])
+            for row in orders
+            if row.get("risk_decision_id") is not None
+        }
+        referenced_signal_ids = sorted(
+            {
+                int(row["signal_id"])
+                for row in risks
+                if row.get("signal_id") is not None and int(row["id"]) in order_risk_ids
+            }
+        )
+
+        signal_where_clause = ""
+        signal_params: list[Any] = []
+        if cutoff is not None:
+            signal_where_clause = "WHERE julianday(created_at) >= julianday(?)"
+            signal_params.append(cutoff)
+        if cutoff is not None and referenced_signal_ids:
+            placeholders = ", ".join("?" for _ in referenced_signal_ids)
+            signal_where_clause += f" OR id IN ({placeholders})"
+            signal_params.extend(referenced_signal_ids)
+        signals_cur = await db.execute(
+            f"""
+            SELECT id, created_at, symbol, thesis, confidence, source, model_tag, features_json
+            FROM signals
+            {signal_where_clause}
+            ORDER BY created_at, id
+            """,
+            tuple(signal_params),
+        )
+
+        memo_where_clause = ""
+        memo_params: list[Any] = []
+        if cutoff is not None:
+            memo_where_clause = "WHERE julianday(created_at) >= julianday(?)"
+            memo_params.append(cutoff)
+        if cutoff is not None and referenced_signal_ids:
+            placeholders = ", ".join("?" for _ in referenced_signal_ids)
+            memo_where_clause += f" OR signal_id IN ({placeholders})"
+            memo_params.extend(referenced_signal_ids)
         memos_cur = await db.execute(
-            """
+            f"""
             SELECT id, created_at, signal_id, symbol, provider, model_tag, prompt_version, input_hash,
                    verdict, confidence, used_only_provided_data, validation_passed, memo_json
             FROM ai_research_memos
+            {memo_where_clause}
             ORDER BY created_at, id
-            """
+            """,
+            tuple(memo_params),
         )
+        outcomes_where_clause = "WHERE julianday(decision_at) >= julianday(?)" if cutoff is not None else ""
+        outcomes_params = (cutoff,) if cutoff is not None else ()
         outcomes_cur = await db.execute(
-            """
+            f"""
             SELECT id, created_at, updated_at, resolved_at, memo_id, signal_id,
                    symbol, provider, model_tag, policy_tag, decision_at,
                    decision_session_date, verdict, confidence, reference_price,
@@ -404,12 +449,12 @@ async def _fetch_rows(db_path: Path) -> dict[str, list[dict[str, Any]]]:
                    d3_session_date, d3_close, d3_return_pct, d3_hypothetical_pnl,
                    d5_session_date, d5_close, d5_return_pct, d5_hypothetical_pnl
             FROM ai_candidate_outcomes
+            {outcomes_where_clause}
             ORDER BY decision_at, id
-            """
+            """,
+            outcomes_params,
         )
-        orders = [dict(row) for row in await orders_cur.fetchall()]
         signals = [dict(row) for row in await signals_cur.fetchall()]
-        risks = [dict(row) for row in await risks_cur.fetchall()]
         memos = [dict(row) for row in await memos_cur.fetchall()]
         outcomes = [dict(row) for row in await outcomes_cur.fetchall()]
 
@@ -596,7 +641,7 @@ def _build_candidate_outcomes(
 async def build_edge_report(*, db_path: Path | None = None, window_days: int = 7) -> EdgeReport:
     await init_db()
     since = datetime.now(UTC) - timedelta(days=max(1, int(window_days)))
-    rows = await _fetch_rows(db_path or get_configured_db_path())
+    rows = await _fetch_rows(db_path or get_configured_db_path(), since=since)
     return EdgeReport(
         window_days=window_days,
         closed_trades=_build_closed_trades(rows, since=since),

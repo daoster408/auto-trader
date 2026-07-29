@@ -1,6 +1,6 @@
 import json
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import aiosqlite
@@ -15,6 +15,8 @@ from auto_trader.edge_report import (
     CandidateOutcomeEvidence,
     ClosedTradeEvidence,
     EdgeReport,
+    _build_closed_trades,
+    _fetch_rows,
     render_edge_report,
 )
 from auto_trader.intelligence.candidate_outcomes import (
@@ -50,6 +52,96 @@ async def _outcome_rows(db_path) -> list[dict]:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM ai_candidate_outcomes ORDER BY id")
         return [dict(row) for row in await cur.fetchall()]
+
+
+@pytest.mark.asyncio
+async def test_edge_fetch_bounds_mixed_timestamps_and_keeps_old_trade_metadata(tmp_path):
+    db_path = tmp_path / "edge-window.db"
+    configure_db_path(db_path)
+    await init_db()
+
+    signals = [
+        (1, "2026-07-01 12:00:00", "OLD", "rules"),
+        (2, "2026-07-20 12:00:00", "SPACE", "rules"),
+        (3, "2026-07-20T13:00:00Z", "ISO", "rules"),
+        (4, "2026-07-01T12:00:00Z", "OLDREF", "rules"),
+    ]
+    memos = [
+        (101, "2026-07-01 12:01:00", 1, "OLD"),
+        (102, "2026-07-20 12:01:00", 2, "SPACE"),
+        (103, "2026-07-20T13:01:00Z", 3, "ISO"),
+        (104, "2026-07-01T12:01:00Z", 4, "OLDREF"),
+    ]
+    async with aiosqlite.connect(db_path) as db:
+        await db.executemany(
+            """
+            INSERT INTO signals (id, created_at, symbol, source)
+            VALUES (?, ?, ?, ?)
+            """,
+            signals,
+        )
+        await db.executemany(
+            """
+            INSERT INTO ai_research_memos (
+                id, created_at, signal_id, symbol, provider, model_tag, prompt_version,
+                input_hash, verdict, confidence, used_only_provided_data,
+                validation_passed, memo_json
+            )
+            VALUES (?, ?, ?, ?, 'xai', 'grok-latest', 'ai_research_single/v1',
+                    'hash', 'approve', 0.8, 1, 1, '{}')
+            """,
+            memos,
+        )
+        await db.execute(
+            """
+            INSERT INTO risk_decisions (
+                id, created_at, signal_id, approved, reason, symbol, side,
+                equity_snapshot
+            )
+            VALUES (201, '2026-07-01 12:02:00', 4, 1, 'approved', 'OLDREF', 'long', 400)
+            """
+        )
+        await db.executemany(
+            """
+            INSERT INTO orders (
+                client_order_id, symbol, side, qty, status, filled_qty,
+                avg_fill_price, submitted_at, filled_at, risk_decision_id
+            )
+            VALUES (?, 'OLDREF', ?, 1, 'filled', 1, ?, ?, ?, ?)
+            """,
+            [
+                ("entry", "buy", 10.0, "2026-07-01 12:03:00", "2026-07-01 12:03:00", 201),
+                ("exit", "sell", 11.0, "2026-07-20 15:55:00", "2026-07-20 15:55:00", None),
+            ],
+        )
+        await db.executemany(
+            """
+            INSERT INTO ai_candidate_outcomes (
+                memo_id, signal_id, symbol, provider, model_tag, policy_tag,
+                decision_at, decision_session_date, verdict, reference_price,
+                price_source
+            )
+            VALUES (?, ?, ?, 'xai', 'grok-latest', 'single_xai', ?, ?, 'approve', 10, 'test')
+            """,
+            [
+                (101, 1, "OLD", "2026-07-01 12:01:00", "2026-07-01"),
+                (102, 2, "SPACE", "2026-07-20 12:01:00", "2026-07-20"),
+                (103, 3, "ISO", "2026-07-20T13:01:00Z", "2026-07-20"),
+                (104, 4, "OLDREF", "2026-07-01T12:01:00Z", "2026-07-01"),
+            ],
+        )
+        await db.commit()
+
+    since = datetime(2026, 7, 14, tzinfo=UTC)
+    rows = await _fetch_rows(db_path, since=since)
+
+    assert {row["symbol"] for row in rows["signals"]} == {"SPACE", "ISO", "OLDREF"}
+    assert {row["symbol"] for row in rows["ai_memos"]} == {"SPACE", "ISO", "OLDREF"}
+    assert {row["symbol"] for row in rows["candidate_outcomes"]} == {"SPACE", "ISO"}
+    closed = _build_closed_trades(rows, since=since)
+    assert [(trade.symbol, trade.pnl, trade.ai_verdict) for trade in closed] == [
+        ("OLDREF", pytest.approx(1.0), "xai:approve")
+    ]
 
 
 @pytest.mark.asyncio

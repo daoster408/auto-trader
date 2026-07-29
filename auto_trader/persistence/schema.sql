@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS signals (
     features_json TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_signals_created_julianday
+ON signals (julianday(created_at));
+
 CREATE TABLE IF NOT EXISTS ai_research_memos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -56,6 +59,12 @@ CREATE TABLE IF NOT EXISTS ai_research_memos (
     validation_passed INTEGER NOT NULL CHECK (validation_passed IN (0,1)),
     memo_json TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_ai_research_memos_created_julianday
+ON ai_research_memos (julianday(created_at));
+
+CREATE INDEX IF NOT EXISTS idx_ai_research_memos_signal_id
+ON ai_research_memos (signal_id);
 
 CREATE TABLE IF NOT EXISTS ai_candidate_outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +110,9 @@ ON ai_candidate_outcomes (provider, model_tag, policy_tag, symbol, decision_sess
 
 CREATE INDEX IF NOT EXISTS idx_ai_candidate_outcome_pending
 ON ai_candidate_outcomes (status, decision_session_date);
+
+CREATE INDEX IF NOT EXISTS idx_ai_candidate_outcome_decision_julianday
+ON ai_candidate_outcomes (julianday(decision_at));
 
 CREATE TABLE IF NOT EXISTS orders (
     client_order_id TEXT PRIMARY KEY,

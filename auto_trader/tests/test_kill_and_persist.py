@@ -9110,6 +9110,33 @@ async def test_telegram_edge_handler_accepts_custom_days(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_telegram_edge_handler_reports_timeout_without_blank_error(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+
+    async def slow_edge_report(*, window_days):
+        await asyncio.sleep(0.1)
+        return "EDGE REPORT"
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.run_edge_report", slow_edge_report)
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.EDGE_REPORT_TIMEOUT_SECONDS", 0.001)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._edge_handler(update, FakeTelegramContext())
+
+    assert update.message.replies == [
+        "EDGE REPORT timed out while reading the evidence ledger. Please retry in a moment."
+    ]
+
+
+@pytest.mark.asyncio
 async def test_telegram_edge_handler_rejects_out_of_range_days(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {"edge": 0}
