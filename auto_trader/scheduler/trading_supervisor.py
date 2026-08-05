@@ -50,6 +50,7 @@ from auto_trader.persistence.db import (
     get_latest_entry_order_for_symbol,
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,  # noqa: F401 - retained for existing test monkeypatch surface
+    get_recent_filled_exit_symbols,
     get_runtime_config_bool,
     get_runtime_config_int,  # noqa: F401 - retained for existing test monkeypatch surface
     get_runtime_config_value,
@@ -717,6 +718,8 @@ class TradingSupervisor:
         self.order_manager = order_manager
         self.notifier = notifier
         self._last_reconcile_at: datetime | None = None
+        self._last_reconciled_orders: list[dict[str, Any]] = []
+        self._last_forced_pending_reconcile_at: dict[str, datetime] = {}
         self._last_outcome_resolution_at: datetime | None = None
         self._outcome_resolution_task: asyncio.Task[None] | None = None
         self._seen_alert_keys: set[str] = set()
@@ -900,6 +903,7 @@ class TradingSupervisor:
         recent_orders = await self.adapter.get_recent_orders(days=lookback)
         reconciled = await reconcile_broker_orders(recent_orders)
         await self._clear_terminal_pending_exits_from_orders(recent_orders)
+        self._last_reconciled_orders = recent_orders
         self._last_reconcile_at = datetime.now(UTC)
         if reconciled != len(recent_orders):
             await self._notify_once(
@@ -908,6 +912,38 @@ class TradingSupervisor:
             )
         log.info("supervisor_reconciled", attempted=len(recent_orders), persisted=reconciled, lookback_days=lookback)
         return reconciled
+
+    async def _reconcile_persisted_pending_exit(
+        self,
+        symbol: str,
+        pending: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
+        """Refresh one unresolved marker without repeatedly polling all broker orders."""
+        now = datetime.now(UTC)
+        throttle_seconds = max(60, int(getattr(self.settings, "reconcile_interval_seconds", 300)))
+        timestamps = [
+            value
+            for value in (self._last_reconcile_at, self._last_forced_pending_reconcile_at.get(symbol))
+            if value is not None
+        ]
+        last_attempt = max(timestamps) if timestamps else None
+        if last_attempt is None or (now - last_attempt).total_seconds() >= throttle_seconds:
+            self._last_forced_pending_reconcile_at[symbol] = now
+            try:
+                await self.reconcile_once()
+            except Exception as e:
+                log.warning("pending_exit_forced_reconcile_failed", symbol=symbol, error=str(e))
+                return pending, None, False
+
+        refreshed = await get_pending_exit_for_symbol(symbol)
+        if refreshed is None:
+            self._last_forced_pending_reconcile_at.pop(symbol, None)
+            return None, None, True
+        exact_order = next(
+            (order for order in self._last_reconciled_orders if _order_matches_pending_exit(order, refreshed)),
+            None,
+        )
+        return refreshed, exact_order, True
 
     def evaluate_exit_rules(self, position: dict[str, Any]) -> ExitDecision:
         symbol = str(position.get("symbol", "")).upper()
@@ -1091,6 +1127,35 @@ class TradingSupervisor:
                     reason=decision.reason,
                 )
             else:
+                persisted_pending, recent_exact_order, reconciliation_succeeded = (
+                    await self._reconcile_persisted_pending_exit(decision.symbol, persisted_pending)
+                )
+                if not reconciliation_succeeded:
+                    return None
+                if persisted_pending is None:
+                    log.info("exit_pending_resolved_by_forced_reconcile", symbol=decision.symbol)
+                    return None
+                if recent_exact_order is not None and not _is_terminal_order_status(recent_exact_order.get("status")):
+                    self._pending_exit_symbols.add(decision.symbol)
+                    log.info(
+                        "exit_suppressed_recent_exact_pending",
+                        symbol=decision.symbol,
+                        broker_order_id=persisted_pending.get("broker_order_id"),
+                        status=recent_exact_order.get("status"),
+                    )
+                    return None
+                marker_at = _parse_dt(persisted_pending.get("created_at")) or _parse_dt(
+                    persisted_pending.get("updated_at")
+                )
+                grace_seconds = int(getattr(self.settings, "pending_exit_unresolved_grace_seconds", 360))
+                if marker_at is not None and (datetime.now(UTC) - marker_at).total_seconds() < grace_seconds:
+                    log.info(
+                        "exit_pending_unresolved_grace",
+                        symbol=decision.symbol,
+                        broker_order_id=persisted_pending.get("broker_order_id"),
+                        grace_seconds=grace_seconds,
+                    )
+                    return None
                 await self._notify_once(
                     f"exit-pending-unresolved-{decision.symbol}",
                     (
@@ -1230,6 +1295,11 @@ class TradingSupervisor:
         )
         if not signals:
             return None
+        cooldown_minutes = int(getattr(self.settings, "symbol_reentry_cooldown_minutes", 60))
+        recent_exit_symbols: set[str] = set()
+        if cooldown_minutes > 0:
+            cutoff = datetime.now(UTC) - timedelta(minutes=cooldown_minutes)
+            recent_exit_symbols = await get_recent_filled_exit_symbols(cutoff.isoformat())
         ai_research_enabled = bool(getattr(self.settings, "ai_research_enabled", True))
         ai_gate_enabled = await get_runtime_config_bool(
             "ai_entry_gate_enabled",
@@ -1240,6 +1310,13 @@ class TradingSupervisor:
         real_providers = real_research_providers(self.research_committee)
         evaluations: list[EntryCandidateEvaluation] = []
         for signal in signals:
+            if signal.symbol.upper() in recent_exit_symbols:
+                log.info(
+                    "entry_candidate_skipped_reentry_cooldown",
+                    symbol=signal.symbol.upper(),
+                    cooldown_minutes=cooldown_minutes,
+                )
+                continue
             cached_candidate_block = await self._same_day_candidate_ai_block(
                 signal.symbol,
                 ai_gate_enabled=ai_gate_enabled,

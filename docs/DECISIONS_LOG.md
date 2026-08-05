@@ -232,3 +232,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: Realized trades alone cannot show whether Grok adds selection edge because rejected opportunities were not graded. Model choice and committee structure should be decided from comparable dollar evidence, not intuition or win rate.
 - Impact: A passive, model-agnostic ledger stores one provider/model/policy/symbol/session decision, a model-packet reference price, and fixed `$30` hypothetical outcomes. Resolution is bounded, batched, silent, and outside trading authority. Realized and hypothetical dollars remain separate. Runtime entry capacity may be raised to 12, but existing RiskEngine sizing, gross-exposure, halt, duplicate, and exit controls remain authoritative.
 - Confidence: high
+
+- UTC timestamp: 2026-08-05T20:02:38Z
+- Local timestamp (`America/Los_Angeles`): 2026-08-05 13:02:38 PDT
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- Decision: Harden fast-filled pending-exit recovery and add a 60-minute filled-exit symbol re-entry cooldown.
+- Rationale: On 2026-08-03, NVDL close orders filled and disappeared from the open-order endpoint before the local pending marker reconciled. The supervisor interpreted the temporary mismatch as unresolved and persisted `PAUSED`. The same symbol also re-entered three times in roughly seven minutes.
+- Impact: Missing open orders now trigger throttled all-status reconciliation using exact broker/client identity, with a 360-second grace before a genuine unmatched marker pauses. Malformed marker timestamps remain fail-closed. Filled exits block same-symbol entry work for 60 minutes before signal persistence or AI spend. RiskEngine, exit rules, sizing, halts, and operator-only recovery authority are unchanged.
+- Confidence: high

@@ -51,6 +51,9 @@ Telegram checks after startup:
 - Send `/status` and confirm pending exits show the close order ID, reason, status, and duplicate-exit suppression.
 - Send `/report` and confirm positions, orders, pending exits, and latest journal entries are visible.
 - Expected pending-close suppression is log-only; Telegram alerts are reserved for submitted exits, failures, unresolved pending exits, and operator actions.
+- If an open-order lookup misses a persisted pending close, the supervisor reconciles the exact broker/client order identity against recent all-status orders. A filled or failed exact match clears the marker; a different same-symbol order never does. A genuinely unmatched marker pauses only after `PENDING_EXIT_UNRESOLVED_GRACE_SECONDS` (default `360`), and forced reconciliation is throttled to the normal reconciliation interval.
+- `SYMBOL_REENTRY_COOLDOWN_MINUTES` defaults to `60`. A symbol with a durable filled exit inside that window is skipped before signal persistence, filtering, paid AI, or order submission. Canceled, rejected, expired, and merely submitted exits do not start the cooldown.
+- `/ai` labels its rows as historical whenever the state is `PAUSED` or `HALTED`; no new entry research runs in those states.
 - A duplicate local bot process should fail fast on startup instead of creating Telegram `getUpdates` conflicts.
 - Do not use `/resume <token>` unless the restored state is intentionally ready to trade.
 - Use `/kill` only when you intend to flatten paper positions and persist `HALTED`.
@@ -185,6 +188,8 @@ BOOTSTRAP_HARD_KILL=true ORACLE_HOST=<host> ORACLE_USER=ubuntu ORACLE_KEY=<ssh-k
 The bootstrap path requires the remote `.env` to contain `ALPACA_PAPER=true` and refuses `ALLOW_LIVE=true`. After that first rollout, future deploys should use the normal planned maintenance command above.
 
 For live mode, the maintenance helper refuses preserve-position restarts unless `ALLOW_LIVE=true` is set explicitly. Use that only for a reviewed live deploy window where preserving positions through a fast restart is intentional. After any deploy, inspect `/status`; send `/resume <token>` only if the state is intentionally ready to trade.
+
+When recovering a false safety pause, first verify broker positions, open orders, and local pending exits are mutually consistent. Persist `ACTIVE` only after that check and immediately before a planned-maintenance restart. Never add or rely on automatic resume behavior.
 
 ### Optional Finnhub Enrichment
 

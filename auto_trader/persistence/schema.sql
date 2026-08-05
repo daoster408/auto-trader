@@ -130,6 +130,9 @@ CREATE TABLE IF NOT EXISTS orders (
     rationale TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_orders_filled_exit_time
+ON orders (lower(status), lower(side), julianday(COALESCE(filled_at, submitted_at)));
+
 CREATE TABLE IF NOT EXISTS pending_exits (
     symbol TEXT PRIMARY KEY,
     broker_order_id TEXT,

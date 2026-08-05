@@ -46,6 +46,18 @@ class Settings(BaseSettings):
     # Supervisor / automation controls (default alert-only)
     reconcile_interval_seconds: int = Field(300, ge=60, alias="RECONCILE_INTERVAL_SECONDS")
     reconcile_lookback_days: int = Field(2, ge=1, alias="RECONCILE_LOOKBACK_DAYS")
+    pending_exit_unresolved_grace_seconds: int = Field(
+        360,
+        ge=60,
+        le=1800,
+        alias="PENDING_EXIT_UNRESOLVED_GRACE_SECONDS",
+    )
+    symbol_reentry_cooldown_minutes: int = Field(
+        60,
+        ge=0,
+        le=1440,
+        alias="SYMBOL_REENTRY_COOLDOWN_MINUTES",
+    )
     position_monitor_interval_seconds: int = Field(60, ge=15, alias="POSITION_MONITOR_INTERVAL_SECONDS")
     supervisor_tick_timeout_seconds: int = Field(90, ge=1, alias="SUPERVISOR_TICK_TIMEOUT_SECONDS")
     auto_entry_enabled: bool = Field(False, alias="AUTO_ENTRY_ENABLED")

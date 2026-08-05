@@ -134,6 +134,7 @@ from auto_trader.intelligence.rules_fallback import (
 from auto_trader.__main__ import _acquire_single_instance_lock, _handle_signal_shutdown, _should_emergency_halt_on_shutdown
 from auto_trader.scheduler.trading_supervisor import (
     AIResearchRunResult,
+    ExitDecision,
     TradingSupervisor,
     _format_entry_notification,
     _position_stagnation_features,
@@ -155,6 +156,7 @@ from auto_trader.persistence.db import (
     get_pending_exits,
     get_pending_exit_for_symbol,
     get_pending_exit_symbols,
+    get_recent_filled_exit_symbols,
     read_latest_ai_research_memos,
     get_runtime_config_bool,
     get_runtime_config_int,
@@ -191,6 +193,8 @@ class DummySettings:
 class DummySupervisorSettings(DummySettings):
     reconcile_interval_seconds = 300
     reconcile_lookback_days = 2
+    pending_exit_unresolved_grace_seconds = 360
+    symbol_reentry_cooldown_minutes = 0
     position_monitor_interval_seconds = 60
     supervisor_tick_timeout_seconds = 20
     auto_entry_enabled = False
@@ -922,6 +926,59 @@ async def test_reconciled_exit_order_uses_matching_pending_exit_reason(tmp_path)
     orders = await get_latest_order_records(limit=1)
 
     assert orders[0]["rationale"] == "position stagnation exit"
+
+
+@pytest.mark.asyncio
+async def test_recent_filled_exit_symbols_only_includes_filled_closes_since_cutoff(tmp_path):
+    configure_db_path(tmp_path / "filled_exit_cooldown.db")
+    now = datetime.now(UTC)
+    orders = [
+        {
+            "id": "filled-recent",
+            "client_order_id": "filled-recent",
+            "symbol": "NVDL",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "submitted_at": (now - timedelta(minutes=5)).isoformat(),
+            "filled_at": (now - timedelta(minutes=4)).isoformat(),
+        },
+        {
+            "id": "canceled-recent",
+            "client_order_id": "canceled-recent",
+            "symbol": "TSLA",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "canceled",
+            "submitted_at": (now - timedelta(minutes=3)).isoformat(),
+        },
+        {
+            "id": "filled-old",
+            "client_order_id": "filled-old",
+            "symbol": "AMD",
+            "side": "sell",
+            "qty": 1.0,
+            "status": "filled",
+            "submitted_at": (now - timedelta(hours=3)).isoformat(),
+            "filled_at": (now - timedelta(hours=3)).isoformat(),
+        },
+        {
+            "id": "filled-entry",
+            "client_order_id": "filled-entry",
+            "symbol": "NVDA",
+            "side": "buy",
+            "qty": 1.0,
+            "status": "filled",
+            "submitted_at": (now - timedelta(minutes=2)).isoformat(),
+            "filled_at": (now - timedelta(minutes=2)).isoformat(),
+        },
+    ]
+    for order in orders:
+        assert await upsert_order_record(order)
+
+    symbols = await get_recent_filled_exit_symbols((now - timedelta(minutes=60)).isoformat())
+
+    assert symbols == {"NVDL"}
 
 
 @pytest.mark.asyncio
@@ -9401,6 +9458,42 @@ async def test_telegram_ai_handler_returns_latest_decisions_without_external_cal
 
 
 @pytest.mark.asyncio
+async def test_telegram_ai_handler_labels_historical_rows_when_paused(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.PAUSED)
+
+    async def fake_latest_memos(*, limit, symbol=None, exclude_providers=()):
+        return [
+            {
+                "created_at": (datetime.now(UTC) - timedelta(days=2)).isoformat(),
+                "symbol": "NVDL",
+                "provider": "xai",
+                "verdict": "approve",
+                "confidence": 0.78,
+                "validation_passed": True,
+                "prompt_version": PROMPT_VERSION,
+                "memo": {},
+            }
+        ]
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.read_latest_ai_research_memos", fake_latest_memos)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    update = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._ai_handler(update, FakeTelegramContext())
+
+    assert "AI PIPELINE PAUSED: new entry research is not running." in update.message.replies[0]
+    assert "The decisions below are historical." in update.message.replies[0]
+    assert "Grok: Buy on NVDL" in update.message.replies[0]
+
+
+@pytest.mark.asyncio
 async def test_telegram_ai_handler_filters_symbol(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
 
@@ -11472,6 +11565,225 @@ async def test_supervisor_persisted_pending_exit_suppresses_close_after_restart(
 
 
 @pytest.mark.asyncio
+async def test_supervisor_fast_filled_pending_exit_reconciles_without_pause_or_duplicate(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    marker = {
+        "symbol": "NVDL",
+        "broker_order_id": "close-1",
+        "client_order_id": "client-close-1",
+        "created_at": (datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+    }
+
+    class ExitSettings(DummySupervisorSettings):
+        auto_exit_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.close_calls = 0
+            self.recent_calls = 0
+
+        async def get_open_orders(self):
+            return []
+
+        async def get_recent_orders(self, days=2):
+            self.recent_calls += 1
+            return [
+                {
+                    "id": "close-1",
+                    "broker_order_id": "close-1",
+                    "client_order_id": "client-close-1",
+                    "symbol": "NVDL",
+                    "side": "sell",
+                    "qty": 1.0,
+                    "status": "filled",
+                    "filled_at": datetime.now(UTC).isoformat(),
+                }
+            ]
+
+        async def close_position(self, symbol, reason):
+            self.close_calls += 1
+            return {"id": "duplicate", "symbol": symbol, "reason": reason}
+
+    async def fake_pending_lookup(symbol):
+        return marker if marker else None
+
+    async def fake_pending_clear(symbol):
+        marker.clear()
+        return True
+
+    async def fake_reconcile(orders):
+        return len(orders)
+
+    async def fake_latest_entry(symbol, *, before_utc_iso=None):
+        return None
+
+    async def noop(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.clear_pending_exit", fake_pending_clear)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_entry_order_for_symbol", fake_latest_entry)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", noop)
+
+    adapter = FakeAdapter()
+    supervisor = TradingSupervisor(
+        settings=ExitSettings(),
+        state_machine=sm,
+        adapter=adapter,
+        order_manager=object(),
+        notifier=None,
+    )
+    decision = ExitDecision(
+        symbol="NVDL",
+        should_exit=True,
+        reason="position trailing stop reached",
+        metrics={"position_qty": 1.0},
+    )
+
+    result = await supervisor._execute_exit_if_enabled(decision, clock={"is_open": True})
+
+    assert result is None
+    assert marker == {}
+    assert sm.state == SystemState.ACTIVE
+    assert adapter.close_calls == 0
+    assert adapter.recent_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_supervisor_young_unmatched_pending_exit_waits_without_pause(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    marker = {
+        "symbol": "NVDL",
+        "broker_order_id": "close-1",
+        "client_order_id": "client-close-1",
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+
+    class ExitSettings(DummySupervisorSettings):
+        auto_exit_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.close_calls = 0
+            self.recent_calls = 0
+
+        async def get_open_orders(self):
+            return []
+
+        async def get_recent_orders(self, days=2):
+            self.recent_calls += 1
+            return []
+
+        async def close_position(self, symbol, reason):
+            self.close_calls += 1
+            return {"id": "duplicate", "symbol": symbol, "reason": reason}
+
+    async def fake_pending_lookup(symbol):
+        return marker
+
+    async def fake_reconcile(orders):
+        return 0
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+
+    adapter = FakeAdapter()
+    supervisor = TradingSupervisor(
+        settings=ExitSettings(),
+        state_machine=sm,
+        adapter=adapter,
+        order_manager=object(),
+        notifier=None,
+    )
+    decision = ExitDecision(
+        symbol="NVDL",
+        should_exit=True,
+        reason="position trailing stop reached",
+        metrics={"position_qty": 1.0},
+    )
+
+    await supervisor._execute_exit_if_enabled(decision, clock={"is_open": True})
+    await supervisor._execute_exit_if_enabled(decision, clock={"is_open": True})
+
+    assert sm.state == SystemState.ACTIVE
+    assert adapter.close_calls == 0
+    assert adapter.recent_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_supervisor_exact_nonterminal_recent_exit_suppresses_without_pause(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    marker = {
+        "symbol": "NVDL",
+        "broker_order_id": "close-1",
+        "client_order_id": "client-close-1",
+        "created_at": (datetime.now(UTC) - timedelta(minutes=10)).isoformat(),
+    }
+
+    class ExitSettings(DummySupervisorSettings):
+        auto_exit_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+        def __init__(self):
+            self.close_calls = 0
+
+        async def get_open_orders(self):
+            return []
+
+        async def get_recent_orders(self, days=2):
+            return [
+                {
+                    "id": "close-1",
+                    "client_order_id": "client-close-1",
+                    "symbol": "NVDL",
+                    "side": "sell",
+                    "qty": 1.0,
+                    "status": "accepted",
+                }
+            ]
+
+        async def close_position(self, symbol, reason):
+            self.close_calls += 1
+            return {"id": "duplicate", "symbol": symbol, "reason": reason}
+
+    async def fake_pending_lookup(symbol):
+        return marker
+
+    async def fake_reconcile(orders):
+        return len(orders)
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_pending_exit_for_symbol", fake_pending_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+
+    adapter = FakeAdapter()
+    supervisor = TradingSupervisor(
+        settings=ExitSettings(),
+        state_machine=sm,
+        adapter=adapter,
+        order_manager=object(),
+        notifier=None,
+    )
+    decision = ExitDecision(
+        symbol="NVDL",
+        should_exit=True,
+        reason="position trailing stop reached",
+        metrics={"position_qty": 1.0},
+    )
+
+    await supervisor._execute_exit_if_enabled(decision, clock={"is_open": True})
+
+    assert sm.state == SystemState.ACTIVE
+    assert adapter.close_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_supervisor_unresolved_persisted_pending_exit_pauses_for_review(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     notifications = []
@@ -11532,7 +11844,11 @@ async def test_supervisor_unresolved_persisted_pending_exit_pauses_for_review(mo
         return {"AMPX"}
 
     async def fake_pending_lookup(symbol):
-        return {"symbol": symbol, "broker_order_id": "old-pending-close"}
+        return {
+            "symbol": symbol,
+            "broker_order_id": "old-pending-close",
+            "created_at": (datetime.now(UTC) - timedelta(minutes=10)).isoformat(),
+        }
 
     async def fake_pending_clear(symbol):
         return True
@@ -11648,7 +11964,12 @@ async def test_supervisor_unmatched_open_close_order_does_not_resolve_persisted_
         return {"AMPX"}
 
     async def fake_pending_lookup(symbol):
-        return {"symbol": symbol, "broker_order_id": "old-pending-close", "client_order_id": "old-pending-close"}
+        return {
+            "symbol": symbol,
+            "broker_order_id": "old-pending-close",
+            "client_order_id": "old-pending-close",
+            "created_at": "malformed-timestamp",
+        }
 
     async def fake_pending_clear(symbol):
         return True
@@ -12724,6 +13045,79 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
     assert any("PAPER ENTRY SUBMITTED: AMPX" in message for message in notifications)
     assert any("Risk: approved, Passed v1 risk gates" in message for message in notifications)
     assert not any("{'approved':" in message or "{'id':" in message for message in notifications)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reentry_cooldown_skips_before_signal_persistence_and_order(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    calls = {"recent_exits": 0, "signals_logged": 0, "orders": 0}
+
+    class EntrySettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        symbol_reentry_cooldown_minutes = 60
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+            calls["orders"] += 1
+            return {}
+
+    async def fake_runtime_bool(key, *, default):
+        return default
+
+    async def fake_signals(*args, **kwargs):
+        return [TradeIntent(symbol="NVDL", side="long", entry_price=31.0)]
+
+    async def fake_recent_exits(cutoff):
+        calls["recent_exits"] += 1
+        parsed_cutoff = datetime.fromisoformat(str(cutoff).replace("Z", "+00:00"))
+        assert parsed_cutoff >= datetime.now(UTC) - timedelta(minutes=61)
+        return {"NVDL"}
+
+    async def fake_log_signal(**kwargs):
+        calls["signals_logged"] += 1
+        return 1
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", fake_runtime_bool)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor._get_profiled_rules_signals", fake_signals)
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.get_recent_filled_exit_symbols",
+        fake_recent_exits,
+    )
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", fake_log_signal)
+
+    supervisor = TradingSupervisor(
+        settings=EntrySettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=FakeOrderManager(),
+        notifier=None,
+    )
+    result = await supervisor._maybe_submit_entry(
+        account={
+            "status": "CONNECTED",
+            "account_status": "AccountStatus.ACTIVE",
+            "trading_blocked": False,
+            "account_blocked": False,
+            "equity": 400.0,
+            "cash": 400.0,
+        },
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=12,
+        risk_profile="aggressive",
+    )
+
+    assert result is None
+    assert calls == {"recent_exits": 1, "signals_logged": 0, "orders": 0}
 
 
 def test_entry_notification_includes_compact_ai_provider_votes():

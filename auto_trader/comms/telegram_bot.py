@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
-from auto_trader.core.models import KillResult
+from auto_trader.core.models import KillResult, SystemState
 from auto_trader.core.risk_engine import RiskEngine
 from auto_trader.core.risk_profile import VALID_RISK_PROFILES, get_risk_profile
 from auto_trader.core.state_machine import StateMachine
@@ -812,7 +812,14 @@ class TelegramBot:
             log.warning("ai_decision_report_failed", error=str(e), symbol=symbol)
             await update.message.reply_text("AI DECISIONS unavailable.")
             return
-        await update.message.reply_text(_format_ai_decision_rows(rows, symbol=symbol))
+        report = _format_ai_decision_rows(rows, symbol=symbol)
+        if self.sm.state != SystemState.ACTIVE:
+            report = (
+                f"AI PIPELINE {self.sm.state.value}: new entry research is not running.\n"
+                "The decisions below are historical.\n\n"
+                f"{report}"
+            )
+        await update.message.reply_text(report)
         log.info("ai_decision_report_requested", symbol=symbol or "latest")
 
     async def _config_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

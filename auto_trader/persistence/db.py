@@ -1071,6 +1071,32 @@ async def count_entry_orders_since(start_utc_iso: str) -> int:
             raise
 
 
+async def get_recent_filled_exit_symbols(since_utc_iso: str) -> set[str]:
+    """Return symbols with a durable filled exit at or after a UTC cutoff."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT DISTINCT upper(symbol) AS symbol
+                    FROM orders
+                    WHERE lower(status) = 'filled'
+                      AND lower(side) IN ('sell', 'close', 'sell_short', 'buy_to_cover')
+                      AND julianday(COALESCE(filled_at, submitted_at)) >= julianday(?)
+                    """,
+                    (since_utc_iso,),
+                )
+                rows = await cur.fetchall()
+                return {str(row["symbol"]).upper() for row in rows if row["symbol"]}
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("recent_filled_exit_symbols_failed", error=str(e))
+            raise
+
+
 async def get_entry_pressure_counts_since(start_utc_iso: str) -> dict[str, Any]:
     """Return bounded structured counts for read-only entry-pressure diagnostics."""
     async with _DB_LOCK:
