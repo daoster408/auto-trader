@@ -37,7 +37,9 @@ class CostAssumptions:
     input_tokens_per_call: int
     output_tokens_per_call: int
     input_price_per_mtok: float
+    cached_input_price_per_mtok: float
     output_price_per_mtok: float
+    reasoning_price_per_mtok: float
 
     @property
     def estimated_cost_per_memo(self) -> float:
@@ -106,12 +108,29 @@ def _warn_gate(name: str, ok: bool, detail: str) -> ValidationGate:
     return ValidationGate(name=name, status="PASS" if ok else "WARN", detail=detail)
 
 
-def _cost_assumptions_from_settings(settings: Any) -> CostAssumptions:
+def _cost_assumptions_from_settings(settings: Any, *, provider: str | None = None) -> CostAssumptions:
+    input_override = getattr(settings, f"ai_research_{provider}_input_price_per_mtok", None) if provider else None
+    cached_override = (
+        getattr(settings, f"ai_research_{provider}_cached_input_price_per_mtok", None) if provider else None
+    )
+    output_override = getattr(settings, f"ai_research_{provider}_output_price_per_mtok", None) if provider else None
+    input_price = (
+        float(input_override)
+        if input_override is not None
+        else float(getattr(settings, "ai_research_input_price_per_mtok", 5.0) or 0.0)
+    )
+    output_price = (
+        float(output_override)
+        if output_override is not None
+        else float(getattr(settings, "ai_research_output_price_per_mtok", 25.0) or 0.0)
+    )
     return CostAssumptions(
         input_tokens_per_call=int(getattr(settings, "ai_research_est_input_tokens", 15000) or 0),
         output_tokens_per_call=int(getattr(settings, "ai_research_est_output_tokens", 2000) or 0),
-        input_price_per_mtok=float(getattr(settings, "ai_research_input_price_per_mtok", 5.0) or 0.0),
-        output_price_per_mtok=float(getattr(settings, "ai_research_output_price_per_mtok", 25.0) or 0.0),
+        input_price_per_mtok=input_price,
+        cached_input_price_per_mtok=float(cached_override) if cached_override is not None else input_price,
+        output_price_per_mtok=output_price,
+        reasoning_price_per_mtok=output_price,
     )
 
 
@@ -201,7 +220,8 @@ def build_ai_research_preflight_report(
     sequential_timeout_budget_seconds = sum(provider_timeout_seconds.values())
     supervisor_tick_timeout_seconds = float(getattr(settings, "supervisor_tick_timeout_seconds", 20) or 20)
     remaining_calls = max(0, max_calls - used_calls) if used_calls is not None else None
-    cost = cost or _cost_assumptions_from_settings(settings)
+    cost_provider = provider_reports[0].provider if len(provider_reports) == 1 else None
+    cost = cost or _cost_assumptions_from_settings(settings, provider=cost_provider)
 
     gates = [
         _gate("AI enabled", enabled, f"AI_RESEARCH_ENABLED={str(enabled).lower()}"),
@@ -294,9 +314,12 @@ def render_ai_research_preflight(report: AIResearchPreflightReport) -> str:
             f"input_tokens={report.cost.input_tokens_per_call}, "
             f"output_tokens={report.cost.output_tokens_per_call}, "
             f"input_price_per_mtok=${report.cost.input_price_per_mtok:.2f}, "
-            f"output_price_per_mtok=${report.cost.output_price_per_mtok:.2f}"
+            f"cached_input_price_per_mtok=${report.cost.cached_input_price_per_mtok:.2f}, "
+            f"output_price_per_mtok=${report.cost.output_price_per_mtok:.2f}, "
+            f"reasoning_price_per_mtok=${report.cost.reasoning_price_per_mtok:.2f}"
         ),
         f"Estimated cost per memo: ${report.cost.estimated_cost_per_memo:.4f}",
+        "Cost estimate assumes regular input plus completion tokens; cached-input and separate reasoning rates are shown for reference.",
         f"Estimated cost per round: ${report.estimated_cost_per_round:.4f}",
         f"Estimated worst-case daily cost: ${report.estimated_daily_cost:.4f}",
     ]

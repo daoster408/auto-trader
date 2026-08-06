@@ -445,6 +445,23 @@ def test_settings_bounds_live_ai_provider_reliability_knobs():
     )
     assert priced.ai_research_openai_input_price_per_mtok == 2.5
     assert priced.ai_research_openai_output_price_per_mtok == 10.0
+    assert priced.ai_research_xai_input_price_per_mtok == 1.25
+    assert priced.ai_research_xai_cached_input_price_per_mtok == 0.20
+    assert priced.ai_research_xai_output_price_per_mtok == 2.50
+    assert priced.ai_research_xai_legacy_cached_input_ratio == pytest.approx(0.06245255)
+
+    invalid_costs = Settings(
+        ALPACA_API_KEY="key",
+        ALPACA_API_SECRET="secret",
+        TELEGRAM_BOT_TOKEN="token",
+        RESUME_TOKEN="resume",
+        AI_RESEARCH_INPUT_PRICE_PER_MTOK="not-a-number",
+        AI_RESEARCH_XAI_CACHED_INPUT_PRICE_PER_MTOK="-1",
+        AI_RESEARCH_XAI_LEGACY_CACHED_INPUT_RATIO="2",
+    )
+    assert invalid_costs.ai_research_input_price_per_mtok == 5.0
+    assert invalid_costs.ai_research_xai_cached_input_price_per_mtok == 0.20
+    assert invalid_costs.ai_research_xai_legacy_cached_input_ratio == pytest.approx(0.06245255)
 
     with pytest.raises(ValidationError, match="AI_RESEARCH_OPENAI_TIMEOUT_SECONDS"):
         Settings(
@@ -1701,8 +1718,152 @@ async def test_ai_cost_report_groups_provider_usage_and_unknown_failures():
         assert by_provider["xai"].estimated_cost == pytest.approx(1.5)
         assert by_provider["xai"].pricing_source == "provider_override"
         assert "Unknown possible billed failures: 1" in rendered
-        assert "- anthropic: calls=2, usage_known=1, unknown=1" in rendered
-        assert "- xai: calls=1, usage_known=1, unknown=0" in rendered
+        assert "- anthropic: persisted_calls=2, usage_known=1, unknown=1" in rendered
+        assert "- xai: persisted_calls=1, usage_known=1, unknown=0" in rendered
+
+
+@pytest.mark.asyncio
+async def test_ai_cost_report_reconstructs_legacy_xai_portal_cost():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "xai_portal_cost.db"
+        configure_db_path(db_path)
+        await init_db()
+        await log_ai_research_memo(
+            signal_id=1,
+            symbol="POET",
+            provider="xai",
+            model_tag="xai/grok-latest",
+            prompt_version="ai_research_single/v1",
+            input_hash="portal-calibration",
+            verdict="watch",
+            confidence=0.5,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={
+                "provider_usage": {
+                    "input_tokens": 1_277_770,
+                    "output_tokens": 65_931,
+                    "total_tokens": 1_551_140,
+                }
+            },
+        )
+
+        class CostSettings(DummySupervisorSettings):
+            ai_research_xai_input_price_per_mtok = 1.25
+            ai_research_xai_cached_input_price_per_mtok = 0.20
+            ai_research_xai_output_price_per_mtok = 2.50
+            ai_research_xai_legacy_cached_input_ratio = 0.06245255
+
+        CostSettings.db_path = str(db_path)
+        report = await build_ai_cost_report(settings=CostSettings(), days=1)
+        row = report.providers[0]
+        rendered = render_ai_cost_report(report)
+
+        assert row.cached_input_tokens == 79_800
+        assert row.reasoning_tokens == 207_439
+        assert row.completion_tokens == 65_931
+        assert row.legacy_estimated_rows == 1
+        assert row.estimated_cost == pytest.approx(2.19685, abs=0.0001)
+        assert "legacy_estimated=1 row(s)" in rendered
+        assert "not the provider portal's HTTP request counter" in rendered
+
+
+@pytest.mark.asyncio
+async def test_ai_cost_report_explicit_xai_usage_overrides_legacy_cache_ratio():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "xai_explicit_cost.db"
+        configure_db_path(db_path)
+        await init_db()
+        await log_ai_research_memo(
+            signal_id=1,
+            symbol="POET",
+            provider="xai",
+            model_tag="xai/grok-latest",
+            prompt_version="ai_research_single/v1",
+            input_hash="explicit-usage",
+            verdict="watch",
+            confidence=0.5,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={
+                "provider_usage": {
+                    "input_tokens": 1_000,
+                    "output_tokens": 200,
+                    "total_tokens": 1_300,
+                    "regular_input_tokens": 900,
+                    "cached_input_tokens": 100,
+                    "completion_tokens": 200,
+                    "reasoning_tokens": 100,
+                    "usage_detail": "provider_explicit",
+                }
+            },
+        )
+
+        class CostSettings(DummySupervisorSettings):
+            ai_research_xai_input_price_per_mtok = 1.25
+            ai_research_xai_cached_input_price_per_mtok = 0.20
+            ai_research_xai_output_price_per_mtok = 2.50
+            ai_research_xai_legacy_cached_input_ratio = 0.5
+
+        CostSettings.db_path = str(db_path)
+        report = await build_ai_cost_report(settings=CostSettings(), days=1)
+        row = report.providers[0]
+
+        assert row.regular_input_tokens == 900
+        assert row.cached_input_tokens == 100
+        assert row.completion_tokens == 200
+        assert row.reasoning_tokens == 100
+        assert row.detailed_usage_rows == 1
+        assert row.legacy_estimated_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_ai_cost_report_clamps_malformed_explicit_usage_without_double_counting():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "xai_malformed_cost.db"
+        configure_db_path(db_path)
+        await init_db()
+        await log_ai_research_memo(
+            signal_id=1,
+            symbol="POET",
+            provider="xai",
+            model_tag="xai/grok-latest",
+            prompt_version="ai_research_single/v1",
+            input_hash="malformed-usage",
+            verdict="watch",
+            confidence=0.5,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={
+                "provider_usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 150,
+                    "regular_input_tokens": 10,
+                    "cached_input_tokens": 120,
+                    "completion_tokens": 100,
+                    "reasoning_tokens": 100,
+                    "usage_detail": "provider_explicit",
+                }
+            },
+        )
+
+        class CostSettings(DummySupervisorSettings):
+            ai_research_xai_input_price_per_mtok = 1.25
+            ai_research_xai_cached_input_price_per_mtok = 0.20
+            ai_research_xai_output_price_per_mtok = 2.50
+            ai_research_xai_legacy_cached_input_ratio = 0.5
+
+        CostSettings.db_path = str(db_path)
+        report = await build_ai_cost_report(settings=CostSettings(), days=1)
+        row = report.providers[0]
+
+        assert row.regular_input_tokens == 0
+        assert row.cached_input_tokens == 100
+        assert row.completion_tokens == 0
+        assert row.reasoning_tokens == 50
+        assert row.degraded_usage_rows == 1
+        assert row.regular_input_tokens + row.cached_input_tokens + row.completion_tokens + row.reasoning_tokens == 150
 
 
 @pytest.mark.asyncio
@@ -5032,6 +5193,74 @@ async def test_real_provider_research_stores_bounded_usage_metadata():
     }
 
 
+@pytest.mark.asyncio
+async def test_xai_research_stores_cached_and_reasoning_usage_without_double_counting():
+    payload = {
+        "symbol": "POET",
+        "verdict": "watch",
+        "confidence": 0.5,
+        "used_only_provided_data": True,
+        "bull_case": "Constructive momentum.",
+        "bear_case": "Catalyst is unverified.",
+        "edge_memory_alignment": "No conflict.",
+        "edge_memory_conflicts": "Sample is thin.",
+        "edge_memory_action": "neutral",
+        "judge_summary": "Watch only.",
+    }
+    provider = XAIResearchCommittee("key", model="grok-latest")
+
+    def fake_call(packet):
+        return {
+            "id": "resp_usage_details",
+            "choices": [{"message": {"content": json.dumps(payload)}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 150,
+                "prompt_tokens_details": {"cached_tokens": 40},
+                "completion_tokens_details": {"reasoning_tokens": 30},
+            },
+        }
+
+    provider._call_provider = fake_call
+    memo = await provider.research(TradeIntent(symbol="POET", side="long", entry_price=10.0))
+
+    assert memo.memo["provider_usage"] == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "total_tokens": 150,
+        "regular_input_tokens": 60,
+        "cached_input_tokens": 40,
+        "completion_tokens": 20,
+        "reasoning_tokens": 30,
+        "usage_detail": "provider_explicit",
+    }
+
+
+def test_xai_usage_keeps_completion_separate_from_reasoning_when_total_confirms_it():
+    usage = ai_committee._provider_usage_metadata(
+        {
+            "usage": {
+                "prompt_tokens": 26,
+                "completion_tokens": 168,
+                "total_tokens": 498,
+                "completion_tokens_details": {"reasoning_tokens": 304},
+            }
+        }
+    )
+
+    assert usage == {
+        "input_tokens": 26,
+        "output_tokens": 168,
+        "total_tokens": 498,
+        "regular_input_tokens": 26,
+        "cached_input_tokens": 0,
+        "completion_tokens": 168,
+        "reasoning_tokens": 304,
+        "usage_detail": "provider_explicit",
+    }
+
+
 def test_ai_research_packet_hash_ignores_volatile_metadata():
     base = {
         "generated_at": "2026-06-04T15:00:00Z",
@@ -5150,6 +5379,40 @@ def test_ai_research_preflight_configured_anthropic_opus_estimate_no_secret():
     assert "super-secret" not in text
     assert "Estimated cost per memo: $0.1250" in text
     assert "Estimated worst-case daily cost: $0.6250" in text
+
+
+def test_ai_research_preflight_uses_xai_provider_specific_prices():
+    class XAISettings(DummySupervisorSettings):
+        ai_research_enabled = True
+        ai_research_provider = "xai"
+        ai_research_model = "grok-latest"
+        ai_research_max_calls_per_day = 10
+        ai_research_est_input_tokens = 15_000
+        ai_research_est_output_tokens = 2_000
+        ai_research_input_price_per_mtok = 5.0
+        ai_research_output_price_per_mtok = 25.0
+        ai_research_xai_input_price_per_mtok = 1.25
+        ai_research_xai_cached_input_price_per_mtok = 0.20
+        ai_research_xai_output_price_per_mtok = 2.50
+        xai_api_key = "xai-secret"
+
+    report = build_ai_research_preflight_report(
+        settings=XAISettings(),
+        used_calls=0,
+        model_availability={"xai": "available"},
+    )
+    text = render_ai_research_preflight(report)
+
+    assert report.cost.input_price_per_mtok == 1.25
+    assert report.cost.cached_input_price_per_mtok == 0.20
+    assert report.cost.output_price_per_mtok == 2.50
+    assert report.cost.reasoning_price_per_mtok == 2.50
+    assert report.cost.estimated_cost_per_memo == pytest.approx(0.02375)
+    assert "input_price_per_mtok=$1.25" in text
+    assert "cached_input_price_per_mtok=$0.20" in text
+    assert "reasoning_price_per_mtok=$2.50" in text
+    assert "regular input plus completion tokens" in text
+    assert "xai-secret" not in text
 
 
 def test_ai_research_preflight_renders_ai_entry_gate_enabled():

@@ -241,3 +241,12 @@ Append-only decision history. Do not delete or rewrite old decisions.
 - Rationale: On 2026-08-03, NVDL close orders filled and disappeared from the open-order endpoint before the local pending marker reconciled. The supervisor interpreted the temporary mismatch as unresolved and persisted `PAUSED`. The same symbol also re-entered three times in roughly seven minutes.
 - Impact: Missing open orders now trigger throttled all-status reconciliation using exact broker/client identity, with a 360-second grace before a genuine unmatched marker pauses. Malformed marker timestamps remain fail-closed. Filled exits block same-symbol entry work for 60 minutes before signal persistence or AI spend. RiskEngine, exit rules, sizing, halts, and operator-only recovery authority are unchanged.
 - Confidence: high
+
+- UTC timestamp: 2026-08-06T16:18:16Z
+- Local timestamp (`America/Los_Angeles`): 2026-08-06 09:18:16 PDT
+- Role: Architect/Engineer
+- Session AI/model: openai/gpt-5
+- Decision: Calibrate xAI cost reporting to provider-specific cached-input and reasoning-token billing while preserving an explicitly estimated legacy reconstruction.
+- Rationale: The xAI portal reported `$2.20` for Jul 8-Aug 6, while the bot's generic `$5/$25` estimate reported roughly `$8.04` from nearly identical aggregate token totals. The discrepancy was stale pricing and missing cache/reasoning buckets, not unexplained provider usage.
+- Impact: New xAI responses persist regular input, cached input, completion, and reasoning buckets. The cost report uses `$1.25/$0.20/$2.50/$2.50` per million tokens, labels historical cache reconstruction `legacy_estimated`, distinguishes stored research decisions from portal HTTP requests, and treats malformed cost-only settings as non-blocking. Trading decisions, RiskEngine, orders, and exits are unchanged.
+- Confidence: high

@@ -1,8 +1,9 @@
 """Configuration and settings (Pydantic v2)."""
+import math
 import os
 
 from pydantic_settings import BaseSettings
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from typing import Literal
 
 
@@ -170,14 +171,25 @@ class Settings(BaseSettings):
         alias="AI_RESEARCH_ANTHROPIC_OUTPUT_PRICE_PER_MTOK",
     )
     ai_research_xai_input_price_per_mtok: float | None = Field(
-        None,
+        1.25,
         ge=0.0,
         alias="AI_RESEARCH_XAI_INPUT_PRICE_PER_MTOK",
     )
+    ai_research_xai_cached_input_price_per_mtok: float | None = Field(
+        0.20,
+        ge=0.0,
+        alias="AI_RESEARCH_XAI_CACHED_INPUT_PRICE_PER_MTOK",
+    )
     ai_research_xai_output_price_per_mtok: float | None = Field(
-        None,
+        2.50,
         ge=0.0,
         alias="AI_RESEARCH_XAI_OUTPUT_PRICE_PER_MTOK",
+    )
+    ai_research_xai_legacy_cached_input_ratio: float = Field(
+        0.06245255,
+        ge=0.0,
+        le=1.0,
+        alias="AI_RESEARCH_XAI_LEGACY_CACHED_INPUT_RATIO",
     )
     ai_research_gemini_input_price_per_mtok: float | None = Field(
         None,
@@ -225,6 +237,50 @@ class Settings(BaseSettings):
         "populate_by_name": True,
         "extra": "forbid",
     }
+
+    @field_validator(
+        "ai_research_input_price_per_mtok",
+        "ai_research_output_price_per_mtok",
+        "ai_research_openai_input_price_per_mtok",
+        "ai_research_openai_output_price_per_mtok",
+        "ai_research_anthropic_input_price_per_mtok",
+        "ai_research_anthropic_output_price_per_mtok",
+        "ai_research_xai_input_price_per_mtok",
+        "ai_research_xai_cached_input_price_per_mtok",
+        "ai_research_xai_output_price_per_mtok",
+        "ai_research_xai_legacy_cached_input_ratio",
+        "ai_research_gemini_input_price_per_mtok",
+        "ai_research_gemini_output_price_per_mtok",
+        mode="before",
+    )
+    @classmethod
+    def tolerate_invalid_cost_estimates(cls, value: object, info: ValidationInfo) -> float | None:
+        """Cost-report estimates must never prevent the trading runtime from starting."""
+        defaults: dict[str, float | None] = {
+            "ai_research_input_price_per_mtok": 5.0,
+            "ai_research_output_price_per_mtok": 25.0,
+            "ai_research_openai_input_price_per_mtok": None,
+            "ai_research_openai_output_price_per_mtok": None,
+            "ai_research_anthropic_input_price_per_mtok": None,
+            "ai_research_anthropic_output_price_per_mtok": None,
+            "ai_research_xai_input_price_per_mtok": 1.25,
+            "ai_research_xai_cached_input_price_per_mtok": 0.20,
+            "ai_research_xai_output_price_per_mtok": 2.50,
+            "ai_research_xai_legacy_cached_input_ratio": 0.06245255,
+            "ai_research_gemini_input_price_per_mtok": None,
+            "ai_research_gemini_output_price_per_mtok": None,
+        }
+        default = defaults[info.field_name]
+        if value is None or value == "":
+            return default
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        upper_bound = 1.0 if info.field_name == "ai_research_xai_legacy_cached_input_ratio" else None
+        if not math.isfinite(parsed) or parsed < 0.0 or (upper_bound is not None and parsed > upper_bound):
+            return default
+        return parsed
 
     @model_validator(mode="after")
     def validate_shutdown_flatten_safety(self) -> "Settings":

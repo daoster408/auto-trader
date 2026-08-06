@@ -1622,10 +1622,10 @@ def _bounded_text(text: str, *, limit: int = 800) -> str:
     return compact[: limit - 3].rstrip() + "..."
 
 
-def _provider_usage_metadata(response: dict[str, Any]) -> dict[str, int]:
+def _provider_usage_metadata(response: dict[str, Any]) -> dict[str, Any]:
     usage = response.get("usage")
     if isinstance(usage, dict):
-        return {
+        normalized: dict[str, Any] = {
             key: int(value)
             for key, value in {
                 "input_tokens": usage.get("input_tokens") or usage.get("prompt_tokens"),
@@ -1634,6 +1634,38 @@ def _provider_usage_metadata(response: dict[str, Any]) -> dict[str, int]:
             }.items()
             if isinstance(value, int) and value >= 0
         }
+        prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+        completion_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details")
+        if isinstance(prompt_details, dict) or isinstance(completion_details, dict):
+            input_tokens = int(normalized.get("input_tokens", 0))
+            output_tokens = int(normalized.get("output_tokens", 0))
+            total_tokens = int(normalized.get("total_tokens", 0))
+            cached_tokens = _safe_int(
+                prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else 0
+            )
+            reasoning_tokens = _safe_int(
+                completion_details.get("reasoning_tokens") if isinstance(completion_details, dict) else 0
+            )
+            degraded = cached_tokens > input_tokens
+            cached_tokens = min(cached_tokens, input_tokens)
+            regular_input_tokens = max(0, input_tokens - cached_tokens)
+            if reasoning_tokens and total_tokens >= input_tokens + output_tokens + reasoning_tokens:
+                completion_tokens = output_tokens
+            elif reasoning_tokens:
+                degraded = degraded or reasoning_tokens > output_tokens
+                completion_tokens = max(0, output_tokens - reasoning_tokens)
+            else:
+                completion_tokens = output_tokens
+            normalized.update(
+                {
+                    "regular_input_tokens": regular_input_tokens,
+                    "cached_input_tokens": cached_tokens,
+                    "completion_tokens": completion_tokens,
+                    "reasoning_tokens": reasoning_tokens,
+                    "usage_detail": "provider_explicit_degraded" if degraded else "provider_explicit",
+                }
+            )
+        return normalized
     usage = response.get("usageMetadata")
     if isinstance(usage, dict):
         return {

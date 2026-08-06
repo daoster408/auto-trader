@@ -24,7 +24,10 @@ from auto_trader.utils.logging import setup_logging
 @dataclass(frozen=True)
 class ProviderPrice:
     input_price_per_mtok: float
+    cached_input_price_per_mtok: float
     output_price_per_mtok: float
+    reasoning_price_per_mtok: float
+    legacy_cached_input_ratio: float
     source: str
 
 
@@ -37,9 +40,18 @@ class ProviderCost:
     input_tokens: int
     output_tokens: int
     total_tokens: int
+    regular_input_tokens: int
+    cached_input_tokens: int
+    completion_tokens: int
+    reasoning_tokens: int
+    detailed_usage_rows: int
+    legacy_estimated_rows: int
+    degraded_usage_rows: int
     estimated_cost: float
     input_price_per_mtok: float
+    cached_input_price_per_mtok: float
     output_price_per_mtok: float
+    reasoning_price_per_mtok: float
     pricing_source: str
 
 
@@ -88,20 +100,32 @@ def _json_dict(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _usage(memo: dict[str, Any]) -> dict[str, int]:
+def _usage(memo: dict[str, Any]) -> dict[str, Any]:
     usage = memo.get("provider_usage")
     if not isinstance(usage, dict):
         return {}
-    parsed: dict[str, int] = {}
-    for key in ("input_tokens", "output_tokens", "total_tokens"):
+    parsed: dict[str, Any] = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "regular_input_tokens",
+        "cached_input_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+    ):
         value = usage.get(key)
         if isinstance(value, int) and value >= 0:
             parsed[key] = value
+    detail = usage.get("usage_detail")
+    if isinstance(detail, str) and detail:
+        parsed["usage_detail"] = detail[:64]
     return parsed
 
 
 def _provider_price(settings: Any, provider: str) -> ProviderPrice:
     input_override = getattr(settings, f"ai_research_{provider}_input_price_per_mtok", None)
+    cached_input_override = getattr(settings, f"ai_research_{provider}_cached_input_price_per_mtok", None)
     output_override = getattr(settings, f"ai_research_{provider}_output_price_per_mtok", None)
     input_price = (
         float(input_override)
@@ -113,18 +137,101 @@ def _provider_price(settings: Any, provider: str) -> ProviderPrice:
         if output_override is not None
         else float(getattr(settings, "ai_research_output_price_per_mtok", 0.0) or 0.0)
     )
-    source = "provider_override" if input_override is not None or output_override is not None else "global_estimate"
+    cached_input_price = float(cached_input_override) if cached_input_override is not None else input_price
+    legacy_cached_input_ratio = float(
+        getattr(settings, f"ai_research_{provider}_legacy_cached_input_ratio", 0.0) or 0.0
+    )
+    legacy_cached_input_ratio = min(1.0, max(0.0, legacy_cached_input_ratio)) if provider == "xai" else 0.0
+    source = (
+        "provider_override"
+        if input_override is not None or cached_input_override is not None or output_override is not None
+        else "global_estimate"
+    )
     return ProviderPrice(
         input_price_per_mtok=input_price,
+        cached_input_price_per_mtok=cached_input_price,
         output_price_per_mtok=output_price,
+        reasoning_price_per_mtok=output_price,
+        legacy_cached_input_ratio=legacy_cached_input_ratio,
         source=source,
     )
 
 
-def _estimate_cost(*, input_tokens: int, output_tokens: int, price: ProviderPrice) -> float:
-    input_cost = (input_tokens / 1_000_000.0) * price.input_price_per_mtok
-    output_cost = (output_tokens / 1_000_000.0) * price.output_price_per_mtok
-    return input_cost + output_cost
+def _usage_buckets(
+    usage: dict[str, Any],
+    *,
+    provider: str,
+    price: ProviderPrice,
+) -> tuple[dict[str, int], str]:
+    input_tokens = int(usage.get("input_tokens", 0))
+    output_tokens = int(usage.get("output_tokens", 0))
+    total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+    explicit = any(
+        key in usage
+        for key in ("regular_input_tokens", "cached_input_tokens", "completion_tokens", "reasoning_tokens")
+    )
+    if explicit:
+        source = str(usage.get("usage_detail") or "provider_explicit")
+        degraded = source.endswith("degraded")
+        supplied_cached = int(usage.get("cached_input_tokens", 0))
+        cached_input = min(input_tokens, supplied_cached)
+        regular_input = input_tokens - cached_input
+        supplied_regular = usage.get("regular_input_tokens")
+        degraded = degraded or supplied_cached > input_tokens
+        degraded = degraded or (
+            supplied_regular is not None and int(supplied_regular) != regular_input
+        )
+        reasoning = int(usage.get("reasoning_tokens", 0))
+        if "completion_tokens" in usage:
+            completion = int(usage["completion_tokens"])
+        elif reasoning and total_tokens >= input_tokens + output_tokens + reasoning:
+            completion = output_tokens
+        else:
+            completion = max(0, output_tokens - reasoning)
+        if total_tokens >= input_tokens:
+            output_budget = total_tokens - input_tokens
+            if completion + reasoning != output_budget:
+                degraded = True
+                reasoning = min(reasoning, output_budget)
+                completion = max(0, output_budget - reasoning)
+        else:
+            degraded = True
+        source = "provider_explicit_degraded" if degraded else "provider_explicit"
+    else:
+        cached_input = (
+            min(input_tokens, round(input_tokens * price.legacy_cached_input_ratio))
+            if provider == "xai" and price.legacy_cached_input_ratio > 0
+            else 0
+        )
+        regular_input = max(0, input_tokens - cached_input)
+        completion = output_tokens
+        reasoning = max(0, total_tokens - input_tokens - output_tokens)
+        source = "legacy_estimated" if provider == "xai" else "legacy_basic"
+    return (
+        {
+            "regular_input_tokens": max(0, regular_input),
+            "cached_input_tokens": max(0, cached_input),
+            "completion_tokens": max(0, completion),
+            "reasoning_tokens": max(0, reasoning),
+        },
+        source,
+    )
+
+
+def _estimate_cost(
+    *,
+    regular_input_tokens: int,
+    cached_input_tokens: int,
+    completion_tokens: int,
+    reasoning_tokens: int,
+    price: ProviderPrice,
+) -> float:
+    return (
+        (regular_input_tokens / 1_000_000.0) * price.input_price_per_mtok
+        + (cached_input_tokens / 1_000_000.0) * price.cached_input_price_per_mtok
+        + (completion_tokens / 1_000_000.0) * price.output_price_per_mtok
+        + (reasoning_tokens / 1_000_000.0) * price.reasoning_price_per_mtok
+    )
 
 
 async def build_ai_cost_report(
@@ -199,11 +306,20 @@ async def build_ai_cost_report(
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "total_tokens": 0,
+                "regular_input_tokens": 0,
+                "cached_input_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "detailed_usage_rows": 0,
+                "legacy_estimated_rows": 0,
+                "degraded_usage_rows": 0,
             },
         )
         bucket["calls"] += 1
         usage = _usage(_json_dict(row["memo_json"]))
         if usage:
+            price = _provider_price(settings, provider)
+            token_buckets, usage_source = _usage_buckets(usage, provider=provider, price=price)
             bucket["usage_known"] += 1
             bucket["input_tokens"] += int(usage.get("input_tokens", 0))
             bucket["output_tokens"] += int(usage.get("output_tokens", 0))
@@ -211,6 +327,14 @@ async def build_ai_cost_report(
                 usage.get("total_tokens")
                 or usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
             )
+            for key, value in token_buckets.items():
+                bucket[key] += value
+            if usage_source == "legacy_estimated":
+                bucket["legacy_estimated_rows"] += 1
+            elif usage_source.startswith("provider_explicit"):
+                bucket["detailed_usage_rows"] += 1
+            if usage_source.endswith("degraded"):
+                bucket["degraded_usage_rows"] += 1
         else:
             bucket["usage_unknown"] += 1
 
@@ -226,13 +350,24 @@ async def build_ai_cost_report(
                 input_tokens=values["input_tokens"],
                 output_tokens=values["output_tokens"],
                 total_tokens=values["total_tokens"],
+                regular_input_tokens=values["regular_input_tokens"],
+                cached_input_tokens=values["cached_input_tokens"],
+                completion_tokens=values["completion_tokens"],
+                reasoning_tokens=values["reasoning_tokens"],
+                detailed_usage_rows=values["detailed_usage_rows"],
+                legacy_estimated_rows=values["legacy_estimated_rows"],
+                degraded_usage_rows=values["degraded_usage_rows"],
                 estimated_cost=_estimate_cost(
-                    input_tokens=values["input_tokens"],
-                    output_tokens=values["output_tokens"],
+                    regular_input_tokens=values["regular_input_tokens"],
+                    cached_input_tokens=values["cached_input_tokens"],
+                    completion_tokens=values["completion_tokens"],
+                    reasoning_tokens=values["reasoning_tokens"],
                     price=price,
                 ),
                 input_price_per_mtok=price.input_price_per_mtok,
+                cached_input_price_per_mtok=price.cached_input_price_per_mtok,
                 output_price_per_mtok=price.output_price_per_mtok,
+                reasoning_price_per_mtok=price.reasoning_price_per_mtok,
                 pricing_source=price.source,
             )
         )
@@ -263,13 +398,23 @@ def render_ai_cost_report(report: AICostReport) -> str:
     lines.append("By provider:")
     for row in report.providers:
         lines.append(
-            f"- {row.provider}: calls={row.calls}, usage_known={row.usage_known}, "
+            f"- {row.provider}: persisted_calls={row.calls}, usage_known={row.usage_known}, "
             f"unknown={row.usage_unknown}, input={row.input_tokens}, output={row.output_tokens}, "
-            f"total={row.total_tokens}, est=${row.estimated_cost:.4f}, "
-            f"prices=${row.input_price_per_mtok:.2f}/${row.output_price_per_mtok:.2f} per MTok "
+            f"total={row.total_tokens}, regular_input={row.regular_input_tokens}, "
+            f"cached_input={row.cached_input_tokens}, completion={row.completion_tokens}, "
+            f"reasoning={row.reasoning_tokens}, est=${row.estimated_cost:.4f}, "
+            f"prices=${row.input_price_per_mtok:.2f}/${row.cached_input_price_per_mtok:.2f}/"
+            f"${row.output_price_per_mtok:.2f}/${row.reasoning_price_per_mtok:.2f} per MTok "
             f"({row.pricing_source})"
         )
+        if row.legacy_estimated_rows:
+            lines.append(
+                f"  legacy_estimated={row.legacy_estimated_rows} row(s); cached/reasoning split is reconstructed"
+            )
+        if row.degraded_usage_rows:
+            lines.append(f"  degraded_usage={row.degraded_usage_rows} row(s); invalid token details were clamped")
     lines.append("Note: dollars are estimated from returned token usage; unknown rows may still have provider-side billing.")
+    lines.append("Persisted research calls are bot decisions, not the provider portal's HTTP request counter.")
     return "\n".join(lines)
 
 

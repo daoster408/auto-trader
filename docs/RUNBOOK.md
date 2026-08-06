@@ -359,6 +359,26 @@ One committee round consumes one chargeable call per selected real provider; wit
 
 The default `AI_RESEARCH_MAX_CALLS_PER_DAY=0` intentionally reports `NOT_READY`, even when a key is present.
 
+### AI Cost Report Calibration
+
+Run the read-only persisted-usage report locally:
+
+```bash
+scripts/ai_cost_report.sh --days 30
+```
+
+Or against Oracle:
+
+```bash
+scripts/oracle_ai_cost_report.sh --days 30
+```
+
+For `grok-latest`, the configured xAI rates verified on 2026-08-06 are `$1.25` per million regular input tokens, `$0.20` per million cached input tokens, and `$2.50` per million completion or reasoning tokens. Future provider responses persist the explicit cached and reasoning token buckets when supplied.
+
+Older xAI memos stored only aggregate prompt, completion, and total tokens. Their cache split is reconstructed with `AI_RESEARCH_XAI_LEGACY_CACHED_INPUT_RATIO=0.06245255`, calibrated against the Jul 8-Aug 6 xAI dashboard snapshot: `$2.20`, 1,555,199 tokens, 1.2M regular prompt tokens, 79.8K cached prompt tokens, 65.9K completion tokens, and 207.8K reasoning tokens. The report labels these rows `legacy_estimated`; this is a historical estimate, not a provider invoice.
+
+The report's `persisted_calls` count is the number of stored bot research decisions. It does not equal xAI's portal request counter because one research decision can make multiple HTTP requests or retries. Invalid cost-only settings fall back to defaults and cannot prevent the trading runtime from starting.
+
 ### Legacy Future Risk Profile Notes (Parked)
 
 Future risk profiles should be explicit, for example `conservative | aggressive | yolo`. `conservative` is the current default. `aggressive` and `yolo` must be introduced behind paper-first controls and audit labels. `yolo` must remain paper-only by default and must never bypass kill switch, HALTED state, broker/account blocks, daily/weekly/drawdown halts, duplicate-position guards, the AI entry gate when enabled, or RiskEngine.
