@@ -104,6 +104,8 @@ class EdgeReport:
     candidate_outcomes: list[CandidateOutcomeEvidence] = field(default_factory=list)
     estimated_ai_cost: float | None = None
     ai_cost_unknown_calls: int = 0
+    ai_cost_unknown_proxy: float | None = None
+    ai_cost_unestimable_calls: int = 0
     ai_cost_unavailable_reason: str | None = None
     execution_mode_filter: str | None = None
     execution_mode_counts: dict[str, int] = field(default_factory=dict)
@@ -790,10 +792,25 @@ async def _attach_ai_cost(report: EdgeReport, *, settings: Any) -> EdgeReport:
         )
     except Exception as exc:
         return replace(report, ai_cost_unavailable_reason=f"cost estimate failed: {type(exc).__name__}")
+    unknown_proxy = 0.0
+    estimated_unknown_calls = 0
+    unestimable_calls = 0
+    for provider in cost.providers:
+        if provider.usage_unknown <= 0:
+            continue
+        if provider.usage_known > 0:
+            unknown_proxy += (
+                provider.estimated_cost / provider.usage_known
+            ) * provider.usage_unknown
+            estimated_unknown_calls += provider.usage_unknown
+        else:
+            unestimable_calls += provider.usage_unknown
     return replace(
         report,
         estimated_ai_cost=None if cost.unavailable_reason else cost.total_estimated_cost,
         ai_cost_unknown_calls=cost.total_usage_unknown,
+        ai_cost_unknown_proxy=unknown_proxy if estimated_unknown_calls else None,
+        ai_cost_unestimable_calls=unestimable_calls,
         ai_cost_unavailable_reason=cost.unavailable_reason,
     )
 
@@ -801,6 +818,12 @@ async def _attach_ai_cost(report: EdgeReport, *, settings: Any) -> EdgeReport:
 def _money(value: float) -> str:
     sign = "-" if value < 0 else ""
     return f"{sign}${abs(value):,.2f}"
+
+
+def _small_money(value: float) -> str:
+    if 0 < abs(value) < 0.01:
+        return "<$0.01" if value > 0 else ">-$0.01"
+    return _money(value)
 
 
 def _pct(value: float) -> str:
@@ -1122,12 +1145,22 @@ def _safe_provider_vote_label(label: str) -> str:
 def _render_candidate_funnel(opportunities: list[OpportunityEvidence]) -> list[str]:
     lines = ["Candidate funnel:"]
     counts = dict(_bucket_counts([opportunity.outcome for opportunity in opportunities]))
-    ordered = ["traded", "ai_approve", "ai_watch", "ai_reject", "prefilter_blocked", "risk_blocked", "candidate_only"]
+    traded = [opportunity for opportunity in opportunities if opportunity.outcome == "traded"]
+    if traded:
+        ai_approved = sum(1 for opportunity in traded if _is_ai_approved(opportunity.ai_verdict))
+        lines.extend(
+            [
+                f"- Traded opportunities (all paths): {len(traded)}",
+                f"- Of traded, valid AI approval recorded: {ai_approved}",
+                f"- Of traded, no valid AI approval recorded: {len(traded) - ai_approved}",
+            ]
+        )
+    ordered = ["ai_approve", "ai_watch", "ai_reject", "prefilter_blocked", "risk_blocked", "candidate_only"]
     for outcome in ordered:
         if outcome in counts:
             lines.append(f"- {_outcome_label(outcome)}: {counts[outcome]}")
     for outcome, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
-        if outcome not in ordered:
+        if outcome not in ordered and outcome != "traded":
             lines.append(f"- {_outcome_label(outcome)}: {count}")
     if len(lines) == 1:
         lines.append("- none")
@@ -1647,6 +1680,12 @@ def build_scoreboard_memory_pack(
                 else round(float(stats["realized_pnl"]) - float(report.estimated_ai_cost), 4)
             ),
             "ai_cost_unknown_calls": int(report.ai_cost_unknown_calls),
+            "ai_cost_unknown_proxy": (
+                None
+                if report.ai_cost_unknown_proxy is None
+                else round(float(report.ai_cost_unknown_proxy), 4)
+            ),
+            "ai_cost_unestimable_calls": int(report.ai_cost_unestimable_calls),
             "expectancy": round(float(stats["expectancy"]), 4),
             "win_rate": round(float(stats["win_rate"]), 2),
             "wins": int(stats["wins"]),
@@ -1806,10 +1845,22 @@ def render_edge_report(report: EdgeReport) -> str:
         ]
     )
     if report.ai_cost_unknown_calls:
-        lines.append(
-            f"- AI cost caveat: {report.ai_cost_unknown_calls} possible billed call(s) had no token usage; "
-            "the estimate may be low."
-        )
+        if report.ai_cost_unknown_proxy is not None:
+            lines.append(
+                f"- AI cost coverage: {report.ai_cost_unknown_calls} billed call(s) lacked token usage; "
+                f"same-provider observed averages suggest about {_small_money(report.ai_cost_unknown_proxy)} "
+                "was omitted from the estimate above."
+            )
+        else:
+            lines.append(
+                f"- AI cost coverage: {report.ai_cost_unknown_calls} billed call(s) lacked token usage; "
+                "no same-provider usage-known call exists in this window, so omitted cost is not estimable."
+            )
+        if report.ai_cost_unestimable_calls:
+            lines.append(
+                f"- AI cost coverage detail: {report.ai_cost_unestimable_calls} of those call(s) "
+                "had no same-provider comparison."
+            )
     if report.ai_cost_unavailable_reason:
         lines.append(f"- AI cost caveat: {report.ai_cost_unavailable_reason}")
     sections = [

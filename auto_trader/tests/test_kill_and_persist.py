@@ -15,6 +15,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
 from zoneinfo import ZoneInfo
 
@@ -35,6 +36,7 @@ from auto_trader.day3_validate import build_day3_validation_report, validation_e
 from auto_trader.edge_report import (
     ClosedTradeEvidence,
     EdgeReport,
+    _attach_ai_cost,
     build_edge_report,
     build_scoreboard_memory_pack,
     render_edge_report,
@@ -8468,6 +8470,9 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
         assert "Realized P/L before AI cost: $4.00" in rendered
         assert "AI edge check:" in rendered
         assert "- AI-approved trades: n=1, P/L $4.00" in rendered
+        assert "- Traded opportunities (all paths): 1" in rendered
+        assert "- Of traded, valid AI approval recorded: 1" in rendered
+        assert "- Of traded, no valid AI approval recorded: 0" in rendered
         assert "sample=thin" in rendered
         assert "Provider vote detail: collapsed until each bucket has at least 3 closed trades." in rendered
         assert "- anthropic:approve:high_conf: n=1, P/L $4.00" not in rendered
@@ -8715,6 +8720,7 @@ def test_edge_report_payoff_shape_explains_negative_dollars_at_even_win_rate():
         opportunities=[],
         estimated_ai_cost=0.75,
         ai_cost_unknown_calls=1,
+        ai_cost_unknown_proxy=0.004,
     )
     rendered = render_edge_report(report)
     memory_pack = build_scoreboard_memory_pack(
@@ -8728,7 +8734,8 @@ def test_edge_report_payoff_shape_explains_negative_dollars_at_even_win_rate():
     assert "- Net after estimated AI cost: -$2.75" in rendered
     assert "- Win rate (secondary): 50.0% (2W/2L)" in rendered
     assert "- Profit factor: 0.50x" in rendered
-    assert "1 possible billed call(s) had no token usage" in rendered
+    assert "1 billed call(s) lacked token usage" in rendered
+    assert "suggest about <$0.01 was omitted" in rendered
     assert "- Gross profit/loss: $2.00 / -$4.00" in rendered
     assert "- Avg win/loss: $1.00 / -$2.00" in rendered
     assert "- Win/loss payoff ratio: 0.50x" in rendered
@@ -8744,6 +8751,33 @@ def test_edge_report_payoff_shape_explains_negative_dollars_at_even_win_rate():
     assert memory_pack["performance"]["net_after_estimated_ai_cost"] == pytest.approx(-2.75)
     assert memory_pack["performance"]["breakeven_win_rate"] == pytest.approx(66.67)
     assert "payoff=0.50x" not in memory_pack["prompt_context"]
+
+
+@pytest.mark.asyncio
+async def test_edge_ai_cost_uses_same_provider_average_for_unknown_usage(monkeypatch):
+    async def fake_cost_report(**kwargs):
+        return SimpleNamespace(
+            unavailable_reason=None,
+            total_estimated_cost=0.75,
+            total_usage_unknown=1,
+            providers=[
+                SimpleNamespace(
+                    usage_known=250,
+                    usage_unknown=1,
+                    estimated_cost=0.75,
+                )
+            ],
+        )
+
+    monkeypatch.setattr("auto_trader.edge_report.build_ai_cost_report", fake_cost_report)
+    report = await _attach_ai_cost(
+        EdgeReport(window_days=14, closed_trades=[], opportunities=[]),
+        settings=object(),
+    )
+
+    assert report.estimated_ai_cost == pytest.approx(0.75)
+    assert report.ai_cost_unknown_proxy == pytest.approx(0.003)
+    assert report.ai_cost_unestimable_calls == 0
 
 
 def test_edge_report_payoff_shape_shows_when_win_rate_clears_breakeven():
