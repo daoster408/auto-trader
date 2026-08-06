@@ -746,26 +746,26 @@ class TelegramBot:
         args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
         if len(args) > 2:
             await update.message.reply_text(
-                f"Use: /edge [days] [paper|live|mixed|unknown], where days is 1-{MAX_EDGE_REPORT_DAYS}."
+                f"Use: /edge [days] [paper|live|mixed|unknown|legacy], where days is 1-{MAX_EDGE_REPORT_DAYS}."
             )
             return
-        mode = next((arg.lower() for arg in args if arg.lower() in {"paper", "live", "mixed", "unknown"}), None)
-        day_args = [arg for arg in args if arg.lower() not in {"paper", "live", "mixed", "unknown"}]
+        mode = next((arg.lower() for arg in args if arg.lower() in {"paper", "live", "mixed", "unknown", "legacy"}), None)
+        day_args = [arg for arg in args if arg.lower() not in {"paper", "live", "mixed", "unknown", "legacy"}]
         if len(day_args) > 1 or (len(args) == 2 and mode is None):
             await update.message.reply_text(
-                f"Use: /edge [days] [paper|live|mixed|unknown], where days is 1-{MAX_EDGE_REPORT_DAYS}."
+                f"Use: /edge [days] [paper|live|mixed|unknown|legacy], where days is 1-{MAX_EDGE_REPORT_DAYS}."
             )
             return
         try:
             days = int(day_args[0]) if day_args else 14
         except ValueError:
             await update.message.reply_text(
-                f"Use: /edge [days] [paper|live|mixed|unknown], where days is 1-{MAX_EDGE_REPORT_DAYS}."
+                f"Use: /edge [days] [paper|live|mixed|unknown|legacy], where days is 1-{MAX_EDGE_REPORT_DAYS}."
             )
             return
         if days < 1 or days > MAX_EDGE_REPORT_DAYS:
             await update.message.reply_text(
-                f"Use: /edge [days] [paper|live|mixed|unknown], where days is 1-{MAX_EDGE_REPORT_DAYS}."
+                f"Use: /edge [days] [paper|live|mixed|unknown|legacy], where days is 1-{MAX_EDGE_REPORT_DAYS}."
             )
             return
         try:

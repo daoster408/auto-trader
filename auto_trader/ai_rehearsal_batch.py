@@ -294,7 +294,11 @@ async def run_ai_rehearsal_batch(
         try:
             research_round = await research_committee_round(active_committee, intent, signal_id=None)
             if paid:
-                await _persist_round(research_round.member_memos, research_round.aggregate_memo)
+                await _persist_round(
+                    research_round.member_memos,
+                    research_round.aggregate_memo,
+                    decision_source="ai_rehearsal_batch",
+                )
             memo = research_round.aggregate_memo
             would_continue = memo.validation_passed and memo.verdict == "approve"
             rows.append(
@@ -326,6 +330,7 @@ async def run_ai_rehearsal_batch(
                     confidence=None,
                     used_only_provided_data=True,
                     validation_passed=False,
+                    decision_source="ai_rehearsal_batch",
                     memo={
                         "source": "ai_rehearsal_batch",
                         "error": str(exc),

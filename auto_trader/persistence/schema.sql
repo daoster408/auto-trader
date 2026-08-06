@@ -14,6 +14,39 @@ CREATE TABLE IF NOT EXISTS system_state (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS runtime_sessions (
+    id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    host_name TEXT NOT NULL,
+    process_id INTEGER NOT NULL,
+    process_role TEXT NOT NULL,
+    execution_mode TEXT NOT NULL CHECK (execution_mode IN ('paper','live','unknown')),
+    config_hash TEXT NOT NULL,
+    config_snapshot_json TEXT NOT NULL,
+    inferred INTEGER NOT NULL DEFAULT 0 CHECK (inferred IN (0,1))
+);
+
+CREATE TABLE IF NOT EXISTS decision_contexts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    context_key TEXT UNIQUE,
+    runtime_session_id TEXT NOT NULL REFERENCES runtime_sessions(id),
+    captured_at TEXT NOT NULL,
+    decision_source TEXT NOT NULL,
+    inferred INTEGER NOT NULL DEFAULT 0 CHECK (inferred IN (0,1)),
+    ai_entry_gate_enabled INTEGER CHECK (ai_entry_gate_enabled IN (0,1)),
+    ai_entry_gate_source TEXT,
+    ai_research_enabled INTEGER CHECK (ai_research_enabled IN (0,1)),
+    simplified_runtime_enabled INTEGER CHECK (simplified_runtime_enabled IN (0,1)),
+    execution_mode TEXT NOT NULL CHECK (execution_mode IN ('paper','live','unknown')),
+    provider TEXT,
+    model_tag TEXT,
+    prompt_version TEXT,
+    risk_profile TEXT,
+    config_hash TEXT NOT NULL,
+    config_snapshot_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS risk_decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -27,7 +60,8 @@ CREATE TABLE IF NOT EXISTS risk_decisions (
     equity_snapshot REAL NOT NULL,
     metrics_json TEXT,  -- serialized risk snapshot
     model_tag TEXT,
-    trace_id TEXT
+    trace_id TEXT,
+    decision_context_id INTEGER REFERENCES decision_contexts(id)
 );
 
 CREATE TABLE IF NOT EXISTS signals (
@@ -38,7 +72,8 @@ CREATE TABLE IF NOT EXISTS signals (
     confidence REAL,
     source TEXT NOT NULL,  -- 'rules' | 'openai/...' etc.
     model_tag TEXT,
-    features_json TEXT
+    features_json TEXT,
+    decision_context_id INTEGER REFERENCES decision_contexts(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_signals_created_julianday
@@ -57,7 +92,8 @@ CREATE TABLE IF NOT EXISTS ai_research_memos (
     confidence REAL,
     used_only_provided_data INTEGER NOT NULL CHECK (used_only_provided_data IN (0,1)),
     validation_passed INTEGER NOT NULL CHECK (validation_passed IN (0,1)),
-    memo_json TEXT NOT NULL
+    memo_json TEXT NOT NULL,
+    decision_context_id INTEGER REFERENCES decision_contexts(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_research_memos_created_julianday
@@ -129,7 +165,8 @@ CREATE TABLE IF NOT EXISTS orders (
     risk_decision_id INTEGER REFERENCES risk_decisions(id),
     rationale TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'unknown'
-        CHECK (execution_mode IN ('paper','live','unknown'))
+        CHECK (execution_mode IN ('paper','live','unknown')),
+    decision_context_id INTEGER REFERENCES decision_contexts(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_filled_exit_time

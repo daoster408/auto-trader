@@ -211,7 +211,11 @@ async def run_ai_entry_gate_rehearsal(
 
     try:
         research_round = await research_committee_round(committee, intent, signal_id=None)
-        memo_ids, provider_results = await _persist_round(research_round.member_memos, research_round.aggregate_memo)
+        memo_ids, provider_results = await _persist_round(
+            research_round.member_memos,
+            research_round.aggregate_memo,
+            decision_source="ai_entry_gate_rehearsal",
+        )
         memo = research_round.aggregate_memo
         memo_id = memo_ids.get((memo.provider, memo.prompt_version))
         used_after = await count_ai_research_chargeable_attempts(provider=budget_provider, today_utc=True)
@@ -254,6 +258,7 @@ async def run_ai_entry_gate_rehearsal(
             confidence=None,
             used_only_provided_data=True,
             validation_passed=False,
+            decision_source="ai_entry_gate_rehearsal",
             memo={
                 "source": "ai_entry_gate_rehearsal",
                 "error": str(exc),
@@ -319,11 +324,13 @@ async def _today_new_entries(settings: Any) -> int:
 async def _persist_round(
     member_memos: list[ResearchMemo],
     aggregate_memo: ResearchMemo,
+    *,
+    decision_source: str,
 ) -> tuple[dict[tuple[str, str], int], list[dict[str, Any]]]:
     memo_ids: dict[tuple[str, str], int] = {}
     provider_memo_ids = []
     for memo in member_memos:
-        memo_id = await _log_memo(memo)
+        memo_id = await _log_memo(memo, decision_source=decision_source)
         memo_ids[(memo.provider, memo.prompt_version)] = memo_id
         provider_memo_ids.append(
             {
@@ -335,7 +342,10 @@ async def _persist_round(
         )
     if aggregate_memo not in member_memos:
         aggregate_memo.memo["provider_memo_ids"] = provider_memo_ids
-        memo_ids[(aggregate_memo.provider, aggregate_memo.prompt_version)] = await _log_memo(aggregate_memo)
+        memo_ids[(aggregate_memo.provider, aggregate_memo.prompt_version)] = await _log_memo(
+            aggregate_memo,
+            decision_source=decision_source,
+        )
     provider_results = [
         {
             "provider": memo.provider,
@@ -349,7 +359,7 @@ async def _persist_round(
     return memo_ids, provider_results
 
 
-async def _log_memo(memo: ResearchMemo) -> int:
+async def _log_memo(memo: ResearchMemo, *, decision_source: str) -> int:
     return await log_ai_research_memo(
         signal_id=None,
         symbol=memo.symbol,
@@ -361,6 +371,7 @@ async def _log_memo(memo: ResearchMemo) -> int:
         confidence=memo.confidence,
         used_only_provided_data=memo.used_only_provided_data,
         validation_passed=memo.validation_passed,
+        decision_source=decision_source,
         memo=memo.memo,
     )
 

@@ -192,6 +192,7 @@ async def run_ai_research_smoke(
                 confidence=memo.confidence,
                 used_only_provided_data=memo.used_only_provided_data,
                 validation_passed=memo.validation_passed,
+                decision_source="ai_research_smoke",
                 memo=memo.memo,
             )
             memo_ids[(memo.provider, memo.prompt_version)] = memo_id
@@ -217,6 +218,7 @@ async def run_ai_research_smoke(
                 confidence=memo.confidence,
                 used_only_provided_data=memo.used_only_provided_data,
                 validation_passed=memo.validation_passed,
+                decision_source="ai_research_smoke",
                 memo=memo.memo,
             )
             memo_ids[(memo.provider, memo.prompt_version)] = memo_id
@@ -268,6 +270,7 @@ async def run_ai_research_smoke(
             confidence=None,
             used_only_provided_data=True,
             validation_passed=False,
+            decision_source="ai_research_smoke",
             memo={
                 "committee": {
                     "symbol": symbol,

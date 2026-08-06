@@ -211,12 +211,15 @@ async def test_schema_upgrade_backfills_existing_valid_single_provider_memos(tmp
     await init_db()
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
+            "INSERT INTO signals (id, symbol, source) VALUES (1, 'OLD', 'rules')"
+        )
+        await db.execute(
             """
             INSERT INTO ai_research_memos (
                 signal_id, symbol, provider, model_tag, prompt_version, input_hash,
                 verdict, confidence, used_only_provided_data, validation_passed, memo_json
             )
-            VALUES (NULL, 'OLD', 'xai', 'grok-latest', 'ai_research_single/v1',
+            VALUES (1, 'OLD', 'xai', 'grok-latest', 'ai_research_single/v1',
                     'old-hash', 'reject', 0.7, 1, 1, ?)
             """,
             (json.dumps(_memo()),),

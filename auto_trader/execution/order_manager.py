@@ -32,6 +32,7 @@ class OrderManager:
         intent: TradeIntent,
         snapshot: Any,  # SystemSnapshot or dict for now
         signal_id: int | None = None,
+        decision_context_id: int | None = None,
     ) -> dict[str, Any]:
         """
         Main entry point for submitting a trade.
@@ -53,6 +54,7 @@ class OrderManager:
             model_tag=decision.model_tag,
             trace_id=decision.trace_id,
             signal_id=signal_id,
+            decision_context_id=decision_context_id,
         )
 
         result: dict[str, Any] = {
@@ -100,6 +102,7 @@ class OrderManager:
                 order_result,
                 risk_decision_id=risk_decision_id,
                 rationale=intent.rationale,
+                decision_context_id=decision_context_id,
             )
             result["persistence"]["order_record_saved"] = persisted
             if not persisted:

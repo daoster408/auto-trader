@@ -10,8 +10,11 @@ Hardens:
 Wires directly to existing persistence/schema.sql .
 """
 import asyncio
+import hashlib
 import json
+import os
 import re
+import socket
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,9 @@ _DB_PATH: Path = Path("auto_trader.db")
 _DB_LOCK = asyncio.Lock()  # single writer guarantee (simple & cheap for v1)
 _OUTCOME_BACKFILL_COMPLETE = False
 _EXECUTION_MODE_BACKFILL_COMPLETE = False
+_LEGACY_CONTEXT_BACKFILL_COMPLETE = False
+LEGACY_RUNTIME_SESSION_ID = "legacy-supervisor-entry"
+LEGACY_DECISION_CONTEXT_KEY = "legacy-supervisor-entry"
 CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = (
     "ai_research_committee/v0",
     "ai_research_committee/v1",
@@ -135,6 +141,7 @@ async def _register_ai_candidate_outcome(
     validation_passed: bool,
     memo: dict[str, Any],
     decision_at: datetime,
+    decision_source: str,
 ) -> None:
     """Register one passive outcome row for a validated single-provider decision."""
     clean_provider = provider.strip().lower()
@@ -145,6 +152,11 @@ async def _register_ai_candidate_outcome(
         or prompt_version not in TRACKED_AI_OUTCOME_PROMPT_VERSIONS
         or clean_provider in TRACKED_AI_OUTCOME_EXCLUDED_PROVIDERS
         or clean_verdict not in TRACKED_AI_OUTCOME_VERDICTS
+        or decision_source not in {
+            "supervisor_entry",
+            "legacy_supervisor_entry",
+            "test_supervisor_entry",
+        }
     ):
         return
     reference_price, price_source = _candidate_reference_price(memo)
@@ -211,9 +223,11 @@ async def _pending_exit_reason_for_order(
 def configure_db_path(path: str | Path) -> None:
     """Called at startup from settings so DB location is configurable."""
     global _DB_PATH, _OUTCOME_BACKFILL_COMPLETE, _EXECUTION_MODE_BACKFILL_COMPLETE
+    global _LEGACY_CONTEXT_BACKFILL_COMPLETE
     _DB_PATH = Path(path).expanduser().resolve()
     _OUTCOME_BACKFILL_COMPLETE = False
     _EXECUTION_MODE_BACKFILL_COMPLETE = False
+    _LEGACY_CONTEXT_BACKFILL_COMPLETE = False
 
 
 def get_configured_db_path() -> Path:
@@ -247,7 +261,15 @@ async def init_db() -> None:
                 "CHECK (execution_mode IN ('paper','live','unknown'))"
             ),
         )
+        for table in ("signals", "ai_research_memos", "risk_decisions", "orders"):
+            await _ensure_column(
+                db,
+                table=table,
+                column="decision_context_id",
+                definition="INTEGER REFERENCES decision_contexts(id)",
+            )
         await _backfill_order_execution_modes(db)
+        await _backfill_legacy_decision_context(db)
         await _backfill_ai_candidate_outcomes(db)
         await db.commit()
     log.info("db_initialized", path=str(_DB_PATH), size_kb=round(_DB_PATH.stat().st_size / 1024, 1) if _DB_PATH.exists() else 0)
@@ -335,6 +357,258 @@ async def _backfill_order_execution_modes(db: aiosqlite.Connection) -> None:
     _EXECUTION_MODE_BACKFILL_COMPLETE = True
 
 
+async def _backfill_legacy_decision_context(db: aiosqlite.Connection) -> None:
+    """Attach pre-provenance rows to one explicitly inferred legacy context."""
+    global _LEGACY_CONTEXT_BACKFILL_COMPLETE
+    if _LEGACY_CONTEXT_BACKFILL_COMPLETE:
+        return
+    snapshot = {
+        "inferred": True,
+        "provenance": "legacy_contextless_rows",
+        "redacted": True,
+    }
+    snapshot_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    config_hash = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+    await db.execute(
+        """
+        INSERT OR IGNORE INTO runtime_sessions (
+            id, started_at, host_name, process_id, process_role, execution_mode,
+            config_hash, config_snapshot_json, inferred
+        )
+        VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?, 1)
+        """,
+        (
+            LEGACY_RUNTIME_SESSION_ID,
+            "1970-01-01T00:00:00Z",
+            "legacy-unknown",
+            0,
+            "legacy_backfill",
+            config_hash,
+            snapshot_json,
+        ),
+    )
+    await db.execute(
+        """
+        INSERT OR IGNORE INTO decision_contexts (
+            context_key, runtime_session_id, captured_at, decision_source, inferred,
+            execution_mode, config_hash, config_snapshot_json
+        )
+        VALUES (?, ?, ?, 'legacy_supervisor_entry', 1, 'unknown', ?, ?)
+        """,
+        (
+            LEGACY_DECISION_CONTEXT_KEY,
+            LEGACY_RUNTIME_SESSION_ID,
+            "1970-01-01T00:00:00Z",
+            config_hash,
+            snapshot_json,
+        ),
+    )
+    context_cur = await db.execute(
+        "SELECT id FROM decision_contexts WHERE context_key = ?",
+        (LEGACY_DECISION_CONTEXT_KEY,),
+    )
+    context_row = await context_cur.fetchone()
+    if context_row is None:
+        raise RuntimeError("legacy decision context could not be created")
+    context_id = int(context_row[0])
+    attached: dict[str, int] = {}
+    for table in ("signals", "ai_research_memos", "risk_decisions", "orders"):
+        where = (
+            "decision_context_id IS NULL AND signal_id IS NOT NULL"
+            if table == "ai_research_memos"
+            else "decision_context_id IS NULL"
+        )
+        update = await db.execute(
+            f"UPDATE {table} SET decision_context_id = ? WHERE {where}",
+            (context_id,),
+        )
+        attached[table] = max(0, int(update.rowcount or 0))
+    log.warning(
+        "legacy_decision_context_backfill_complete",
+        context_id=context_id,
+        **attached,
+    )
+    _LEGACY_CONTEXT_BACKFILL_COMPLETE = True
+
+
+async def _offline_decision_context(
+    db: aiosqlite.Connection,
+    *,
+    decision_source: str,
+    provider: str,
+    model_tag: str,
+    prompt_version: str,
+) -> int:
+    """Create one captured, source-explicit context for a non-trading process."""
+    host_name = socket.gethostname()
+    process_id = os.getpid()
+    session_id = f"offline:{host_name}:{process_id}"
+    snapshot = {
+        "SNAPSHOT_POLICY": "offline_source_only_v1",
+        "configured_values": "<redacted>",
+        "decision_source": decision_source,
+    }
+    snapshot_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    config_hash = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+    await db.execute(
+        """
+        INSERT OR IGNORE INTO runtime_sessions (
+            id, started_at, host_name, process_id, process_role, execution_mode,
+            config_hash, config_snapshot_json, inferred
+        )
+        VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?, 0)
+        """,
+        (
+            session_id,
+            _utc_iso(datetime.now(UTC)),
+            host_name,
+            process_id,
+            decision_source,
+            config_hash,
+            snapshot_json,
+        ),
+    )
+    context_key = ":".join(
+        ("offline", host_name, str(process_id), decision_source, provider, model_tag, prompt_version)
+    )
+    await db.execute(
+        """
+        INSERT OR IGNORE INTO decision_contexts (
+            context_key, runtime_session_id, captured_at, decision_source, inferred,
+            execution_mode, provider, model_tag, prompt_version, config_hash,
+            config_snapshot_json
+        )
+        VALUES (?, ?, ?, ?, 0, 'unknown', ?, ?, ?, ?, ?)
+        """,
+        (
+            context_key,
+            session_id,
+            _utc_iso(datetime.now(UTC)),
+            decision_source,
+            provider,
+            model_tag,
+            prompt_version,
+            config_hash,
+            snapshot_json,
+        ),
+    )
+    cur = await db.execute(
+        "SELECT id FROM decision_contexts WHERE context_key = ?",
+        (context_key,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        raise RuntimeError("offline decision context could not be created")
+    return int(row[0])
+
+
+async def create_runtime_session(
+    *,
+    session_id: str,
+    host_name: str,
+    process_id: int,
+    process_role: str,
+    execution_mode: str,
+    config_hash: str,
+    config_snapshot: dict[str, Any],
+) -> str | None:
+    """Persist one captured process session without secret-bearing config values."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO runtime_sessions (
+                        id, started_at, host_name, process_id, process_role,
+                        execution_mode, config_hash, config_snapshot_json, inferred
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        session_id,
+                        _utc_iso(datetime.now(UTC)),
+                        host_name,
+                        int(process_id),
+                        process_role,
+                        execution_mode,
+                        config_hash,
+                        json.dumps(config_snapshot, sort_keys=True, separators=(",", ":")),
+                    ),
+                )
+                await db.commit()
+                return session_id
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error("runtime_session_create_failed", session_id=session_id, error=str(e))
+            return None
+
+
+async def create_decision_context(
+    *,
+    runtime_session_id: str,
+    decision_source: str,
+    ai_entry_gate_enabled: bool | None,
+    ai_entry_gate_source: str | None,
+    ai_research_enabled: bool | None,
+    simplified_runtime_enabled: bool | None,
+    execution_mode: str,
+    provider: str | None,
+    model_tag: str | None,
+    prompt_version: str | None,
+    risk_profile: str | None,
+    config_hash: str,
+    config_snapshot: dict[str, Any],
+) -> int | None:
+    """Capture immutable effective decision settings at the decision boundary."""
+    async with _DB_LOCK:
+        try:
+            await init_db()
+            db = await _get_conn()
+            try:
+                cur = await db.execute(
+                    """
+                    INSERT INTO decision_contexts (
+                        runtime_session_id, captured_at, decision_source, inferred,
+                        ai_entry_gate_enabled, ai_entry_gate_source, ai_research_enabled,
+                        simplified_runtime_enabled, execution_mode, provider, model_tag,
+                        prompt_version, risk_profile, config_hash, config_snapshot_json
+                    )
+                    VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        runtime_session_id,
+                        _utc_iso(datetime.now(UTC)),
+                        decision_source,
+                        None if ai_entry_gate_enabled is None else int(ai_entry_gate_enabled),
+                        ai_entry_gate_source,
+                        None if ai_research_enabled is None else int(ai_research_enabled),
+                        None if simplified_runtime_enabled is None else int(simplified_runtime_enabled),
+                        execution_mode,
+                        provider,
+                        model_tag,
+                        prompt_version,
+                        risk_profile,
+                        config_hash,
+                        json.dumps(config_snapshot, sort_keys=True, separators=(",", ":")),
+                    ),
+                )
+                await db.commit()
+                return int(cur.lastrowid) if cur.lastrowid is not None else None
+            finally:
+                await db.close()
+        except Exception as e:
+            log.error(
+                "decision_context_create_failed",
+                runtime_session_id=runtime_session_id,
+                decision_source=decision_source,
+                error=str(e),
+            )
+            return None
+
+
 def _db_datetime(value: Any) -> datetime:
     text = str(value or "").strip()
     if not text:
@@ -355,9 +629,11 @@ async def _backfill_ai_candidate_outcomes(db: aiosqlite.Connection) -> None:
     cur = await db.execute(
         f"""
         SELECT m.id, m.created_at, m.signal_id, m.symbol, m.provider, m.model_tag,
-               m.prompt_version, m.verdict, m.confidence, m.validation_passed, m.memo_json
+               m.prompt_version, m.verdict, m.confidence, m.validation_passed,
+               m.memo_json, c.decision_source
         FROM ai_research_memos AS m
         LEFT JOIN ai_candidate_outcomes AS o ON o.memo_id = m.id
+        LEFT JOIN decision_contexts AS c ON c.id = m.decision_context_id
         WHERE o.id IS NULL
           AND m.prompt_version IN ({placeholders})
           AND m.validation_passed = 1
@@ -385,6 +661,7 @@ async def _backfill_ai_candidate_outcomes(db: aiosqlite.Connection) -> None:
             validation_passed=bool(row["validation_passed"]),
             memo=memo if isinstance(memo, dict) else {},
             decision_at=_db_datetime(row["created_at"]),
+            decision_source=str(row["decision_source"] or "unknown"),
         )
     _OUTCOME_BACKFILL_COMPLETE = len(rows) < 5000
 
@@ -489,13 +766,25 @@ async def log_risk_decision(**kwargs: Any) -> int | None:
             await init_db()
             db = await _get_conn()
             try:
+                decision_context_id = kwargs.get("decision_context_id")
+                decision_source = str(
+                    kwargs.get("decision_source") or "test_supervisor_entry"
+                )
+                if decision_context_id is None:
+                    decision_context_id = await _offline_decision_context(
+                        db,
+                        decision_source=decision_source,
+                        provider="risk_engine",
+                        model_tag=str(kwargs.get("model_tag") or "unknown"),
+                        prompt_version="risk_decision",
+                    )
                 cur = await db.execute(
                     """
                     INSERT INTO risk_decisions (
                         signal_id, approved, reason, symbol, side, proposed_qty, sized_qty,
-                        equity_snapshot, metrics_json, model_tag, trace_id
+                        equity_snapshot, metrics_json, model_tag, trace_id, decision_context_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         kwargs.get("signal_id"),
@@ -509,6 +798,7 @@ async def log_risk_decision(**kwargs: Any) -> int | None:
                         json.dumps(kwargs.get("risk_metrics") or {}, sort_keys=True),
                         kwargs.get("model_tag"),
                         kwargs.get("trace_id"),
+                        decision_context_id,
                     ),
                 )
                 await db.commit()
@@ -528,6 +818,8 @@ async def log_signal(
     source: str,
     model_tag: str | None = None,
     features: dict[str, Any] | None = None,
+    decision_context_id: int | None = None,
+    decision_source: str = "test_supervisor_entry",
 ) -> int | None:
     """Persist a pre-risk candidate signal with optional enrichment features."""
     async with _DB_LOCK:
@@ -535,12 +827,21 @@ async def log_signal(
             await init_db()
             db = await _get_conn()
             try:
+                if decision_context_id is None:
+                    decision_context_id = await _offline_decision_context(
+                        db,
+                        decision_source=decision_source,
+                        provider=source,
+                        model_tag=str(model_tag or "unknown"),
+                        prompt_version="signal",
+                    )
                 cur = await db.execute(
                     """
                     INSERT INTO signals (
-                        symbol, thesis, confidence, source, model_tag, features_json
+                        symbol, thesis, confidence, source, model_tag, features_json,
+                        decision_context_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(symbol).upper(),
@@ -549,6 +850,7 @@ async def log_signal(
                         source,
                         model_tag,
                         json.dumps(features or {}, sort_keys=True),
+                        decision_context_id,
                     ),
                 )
                 await db.commit()
@@ -573,6 +875,8 @@ async def log_ai_research_memo(
     used_only_provided_data: bool,
     validation_passed: bool,
     memo: dict[str, Any],
+    decision_context_id: int | None = None,
+    decision_source: str = "test_supervisor_entry",
 ) -> int | None:
     """Persist an AI/shadow committee research memo. Advisory only; never an order gate."""
     decision_at = datetime.now(UTC)
@@ -581,13 +885,22 @@ async def log_ai_research_memo(
             await init_db()
             db = await _get_conn()
             try:
+                if decision_context_id is None:
+                    decision_context_id = await _offline_decision_context(
+                        db,
+                        decision_source=decision_source,
+                        provider=str(provider),
+                        model_tag=str(model_tag),
+                        prompt_version=str(prompt_version),
+                    )
                 cur = await db.execute(
                     """
                     INSERT INTO ai_research_memos (
                         signal_id, symbol, provider, model_tag, prompt_version, input_hash,
-                        verdict, confidence, used_only_provided_data, validation_passed, memo_json
+                        verdict, confidence, used_only_provided_data, validation_passed,
+                        memo_json, decision_context_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         signal_id,
@@ -601,6 +914,7 @@ async def log_ai_research_memo(
                         1 if used_only_provided_data else 0,
                         1 if validation_passed else 0,
                         json.dumps(memo, sort_keys=True),
+                        decision_context_id,
                     ),
                 )
                 memo_id = int(cur.lastrowid) if cur.lastrowid is not None else None
@@ -617,6 +931,7 @@ async def log_ai_research_memo(
                     validation_passed=validation_passed,
                     memo=memo,
                     decision_at=decision_at,
+                    decision_source=decision_source,
                 )
                 await db.commit()
                 log.info(
@@ -625,6 +940,7 @@ async def log_ai_research_memo(
                     provider=provider,
                     verdict=verdict,
                     validation_passed=validation_passed,
+                    decision_source=decision_source,
                 )
                 return memo_id
             finally:
@@ -1051,7 +1367,13 @@ async def update_ai_candidate_outcomes_batch(updates: list[dict[str, Any]]) -> N
             await db.close()
 
 
-async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | None = None, rationale: str | None = None) -> bool:
+async def upsert_order_record(
+    order: dict[str, Any],
+    risk_decision_id: int | None = None,
+    rationale: str | None = None,
+    decision_context_id: int | None = None,
+    decision_source: str = "test_supervisor_entry",
+) -> bool:
     """Persist or refresh an order row from broker/manager normalized data."""
     client_order_id = str(order.get("client_order_id") or order.get("id") or order.get("broker_order_id") or "")
     broker_order_id = str(order.get("broker_order_id") or order.get("id") or client_order_id)
@@ -1068,6 +1390,14 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
             await init_db()
             db = await _get_conn()
             try:
+                if decision_context_id is None:
+                    decision_context_id = await _offline_decision_context(
+                        db,
+                        decision_source=decision_source,
+                        provider="broker",
+                        model_tag="order",
+                        prompt_version="order_persistence",
+                    )
                 existing_cur = await db.execute(
                     "SELECT execution_mode FROM orders WHERE client_order_id = ?",
                     (client_order_id,),
@@ -1104,9 +1434,9 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
                     INSERT INTO orders (
                         client_order_id, broker_order_id, symbol, side, qty, order_type,
                         status, filled_qty, avg_fill_price, submitted_at, filled_at,
-                        risk_decision_id, rationale, execution_mode
+                        risk_decision_id, rationale, execution_mode, decision_context_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(client_order_id) DO UPDATE SET
                         broker_order_id=excluded.broker_order_id,
                         symbol=excluded.symbol,
@@ -1119,6 +1449,10 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
                         submitted_at=COALESCE(excluded.submitted_at, orders.submitted_at),
                         filled_at=COALESCE(excluded.filled_at, orders.filled_at),
                         risk_decision_id=COALESCE(excluded.risk_decision_id, orders.risk_decision_id),
+                        decision_context_id=COALESCE(
+                            excluded.decision_context_id,
+                            orders.decision_context_id
+                        ),
                         execution_mode=CASE
                             WHEN excluded.execution_mode = 'unknown' THEN orders.execution_mode
                             ELSE excluded.execution_mode
@@ -1151,6 +1485,7 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
                         risk_decision_id,
                         resolved_rationale,
                         execution_mode,
+                        decision_context_id,
                     ),
                 )
                 await db.commit()
@@ -1678,7 +2013,7 @@ async def reconcile_broker_orders(orders: list[dict[str, Any]]) -> int:
     """Upsert broker orders into SQLite. Returns number successfully persisted."""
     count = 0
     for order in orders:
-        if await upsert_order_record(order):
+        if await upsert_order_record(order, decision_source="broker_reconciliation"):
             count += 1
     log.info("broker_orders_reconciled", count=count, attempted=len(orders))
     return count

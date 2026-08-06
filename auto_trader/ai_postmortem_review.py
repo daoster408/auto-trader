@@ -1688,6 +1688,7 @@ async def _log_postmortem_memo(memo: PostmortemProviderMemo, packet: dict[str, A
         confidence=None,
         used_only_provided_data=memo.used_only_provided_data,
         validation_passed=memo.validation_passed,
+        decision_source="ai_postmortem",
         memo={
             "source": "ai_postmortem_review",
             "input_packet": packet,

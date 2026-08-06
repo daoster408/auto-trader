@@ -178,6 +178,29 @@ from auto_trader.persistence.db import (
     upsert_order_record,
     update_account_risk_state,
 )
+from auto_trader.persistence.provenance import RuntimeProvenance
+
+
+@pytest.fixture(autouse=True)
+def stub_supervisor_provenance(monkeypatch):
+    async def fake_start(*args, **kwargs):
+        return RuntimeProvenance(
+            session_id="test-session",
+            config_hash="test-config-hash",
+            config_snapshot={"SNAPSHOT_POLICY": "test"},
+        )
+
+    async def fake_capture(*args, **kwargs):
+        return 1
+
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.start_runtime_provenance",
+        fake_start,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.capture_decision_provenance",
+        fake_capture,
+    )
 
 
 @pytest.mark.asyncio
@@ -1112,7 +1135,8 @@ async def test_closed_trade_evidence_uses_preserved_pending_exit_reason(tmp_path
             "submitted_at": (now - timedelta(hours=2)).isoformat(),
             "filled_at": (now - timedelta(hours=2) + timedelta(seconds=1)).isoformat(),
             "rationale": "entry",
-        }
+        },
+        decision_source="supervisor_entry",
     )
     await upsert_pending_exit(
         "FMDE",
@@ -1137,7 +1161,8 @@ async def test_closed_trade_evidence_uses_preserved_pending_exit_reason(tmp_path
             "submitted_at": (now - timedelta(hours=1)).isoformat(),
             "filled_at": (now - timedelta(hours=1) + timedelta(seconds=1)).isoformat(),
             "rationale": "broker_reconciliation",
-        }
+        },
+        decision_source="supervisor_entry",
     )
 
     report = await build_edge_report(window_days=7)
@@ -2266,6 +2291,7 @@ async def test_brain_review_bundle_generates_edge_amplification_guidance():
                     "fundamental": {"market_cap": 500_000_000},
                 },
             },
+            decision_source="supervisor_entry",
         )
         risk_id = await log_risk_decision(
             signal_id=signal_id,
@@ -8328,6 +8354,7 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
                     "macro": {"enabled": True, "series": {"fed_funds_rate": {"value": 4.25}}},
                 },
             },
+            decision_source="supervisor_entry",
         )
         risk_id = await log_risk_decision(
             signal_id=signal_id,
@@ -8341,6 +8368,7 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
             risk_metrics={"risk_profile": "aggressive"},
             model_tag="risk/v1",
             trace_id="edge1234",
+            decision_source="supervisor_entry",
         )
         await log_ai_research_memo(
             signal_id=signal_id,
@@ -8361,6 +8389,7 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
                     {"provider": "xai", "verdict": "watch", "confidence": 0.52, "validation_passed": True},
                 ],
             },
+            decision_source="supervisor_entry",
         )
         now = datetime.now(UTC)
         mixed_day = (now - timedelta(days=10)).replace(hour=14, minute=0, second=0, microsecond=0)
@@ -8379,6 +8408,7 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
             },
             risk_decision_id=risk_id,
             rationale="entry",
+            decision_source="supervisor_entry",
         )
         await upsert_order_record(
             {
@@ -8395,6 +8425,7 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
             },
             risk_decision_id=risk_id,
             rationale="entry",
+            decision_source="supervisor_entry",
         )
         await upsert_order_record(
             {
@@ -8410,6 +8441,7 @@ async def test_edge_report_pairs_filled_entry_exit_and_scores_ai_bucket():
                 "filled_at": (now - timedelta(hours=1) + timedelta(seconds=1)).isoformat(),
             },
             rationale="broker_reconciliation",
+            decision_source="supervisor_entry",
         )
 
         report = await build_edge_report(window_days=7)
@@ -8485,6 +8517,7 @@ async def test_edge_report_classifies_skipped_opportunities():
             source="test",
             model_tag="rules_fallback/v0",
             features={"risk": {"risk_profile": "aggressive"}},
+            decision_source="supervisor_entry",
         )
         await log_ai_research_memo(
             signal_id=watch_signal_id,
@@ -8498,6 +8531,7 @@ async def test_edge_report_classifies_skipped_opportunities():
             used_only_provided_data=True,
             validation_passed=True,
             memo={"rationale": "wait for cleaner setup"},
+            decision_source="supervisor_entry",
         )
 
         approve_signal_id = await log_signal(
@@ -8507,6 +8541,7 @@ async def test_edge_report_classifies_skipped_opportunities():
             source="test",
             model_tag="rules_fallback/v0",
             features={"risk": {"risk_profile": "aggressive"}},
+            decision_source="supervisor_entry",
         )
         await log_ai_research_memo(
             signal_id=approve_signal_id,
@@ -8520,6 +8555,7 @@ async def test_edge_report_classifies_skipped_opportunities():
             used_only_provided_data=True,
             validation_passed=True,
             memo={"rationale": "approved but no order followed"},
+            decision_source="supervisor_entry",
         )
 
         prefilter_signal_id = await log_signal(
@@ -8529,6 +8565,7 @@ async def test_edge_report_classifies_skipped_opportunities():
             source="test",
             model_tag="rules_fallback/v0",
             features={},
+            decision_source="supervisor_entry",
         )
         await log_ai_research_memo(
             signal_id=prefilter_signal_id,
@@ -8542,6 +8579,7 @@ async def test_edge_report_classifies_skipped_opportunities():
             used_only_provided_data=True,
             validation_passed=True,
             memo={"rationale": "duplicate weak idea"},
+            decision_source="supervisor_entry",
         )
 
         risk_signal_id = await log_signal(
@@ -8551,6 +8589,7 @@ async def test_edge_report_classifies_skipped_opportunities():
             source="test",
             model_tag="rules_fallback/v0",
             features={},
+            decision_source="supervisor_entry",
         )
         await log_risk_decision(
             signal_id=risk_signal_id,
@@ -8564,6 +8603,7 @@ async def test_edge_report_classifies_skipped_opportunities():
             risk_metrics={},
             model_tag="risk/v1",
             trace_id="edge5678",
+            decision_source="supervisor_entry",
         )
 
         report = await build_edge_report(window_days=30)
@@ -8733,7 +8773,7 @@ def test_edge_report_payoff_shape_handles_no_losses_yet():
     assert "- Gross profit/loss: $3.00 / $0.00" in rendered
     assert "- Win/loss payoff ratio: no losses yet" in rendered
     assert "- Profit factor: n/a (no mix of profits and losses)" in rendered
-    assert "inf" not in rendered.lower()
+    assert "infinity" not in rendered.lower()
     assert "- Breakeven win rate at this payoff: n/a" in rendered
     assert "- Read: No losing exits yet; payoff shape is not stressed by losses in this window." in rendered
 
@@ -8752,6 +8792,7 @@ async def test_edge_report_treats_malformed_features_as_missing_evidence():
             source="test",
             model_tag="rules_fallback/v0",
             features={"discovery": {"rel_volume": 5.0}},
+            decision_source="supervisor_entry",
         )
         with sqlite3.connect(db_path) as conn:
             conn.execute("UPDATE signals SET features_json = ? WHERE id = ?", ("{bad-json", signal_id))
@@ -8798,7 +8839,7 @@ async def test_entry_order_count_failure_raises():
 async def test_reconcile_broker_orders_counts_only_successful_writes(monkeypatch):
     calls = {"count": 0}
 
-    async def fake_upsert(order):
+    async def fake_upsert(order, **kwargs):
         calls["count"] += 1
         return calls["count"] == 1
 
@@ -9601,7 +9642,7 @@ async def test_telegram_edge_handler_rejects_out_of_range_days(monkeypatch):
     await bot._edge_handler(update, FakeTelegramContext(["91"]))
 
     assert called == {"edge": 0}
-    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown], where days is 1-90."]
+    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown|legacy], where days is 1-90."]
 
 
 @pytest.mark.asyncio
@@ -9627,7 +9668,7 @@ async def test_telegram_edge_handler_rejects_zero_days(monkeypatch):
     await bot._edge_handler(update, FakeTelegramContext(["0"]))
 
     assert called == {"edge": 0}
-    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown], where days is 1-90."]
+    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown|legacy], where days is 1-90."]
 
 
 @pytest.mark.asyncio
@@ -9653,7 +9694,7 @@ async def test_telegram_edge_handler_rejects_multiple_args(monkeypatch):
     await bot._edge_handler(update, FakeTelegramContext(["14", "extra"]))
 
     assert called == {"edge": 0}
-    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown], where days is 1-90."]
+    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown|legacy], where days is 1-90."]
 
 
 @pytest.mark.asyncio
@@ -9679,7 +9720,7 @@ async def test_telegram_edge_handler_rejects_invalid_days(monkeypatch):
     await bot._edge_handler(update, FakeTelegramContext(["abc"]))
 
     assert called == {"edge": 0}
-    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown], where days is 1-90."]
+    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown|legacy], where days is 1-90."]
 
 
 @pytest.mark.asyncio
@@ -13366,7 +13407,7 @@ async def test_supervisor_auto_entry_uses_order_manager(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls.append((intent, snapshot))
             return {
                 "intent": {"symbol": intent.symbol, "side": intent.side},
@@ -13450,7 +13491,7 @@ async def test_supervisor_reentry_cooldown_skips_before_signal_persistence_and_o
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             calls["orders"] += 1
             return {}
 
@@ -13625,7 +13666,7 @@ async def test_supervisor_auto_entry_logs_shadow_ai_research(monkeypatch):
         def __init__(self):
             self.intents = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.intents.append(intent)
             return {"order": {"id": "entry-1"}, "risk_decision": {"approved": True}}
 
@@ -13704,7 +13745,7 @@ async def test_simplified_gate_disabled_bypasses_shadow_research(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             return {"order": {"id": "entry-bypassed-ai"}, "risk_decision": {"approved": True}}
 
     async def fake_bool(key, *, default):
@@ -13764,7 +13805,7 @@ async def test_supervisor_skips_paid_ai_research_when_gate_disabled(monkeypatch)
         def __init__(self):
             self.calls = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls.append((intent, snapshot, signal_id))
             return {"order": {"id": "entry-no-paid-ai"}, "risk_decision": {"approved": True}}
 
@@ -13835,7 +13876,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_paid_memo(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when cached AI memo is watch")
 
     class ExplodingPaidCommittee:
@@ -13933,7 +13974,7 @@ async def test_ai_entry_gate_reuses_same_symbol_daily_multi_provider_memo(monkey
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when cached multi-provider AI memo is watch")
 
     class ExplodingPaidMember:
@@ -14038,7 +14079,7 @@ async def test_ai_entry_gate_cached_watch_tries_next_ranked_candidate(monkeypatc
         def __init__(self):
             self.calls = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls.append((intent, snapshot, signal_id))
             return {"order": {"id": "entry-approved-next", "symbol": intent.symbol}, "risk_decision": {"approved": True}}
 
@@ -14066,7 +14107,7 @@ async def test_ai_entry_gate_cached_watch_tries_next_ranked_candidate(monkeypatc
     async def no_cached_lookup(**kwargs):
         return None
 
-    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative", decision_context_id=None):
         researched.append((intent.symbol, signal_id))
         if intent.symbol == "TNA":
             return AIResearchRunResult(
@@ -14139,7 +14180,7 @@ async def test_ai_entry_gate_triages_viable_slate_before_paid_ai(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls.append((intent.symbol, signal_id))
             return {"order": {"id": "entry-best-slate", "symbol": intent.symbol}, "risk_decision": {"approved": True}}
 
@@ -14199,7 +14240,7 @@ async def test_ai_entry_gate_triages_viable_slate_before_paid_ai(monkeypatch):
     async def no_cached_lookup(**kwargs):
         return None
 
-    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative", decision_context_id=None):
         researched.append((intent.symbol, signal_id))
         return AIResearchRunResult(
             symbol=intent.symbol,
@@ -14256,7 +14297,7 @@ async def test_ai_entry_gate_prefilter_blocks_first_slate_candidate_without_paid
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             return {"order": {"id": "entry-after-prefilter-skip", "symbol": intent.symbol}, "risk_decision": {"approved": True}}
 
     class FakeCommittee:
@@ -14315,7 +14356,7 @@ async def test_ai_entry_gate_prefilter_blocks_first_slate_candidate_without_paid
     async def fake_persist_prefilter(self, intent, **kwargs):
         persisted_prefilters.append((intent.symbol, kwargs["prefilter"].reasons))
 
-    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative", decision_context_id=None):
         researched.append((intent.symbol, signal_id))
         return AIResearchRunResult(
             symbol=intent.symbol,
@@ -14392,7 +14433,7 @@ async def test_ai_entry_gate_capacity_reject_skips_to_next_viable_candidate(monk
         def __init__(self):
             self.calls = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls.append((intent.symbol, signal_id))
             return {"order": {"id": "entry-after-capacity-skip", "symbol": intent.symbol}, "risk_decision": {"approved": True}}
 
@@ -14433,7 +14474,7 @@ async def test_ai_entry_gate_capacity_reject_skips_to_next_viable_candidate(monk
         assert kwargs["symbol"] == "BEST"
         return 701
 
-    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative", decision_context_id=None):
         researched.append((intent.symbol, signal_id))
         return AIResearchRunResult(
             symbol=intent.symbol,
@@ -14490,7 +14531,7 @@ async def test_ai_entry_gate_systemic_failure_does_not_try_next_candidate(monkey
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when AI failure is systemic")
 
     class FakeCommittee:
@@ -14516,7 +14557,7 @@ async def test_ai_entry_gate_systemic_failure_does_not_try_next_candidate(monkey
     async def no_cached_lookup(**kwargs):
         return None
 
-    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative"):
+    async def fake_run_ai(self, intent, *, signal_id=None, risk_profile="conservative", decision_context_id=None):
         researched.append(intent.symbol)
         return AIResearchRunResult(
             symbol=intent.symbol,
@@ -14581,7 +14622,7 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_aggregate_cache_versio
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             return {"order": {"id": "entry-after-current-committee", "symbol": intent.symbol}}
 
     class ApprovingPaidMember:
@@ -14683,6 +14724,69 @@ async def test_ai_entry_gate_ignores_stale_multi_provider_aggregate_cache_versio
 
 
 @pytest.mark.asyncio
+async def test_ai_cache_reuse_is_attributed_to_current_signal_and_context(monkeypatch):
+    class FakeAdapter:
+        paper = True
+
+    class FakeCommittee:
+        provider = "xai"
+        model_tag = "xai/grok-latest"
+
+    captured = {}
+
+    async def fake_cached(**kwargs):
+        return {
+            "id": 4551,
+            "signal_id": 4880,
+            "verdict": "approve",
+            "confidence": 0.78,
+            "validation_passed": True,
+        }
+
+    async def fake_log_memo(**kwargs):
+        captured.update(kwargs)
+        return 4552
+
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.real_research_providers",
+        lambda committee: ["xai"],
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol",
+        fake_cached,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.log_ai_research_memo",
+        fake_log_memo,
+    )
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=object(),
+    )
+    supervisor.research_committee = FakeCommittee()
+
+    result = await supervisor._run_ai_research(
+        TradeIntent(symbol="NVDL", side="long", entry_price=50.0, confidence=0.8),
+        signal_id=4882,
+        decision_context_id=77,
+    )
+
+    assert result.approved_for_entry is True
+    assert result.called_provider is False
+    assert result.memo_id == 4552
+    assert captured["signal_id"] == 4882
+    assert captured["decision_context_id"] == 77
+    assert captured["decision_source"] == "supervisor_entry"
+    assert captured["prompt_version"] == "ai_research_cache_reuse/v0"
+    assert captured["memo"]["cache_reuse"] == {
+        "source_memo_id": 4551,
+        "source_signal_id": 4880,
+    }
+
+
+@pytest.mark.asyncio
 async def test_ai_entry_gate_cache_lookup_failure_blocks_without_paid_call(monkeypatch):
     class GateSettings(DummySupervisorSettings):
         auto_entry_enabled = True
@@ -14702,7 +14806,7 @@ async def test_ai_entry_gate_cache_lookup_failure_blocks_without_paid_call(monke
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when AI cache lookup fails")
 
     class ExplodingPaidCommittee:
@@ -14782,7 +14886,7 @@ async def test_ai_paid_prefilter_blocks_low_volume_before_paid_provider(monkeypa
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when paid AI prefilter blocks")
 
     class ExplodingPaidCommittee:
@@ -14893,7 +14997,7 @@ async def test_ai_entry_gate_cached_prefilter_watch_skips_signal_and_journal(mon
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called for cached prefilter watch")
 
     class ExplodingPaidMember:
@@ -15034,7 +15138,7 @@ async def test_ai_paid_prefilter_allows_strong_candidate_to_paid_provider(monkey
         def __init__(self):
             self.calls = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls.append((intent, snapshot, signal_id))
             return {"order": {"id": "entry-prefilter-pass"}, "risk_decision": {"approved": True}}
 
@@ -15141,7 +15245,7 @@ async def test_ai_entry_gate_approve_continues_to_order_manager(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls.append((intent, snapshot, signal_id))
             return {"order": {"id": "entry-approved"}, "risk_decision": {"approved": True}}
 
@@ -15244,7 +15348,7 @@ async def test_entry_capacity_precheck_skips_paid_ai_when_risk_would_reject(monk
     class FakeOrderManager:
         risk = PreviewRejectRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not submit when capacity preview rejects")
 
     class ExplodingCommittee:
@@ -15310,7 +15414,7 @@ async def test_entry_capacity_preview_unavailable_blocks_before_paid_ai(monkeypa
             return []
 
     class FakeOrderManager:
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not submit when capacity preview is unavailable")
 
     class ExplodingCommittee:
@@ -15383,7 +15487,7 @@ async def test_entry_inactive_account_status_blocks_before_paid_ai(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not submit when account is inactive")
 
     class ExplodingCommittee:
@@ -15451,7 +15555,7 @@ async def test_ai_entry_gate_submission_error_does_not_write_buy_journal(monkeyp
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             return {
                 "order": {"error": "broker unavailable"},
                 "risk_decision": {"approved": False, "reason": "order submission failed"},
@@ -15546,7 +15650,7 @@ async def test_ai_entry_gate_reject_blocks_before_order_manager(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls.append((intent, snapshot, signal_id))
             raise AssertionError("OrderManager should not be called when AI gate rejects")
 
@@ -15632,7 +15736,7 @@ async def test_ai_entry_gate_runtime_config_enables_gate(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when runtime AI gate rejects")
 
     class RejectingCommittee:
@@ -15719,7 +15823,7 @@ async def test_ai_entry_gate_budget_exhausted_fails_closed(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when AI budget is exhausted")
 
     class ExplodingCommittee:
@@ -15857,7 +15961,7 @@ async def test_ai_entry_gate_requires_real_provider(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when gate has only shadow research")
 
     journal_entries = []
@@ -15931,7 +16035,7 @@ async def test_simplified_ai_entry_gate_blocks_configured_provider_setup_failure
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager must not run after provider setup failure")
 
     journal_entries = []
@@ -16000,7 +16104,7 @@ async def test_ai_entry_gate_invalid_output_fails_closed(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when AI output is invalid")
 
     class InvalidCommittee:
@@ -16084,7 +16188,7 @@ async def test_ai_entry_gate_provider_failure_fails_closed(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when AI provider fails")
 
     class FailingCommittee:
@@ -16170,7 +16274,7 @@ async def test_ai_entry_gate_research_disabled_fails_closed(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when AI research is disabled")
 
     journal_entries = []
@@ -16232,7 +16336,7 @@ async def test_ai_entry_gate_budget_count_failure_fails_closed(monkeypatch):
     class FakeOrderManager:
         risk = ApprovingPreviewRisk()
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             raise AssertionError("OrderManager should not be called when AI budget count fails")
 
     class ExplodingCommittee:
@@ -16333,7 +16437,7 @@ async def test_supervisor_auto_entry_uses_runtime_entry_cap(monkeypatch):
         def __init__(self):
             self.snapshots = []
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.snapshots.append(snapshot)
             return {"order": {"id": "entry-runtime-cap"}, "risk_decision": {"approved": True}}
 
@@ -16501,7 +16605,7 @@ async def test_supervisor_blocks_auto_entry_when_broker_has_open_entry_order(mon
         def __init__(self):
             self.calls = 0
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls += 1
             return {"order": {"id": "entry-1"}}
 
@@ -16586,7 +16690,7 @@ async def test_supervisor_account_risk_halt_flattens_and_blocks_entry(monkeypatc
         def __init__(self):
             self.calls = 0
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls += 1
             return {"order": {"id": "entry-1"}}
 
@@ -16679,7 +16783,7 @@ async def test_supervisor_blocks_auto_entry_when_positions_unavailable(monkeypat
         def __init__(self):
             self.calls = 0
 
-        async def submit_trade_intent(self, intent, snapshot, signal_id=None):
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
             self.calls += 1
             return {"order": {"id": "entry-1"}}
 

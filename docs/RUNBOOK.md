@@ -501,3 +501,26 @@ Use `/edge paper` or `/edge live` to isolate P/L. A proven entry supplies
 the trade mode when its paired historical exit is unknown. If a report
 window contains both proven paper and proven live trades, the unfiltered
 scorecard is withheld and the report must be rerun with a mode filter.
+
+## Decision Provenance
+
+Each supervisor process creates a captured `runtime_session`. Every entry
+decision then creates an immutable `decision_context` recording the effective
+AI gate value and whether it came from an environment setting or runtime
+override, AI research and simplified-runtime state, paper/live mode, risk
+profile, provider/model/prompt identifiers, host/process session identity, and
+a hash of a secret-safe configuration snapshot. Signals, AI memos, risk
+decisions, and orders reference that context.
+
+Configuration snapshots use an explicit non-secret allowlist. All other
+configured values are stored as `<redacted>`, and the hash is computed from
+that redacted snapshot. API keys, broker secrets, Telegram credentials, and
+resume tokens must never be persisted in provenance rows.
+
+Pre-provenance trading rows are attached once to a synthetic
+`legacy_supervisor_entry` context with `inferred=1`. They remain visible in the
+default report for historical continuity and can be isolated with
+`/edge legacy`, but they are labeled `legacy inferred` and never count as
+captured or proven provenance. Smoke tests, rehearsals, postmortems, broker
+reconciliation, and other offline sources are tagged explicitly and excluded
+from Edge trading-decision counts.

@@ -62,6 +62,11 @@ from auto_trader.persistence.db import (
     upsert_pending_exit,
     upsert_order_record,
 )
+from auto_trader.persistence.provenance import (
+    RuntimeProvenance,
+    capture_decision_provenance,
+    start_runtime_provenance,
+)
 from auto_trader.utils.logging import get_logger
 
 NotifyFn = Callable[[str], Awaitable[None]]
@@ -73,6 +78,15 @@ AI_ENTRY_GATE_CANDIDATE_BLOCK_VERDICTS = {"watch", "reject"}
 AI_HIGH_EXPOSURE_UNANIMOUS_REASON = "projected gross exposure exceeds unanimous AI threshold"
 STAGNATION_SNAPSHOT_MAX_AGE_MINUTES = 20
 OUTCOME_RESOLUTION_INTERVAL_SECONDS = 3600
+
+
+def _parse_runtime_bool(key: str, value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    raise ValueError(f"invalid boolean runtime config for {key}: {value}")
 
 
 async def _runtime_risk_profile(settings: Any, *, paper: bool) -> str:
@@ -172,6 +186,7 @@ class AIResearchRunResult:
     reason: str
     memo: ResearchMemo | None = None
     called_provider: bool = False
+    memo_id: int | None = None
 
     @property
     def approved_for_entry(self) -> bool:
@@ -726,6 +741,7 @@ class TradingSupervisor:
         self._position_high_values: dict[str, float] = {}
         self._pending_exit_symbols: set[str] = set()
         self._last_risk_sweep_dates: set[str] = set()
+        self._runtime_provenance: RuntimeProvenance | None = None
         self.finnhub_client = FinnhubClient(getattr(settings, "finnhub_api_key", None))
         self.fred_client = (
             None
@@ -749,6 +765,93 @@ class TradingSupervisor:
                 include_edge_memory=not simplified_runtime,
                 prompt_version=SIMPLIFIED_PROMPT_VERSION if simplified_runtime else PROMPT_VERSION,
             )
+
+    async def _ensure_runtime_provenance(self) -> RuntimeProvenance | None:
+        if self._runtime_provenance is not None:
+            return self._runtime_provenance
+        mode = "paper" if bool(getattr(self.adapter, "paper", False)) else "live"
+        self._runtime_provenance = await start_runtime_provenance(
+            self.settings,
+            process_role="trading_supervisor",
+            execution_mode=mode,
+        )
+        return self._runtime_provenance
+
+    async def _capture_entry_context(
+        self,
+        *,
+        ai_gate_enabled: bool,
+        ai_gate_source: str,
+        ai_research_enabled: bool,
+        simplified_runtime: bool,
+        risk_profile: str,
+        effective_config: dict[str, Any] | None = None,
+    ) -> int | None:
+        session = await self._ensure_runtime_provenance()
+        if session is None:
+            return None
+        real_providers = real_research_providers(self.research_committee)
+        provider = (
+            real_providers[0]
+            if len(real_providers) == 1
+            else str(getattr(self.research_committee, "provider", "shadow"))
+        )
+        model_tag = str(getattr(self.research_committee, "model_tag", provider))
+        prompt_version = (
+            _single_provider_prompt_version(self.research_committee)
+            if len(real_providers) == 1
+            else AGGREGATE_PROMPT_VERSION
+        )
+        return await capture_decision_provenance(
+            session,
+            self.settings,
+            decision_source="supervisor_entry",
+            ai_entry_gate_enabled=ai_gate_enabled,
+            ai_entry_gate_source=ai_gate_source,
+            ai_research_enabled=ai_research_enabled,
+            simplified_runtime_enabled=simplified_runtime,
+            execution_mode=("paper" if bool(getattr(self.adapter, "paper", False)) else "live"),
+            provider=provider,
+            model_tag=model_tag,
+            prompt_version=prompt_version,
+            risk_profile=risk_profile,
+            effective_config=effective_config,
+        )
+
+    async def _capture_exit_context(self) -> int | None:
+        session = await self._ensure_runtime_provenance()
+        if session is None:
+            return None
+        try:
+            override = await get_runtime_config_value("ai_entry_gate_enabled")
+            gate_source = "runtime_override" if override is not None else "env"
+            gate_enabled = await get_runtime_config_bool(
+                "ai_entry_gate_enabled",
+                default=bool(getattr(self.settings, "ai_entry_gate_enabled", False)),
+            )
+        except Exception as e:
+            log.warning("exit_decision_context_gate_lookup_failed", error=str(e))
+            gate_source = "env_fallback"
+            gate_enabled = bool(getattr(self.settings, "ai_entry_gate_enabled", False))
+        return await capture_decision_provenance(
+            session,
+            self.settings,
+            decision_source="supervisor_exit",
+            ai_entry_gate_enabled=gate_enabled,
+            ai_entry_gate_source=gate_source,
+            ai_research_enabled=bool(getattr(self.settings, "ai_research_enabled", True)),
+            simplified_runtime_enabled=bool(
+                getattr(self.settings, "simplified_runtime_enabled", False)
+            ),
+            execution_mode=("paper" if bool(getattr(self.adapter, "paper", False)) else "live"),
+            provider=None,
+            model_tag=None,
+            prompt_version=None,
+            risk_profile=await _runtime_risk_profile(
+                self.settings,
+                paper=bool(getattr(self.adapter, "paper", False)),
+            ),
+        )
 
     def _alert_local_date(self) -> str:
         timezone = ZoneInfo(getattr(self.settings, "report_timezone", "America/Los_Angeles"))
@@ -1194,8 +1297,19 @@ class TradingSupervisor:
                 return None
 
             self._pending_exit_symbols.add(decision.symbol)
+            decision_context_id = await self._capture_exit_context()
+            if decision_context_id is None:
+                log.error(
+                    "exit_decision_context_persistence_failed",
+                    symbol=decision.symbol,
+                    reason=decision.reason,
+                )
             order = await self.adapter.close_position(decision.symbol, reason=decision.reason)
-            order_persisted = await upsert_order_record(order, rationale=decision.reason)
+            order_persisted = await upsert_order_record(
+                order,
+                rationale=decision.reason,
+                decision_context_id=decision_context_id,
+            )
             pending_persisted = await upsert_pending_exit(decision.symbol, order, reason=decision.reason)
             if not order_persisted or not pending_persisted:
                 await self._notify_once(
@@ -1249,6 +1363,14 @@ class TradingSupervisor:
         max_new_positions_per_day: int,
         risk_profile: str = "conservative",
     ) -> dict[str, Any] | None:
+        try:
+            auto_entry_override = await get_runtime_config_value("auto_entry_enabled")
+        except Exception as e:
+            log.warning("auto_entry_source_lookup_failed", error=str(e))
+            auto_entry_override = None
+            auto_entry_source = "env_fallback"
+        else:
+            auto_entry_source = "runtime_override" if auto_entry_override is not None else "env"
         auto_entry_enabled = await get_runtime_config_bool(
             "auto_entry_enabled",
             default=bool(self.settings.auto_entry_enabled),
@@ -1301,11 +1423,49 @@ class TradingSupervisor:
             cutoff = datetime.now(UTC) - timedelta(minutes=cooldown_minutes)
             recent_exit_symbols = await get_recent_filled_exit_symbols(cutoff.isoformat())
         ai_research_enabled = bool(getattr(self.settings, "ai_research_enabled", True))
+        try:
+            ai_gate_override = await get_runtime_config_value("ai_entry_gate_enabled")
+        except Exception as e:
+            log.warning("ai_entry_gate_source_lookup_failed", error=str(e))
+            ai_gate_override = None
+        ai_gate_source = "runtime_override" if ai_gate_override is not None else "env"
         ai_gate_enabled = await get_runtime_config_bool(
             "ai_entry_gate_enabled",
             default=bool(getattr(self.settings, "ai_entry_gate_enabled", False)),
         )
         simplified_runtime = bool(getattr(self.settings, "simplified_runtime_enabled", False))
+        try:
+            risk_profile_override = await get_runtime_config_value("risk_profile")
+        except Exception as e:
+            log.warning("risk_profile_source_lookup_failed", error=str(e))
+            risk_profile_override = None
+            risk_profile_source = "env_fallback"
+        else:
+            risk_profile_source = (
+                "runtime_override" if risk_profile_override is not None else "env"
+            )
+        try:
+            max_entries_override = await get_runtime_config_value("max_new_positions_per_day")
+        except Exception as e:
+            log.warning("max_entries_source_lookup_failed", error=str(e))
+            max_entries_override = None
+            max_entries_source = "env_fallback"
+        else:
+            max_entries_source = (
+                "runtime_override" if max_entries_override is not None else "env"
+            )
+        configured_exposure = float(getattr(self.settings, "max_gross_exposure_pct", 25.0))
+        paper_mode = bool(getattr(self.adapter, "paper", False))
+        effective_exposure = configured_exposure if paper_mode else min(configured_exposure, 25.0)
+        provenance_effective = {
+            "auto_entry_enabled": auto_entry_enabled,
+            "auto_entry_source": auto_entry_source,
+            "risk_profile_source": risk_profile_source,
+            "max_new_positions_per_day": max_new_positions_per_day,
+            "max_new_positions_source": max_entries_source,
+            "max_gross_exposure_pct": effective_exposure,
+            "max_gross_exposure_source": "env" if paper_mode else "env_with_live_cap",
+        }
         last_blocked_result: dict[str, Any] | None = None
         real_providers = real_research_providers(self.research_committee)
         evaluations: list[EntryCandidateEvaluation] = []
@@ -1414,6 +1574,22 @@ class TradingSupervisor:
             if ai_gate_enabled and ai_research_enabled and real_providers:
                 prefilter = evaluate_paid_ai_prefilter(intent, settings=self.settings, risk_profile=risk_profile)
                 if prefilter.blocked:
+                    decision_context_id = await self._capture_entry_context(
+                        ai_gate_enabled=ai_gate_enabled,
+                        ai_gate_source=ai_gate_source,
+                        ai_research_enabled=ai_research_enabled,
+                        simplified_runtime=simplified_runtime,
+                        risk_profile=risk_profile,
+                        effective_config=provenance_effective,
+                    )
+                    if decision_context_id is None:
+                        return {
+                            "blocked": True,
+                            "reason": (
+                                f"Entry blocked for {intent.symbol.upper()}: "
+                                "decision context persistence failed"
+                            ),
+                        }
                     signal_id = await log_signal(
                         symbol=intent.symbol,
                         thesis=intent.rationale,
@@ -1421,6 +1597,7 @@ class TradingSupervisor:
                         source="rules_fallback",
                         model_tag="rules_fallback/v0",
                         features=intent.features,
+                        decision_context_id=decision_context_id,
                     )
                     packet = build_research_packet(
                         intent,
@@ -1434,6 +1611,7 @@ class TradingSupervisor:
                         digest=packet_hash(packet),
                         prefilter=prefilter,
                         real_providers=real_providers,
+                        decision_context_id=decision_context_id,
                     )
                     await append_journal_entry(
                         content=(
@@ -1491,6 +1669,22 @@ class TradingSupervisor:
         for evaluation in evaluations:
             intent = evaluation.intent
             snapshot = evaluation.snapshot
+            decision_context_id = await self._capture_entry_context(
+                ai_gate_enabled=ai_gate_enabled,
+                ai_gate_source=ai_gate_source,
+                ai_research_enabled=ai_research_enabled,
+                simplified_runtime=simplified_runtime,
+                risk_profile=risk_profile,
+                effective_config=provenance_effective,
+            )
+            if decision_context_id is None:
+                return {
+                    "blocked": True,
+                    "reason": (
+                        f"Entry blocked for {intent.symbol.upper()}: "
+                        "decision context persistence failed"
+                    ),
+                }
             signal_id = await log_signal(
                 symbol=intent.symbol,
                 thesis=intent.rationale,
@@ -1498,6 +1692,7 @@ class TradingSupervisor:
                 source="rules_fallback",
                 model_tag="rules_fallback/v0",
                 features=intent.features,
+                decision_context_id=decision_context_id,
             )
             ai_result: AIResearchRunResult | None = None
             paid_research_allowed = ai_gate_enabled or not real_providers
@@ -1520,7 +1715,12 @@ class TradingSupervisor:
                         symbol=intent.symbol.upper(),
                     )
             elif ai_research_enabled and paid_research_allowed:
-                ai_result = await self._run_ai_research(intent, signal_id=signal_id, risk_profile=risk_profile)
+                ai_result = await self._run_ai_research(
+                    intent,
+                    signal_id=signal_id,
+                    risk_profile=risk_profile,
+                    decision_context_id=decision_context_id,
+                )
             elif ai_research_enabled and real_providers:
                 log.info(
                     "paid_ai_research_skipped_gate_disabled",
@@ -1569,7 +1769,12 @@ class TradingSupervisor:
                         )
                         continue
                     return last_blocked_result
-            result = await self.order_manager.submit_trade_intent(intent, snapshot, signal_id=signal_id)
+            result = await self.order_manager.submit_trade_intent(
+                intent,
+                snapshot,
+                signal_id=signal_id,
+                decision_context_id=decision_context_id,
+            )
             if _has_submitted_entry_order(result):
                 try:
                     await append_journal_entry(
@@ -1692,6 +1897,7 @@ class TradingSupervisor:
         digest: str,
         prefilter: Any,
         real_providers: list[str],
+        decision_context_id: int | None = None,
     ) -> None:
         prefilter_already_logged = False
         try:
@@ -1719,6 +1925,8 @@ class TradingSupervisor:
                 confidence=None,
                 used_only_provided_data=True,
                 validation_passed=True,
+                decision_context_id=decision_context_id,
+                decision_source="supervisor_entry",
                 memo={
                     "input_packet": packet,
                     "committee": {
@@ -1752,6 +1960,7 @@ class TradingSupervisor:
         *,
         signal_id: int | None,
         risk_profile: str = "conservative",
+        decision_context_id: int | None = None,
     ) -> AIResearchRunResult:
         provider = str(getattr(self.research_committee, "provider", "shadow"))
         packet = build_research_packet(
@@ -1800,12 +2009,33 @@ class TradingSupervisor:
                     verdict=cached_verdict,
                     memo_id=cached.get("id"),
                 )
+                cache_memo_id = await log_ai_research_memo(
+                    signal_id=signal_id,
+                    symbol=intent.symbol,
+                    provider=cache_provider,
+                    model_tag=model_tag,
+                    prompt_version="ai_research_cache_reuse/v0",
+                    input_hash=digest,
+                    verdict=cached_verdict,
+                    confidence=cached.get("confidence"),
+                    used_only_provided_data=True,
+                    validation_passed=bool(cached.get("validation_passed")),
+                    decision_context_id=decision_context_id,
+                    decision_source="supervisor_entry",
+                    memo={
+                        "cache_reuse": {
+                            "source_memo_id": cached.get("id"),
+                            "source_signal_id": cached.get("signal_id"),
+                        }
+                    },
+                )
                 return AIResearchRunResult(
                     symbol=intent.symbol.upper(),
                     verdict=cached_verdict,
                     validation_passed=bool(cached.get("validation_passed")),
                     reason=f"ai_research_cached_{cached_verdict}",
                     called_provider=False,
+                    memo_id=cache_memo_id,
                 )
             prefilter = evaluate_paid_ai_prefilter(intent, settings=self.settings, risk_profile=risk_profile)
             if prefilter.blocked:
@@ -1816,6 +2046,7 @@ class TradingSupervisor:
                     digest=digest,
                     prefilter=prefilter,
                     real_providers=real_providers,
+                    decision_context_id=decision_context_id,
                 )
                 log.info(
                     "ai_paid_prefilter_blocked",
@@ -1895,6 +2126,8 @@ class TradingSupervisor:
                         confidence=None,
                         used_only_provided_data=True,
                         validation_passed=False,
+                        decision_context_id=decision_context_id,
+                        decision_source="supervisor_entry",
                         memo={
                             "input_packet": packet,
                             "committee": {
@@ -1945,6 +2178,8 @@ class TradingSupervisor:
                     confidence=memo.confidence,
                     used_only_provided_data=memo.used_only_provided_data,
                     validation_passed=memo.validation_passed,
+                    decision_context_id=decision_context_id,
+                    decision_source="supervisor_entry",
                     memo=memo.memo,
                 )
                 member_memo_ids.append(
@@ -1969,6 +2204,8 @@ class TradingSupervisor:
                     confidence=memo.confidence,
                     used_only_provided_data=memo.used_only_provided_data,
                     validation_passed=memo.validation_passed,
+                    decision_context_id=decision_context_id,
+                    decision_source="supervisor_entry",
                     memo=memo.memo,
                 )
                 return AIResearchRunResult(
@@ -2002,6 +2239,8 @@ class TradingSupervisor:
                 confidence=None,
                 used_only_provided_data=True,
                 validation_passed=False,
+                decision_context_id=decision_context_id,
+                decision_source="supervisor_entry",
                 memo={
                     "input_packet": packet,
                     "committee": {

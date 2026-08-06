@@ -240,6 +240,7 @@ async def build_ai_cost_report(
     days: int = 1,
     start_utc: datetime | None = None,
     end_utc: datetime | None = None,
+    decision_sources: tuple[str, ...] | None = None,
 ) -> AICostReport:
     timezone_name = str(getattr(settings, "report_timezone", "America/Los_Angeles") or "America/Los_Angeles")
     if start_utc is None or end_utc is None:
@@ -265,18 +266,25 @@ async def build_ai_cost_report(
         _sqlite_dt(start_utc),
         _sqlite_dt(end_utc),
     ]
+    source_clause = ""
+    if decision_sources:
+        source_placeholders = ",".join("?" for _ in decision_sources)
+        source_clause = f" AND c.decision_source IN ({source_placeholders})"
+        params.extend(decision_sources)
     db = await aiosqlite.connect(get_configured_db_path())
     db.row_factory = aiosqlite.Row
     try:
         cur = await db.execute(
             f"""
-            SELECT provider, memo_json
-            FROM ai_research_memos
-            WHERE provider NOT IN (?, ?)
-              AND prompt_version IN ({placeholders})
-              AND created_at >= ?
-              AND created_at < ?
-            ORDER BY id ASC
+            SELECT m.provider, m.memo_json
+            FROM ai_research_memos AS m
+            LEFT JOIN decision_contexts AS c ON c.id = m.decision_context_id
+            WHERE m.provider NOT IN (?, ?)
+              AND m.prompt_version IN ({placeholders})
+              AND m.created_at >= ?
+              AND m.created_at < ?
+              {source_clause}
+            ORDER BY m.id ASC
             """,
             tuple(params),
         )

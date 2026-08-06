@@ -35,7 +35,11 @@ MISSING_TAG_PREFIXES = (
 SAFE_PROVIDER_NAMES = {"anthropic", "deepseek", "gemini", "multi", "openai", "prefilter", "shadow", "unknown", "xai"}
 SAFE_VERDICTS = {"approve", "reject", "unknown", "watch"}
 SAFE_PROVIDER_ANNOTATIONS = {"high_conf", "invalid", "low_conf", "med_conf"}
-EXECUTION_MODE_FILTERS = {"paper", "live", "mixed", "unknown"}
+EXECUTION_MODE_FILTERS = {"paper", "live", "mixed", "unknown", "legacy"}
+TRADING_DECISION_SOURCES = {
+    "supervisor_entry",
+    "legacy_supervisor_entry",
+}
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,8 @@ class ClosedTradeEvidence:
     signal_id: int | None
     execution_mode: str = "unknown"
     execution_mode_inherited: bool = False
+    decision_source: str = "unknown"
+    context_inferred: bool = False
     setup_tags: tuple[str, ...] = ()
     provider_votes: tuple[str, ...] = ()
 
@@ -67,6 +73,8 @@ class OpportunityEvidence:
     risk_profile: str
     signal_id: int
     created_at: datetime | None
+    decision_source: str = "unknown"
+    context_inferred: bool = False
     setup_tags: tuple[str, ...] = ()
     provider_votes: tuple[str, ...] = ()
 
@@ -82,6 +90,8 @@ class CandidateOutcomeEvidence:
     comparison_notional: float
     price_source: str
     status: str
+    decision_source: str = "unknown"
+    context_inferred: bool = False
     horizon_returns: dict[int, float] = field(default_factory=dict)
     horizon_pnl: dict[int, float] = field(default_factory=dict)
 
@@ -98,6 +108,7 @@ class EdgeReport:
     execution_mode_filter: str | None = None
     execution_mode_counts: dict[str, int] = field(default_factory=dict)
     scorecard_withheld: bool = False
+    provenance_counts: dict[str, int] = field(default_factory=dict)
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -374,20 +385,26 @@ async def _fetch_rows(
         db.row_factory = aiosqlite.Row
         orders_cur = await db.execute(
             """
-            SELECT client_order_id, broker_order_id, symbol, side, qty, order_type, status,
-                   filled_qty, avg_fill_price, submitted_at, filled_at, risk_decision_id,
-                   rationale, execution_mode
-            FROM orders
-            WHERE lower(status) = 'filled'
-            ORDER BY COALESCE(filled_at, submitted_at, ''), rowid
+            SELECT o.client_order_id, o.broker_order_id, o.symbol, o.side, o.qty,
+                   o.order_type, o.status, o.filled_qty, o.avg_fill_price,
+                   o.submitted_at, o.filled_at, o.risk_decision_id, o.rationale,
+                   o.execution_mode, o.decision_context_id,
+                   c.decision_source, c.inferred AS context_inferred
+            FROM orders AS o
+            LEFT JOIN decision_contexts AS c ON c.id = o.decision_context_id
+            WHERE lower(o.status) = 'filled'
+            ORDER BY COALESCE(o.filled_at, o.submitted_at, ''), o.rowid
             """
         )
         risks_cur = await db.execute(
             """
-            SELECT id, created_at, signal_id, approved, reason, symbol, side, proposed_qty, sized_qty,
-                   equity_snapshot, metrics_json, model_tag, trace_id
-            FROM risk_decisions
-            ORDER BY created_at, id
+            SELECT r.id, r.created_at, r.signal_id, r.approved, r.reason, r.symbol,
+                   r.side, r.proposed_qty, r.sized_qty, r.equity_snapshot,
+                   r.metrics_json, r.model_tag, r.trace_id, r.decision_context_id,
+                   c.decision_source, c.inferred AS context_inferred
+            FROM risk_decisions AS r
+            LEFT JOIN decision_contexts AS c ON c.id = r.decision_context_id
+            ORDER BY r.created_at, r.id
             """
         )
         orders = [dict(row) for row in await orders_cur.fetchall()]
@@ -408,18 +425,21 @@ async def _fetch_rows(
         signal_where_clause = ""
         signal_params: list[Any] = []
         if cutoff is not None:
-            signal_where_clause = "WHERE julianday(created_at) >= julianday(?)"
+            signal_where_clause = "WHERE julianday(s.created_at) >= julianday(?)"
             signal_params.append(cutoff)
         if cutoff is not None and referenced_signal_ids:
             placeholders = ", ".join("?" for _ in referenced_signal_ids)
-            signal_where_clause += f" OR id IN ({placeholders})"
+            signal_where_clause += f" OR s.id IN ({placeholders})"
             signal_params.extend(referenced_signal_ids)
         signals_cur = await db.execute(
             f"""
-            SELECT id, created_at, symbol, thesis, confidence, source, model_tag, features_json
-            FROM signals
+            SELECT s.id, s.created_at, s.symbol, s.thesis, s.confidence, s.source,
+                   s.model_tag, s.features_json, s.decision_context_id,
+                   c.decision_source, c.inferred AS context_inferred
+            FROM signals AS s
+            LEFT JOIN decision_contexts AS c ON c.id = s.decision_context_id
             {signal_where_clause}
-            ORDER BY created_at, id
+            ORDER BY s.created_at, s.id
             """,
             tuple(signal_params),
         )
@@ -427,37 +447,46 @@ async def _fetch_rows(
         memo_where_clause = ""
         memo_params: list[Any] = []
         if cutoff is not None:
-            memo_where_clause = "WHERE julianday(created_at) >= julianday(?)"
+            memo_where_clause = "WHERE julianday(m.created_at) >= julianday(?)"
             memo_params.append(cutoff)
         if cutoff is not None and referenced_signal_ids:
             placeholders = ", ".join("?" for _ in referenced_signal_ids)
-            memo_where_clause += f" OR signal_id IN ({placeholders})"
+            memo_where_clause += f" OR m.signal_id IN ({placeholders})"
             memo_params.extend(referenced_signal_ids)
         memos_cur = await db.execute(
             f"""
-            SELECT id, created_at, signal_id, symbol, provider, model_tag, prompt_version, input_hash,
-                   verdict, confidence, used_only_provided_data, validation_passed, memo_json
-            FROM ai_research_memos
+            SELECT m.id, m.created_at, m.signal_id, m.symbol, m.provider,
+                   m.model_tag, m.prompt_version, m.input_hash, m.verdict,
+                   m.confidence, m.used_only_provided_data, m.validation_passed,
+                   m.memo_json, m.decision_context_id, c.decision_source,
+                   c.inferred AS context_inferred
+            FROM ai_research_memos AS m
+            LEFT JOIN decision_contexts AS c ON c.id = m.decision_context_id
             {memo_where_clause}
-            ORDER BY created_at, id
+            ORDER BY m.created_at, m.id
             """,
             tuple(memo_params),
         )
-        outcomes_where_clause = "WHERE julianday(decision_at) >= julianday(?)" if cutoff is not None else ""
+        outcomes_where_clause = "WHERE julianday(o.decision_at) >= julianday(?)" if cutoff is not None else ""
         outcomes_params = (cutoff,) if cutoff is not None else ()
         outcomes_cur = await db.execute(
             f"""
-            SELECT id, created_at, updated_at, resolved_at, memo_id, signal_id,
-                   symbol, provider, model_tag, policy_tag, decision_at,
-                   decision_session_date, verdict, confidence, reference_price,
-                   price_source, comparison_notional, status, last_error,
-                   d0_session_date, d0_close, d0_return_pct, d0_hypothetical_pnl,
-                   d1_session_date, d1_close, d1_return_pct, d1_hypothetical_pnl,
-                   d3_session_date, d3_close, d3_return_pct, d3_hypothetical_pnl,
-                   d5_session_date, d5_close, d5_return_pct, d5_hypothetical_pnl
-            FROM ai_candidate_outcomes
+            SELECT o.id, o.created_at, o.updated_at, o.resolved_at, o.memo_id,
+                   o.signal_id, o.symbol, o.provider, o.model_tag, o.policy_tag,
+                   o.decision_at, o.decision_session_date, o.verdict, o.confidence,
+                   o.reference_price, o.price_source, o.comparison_notional,
+                   o.status, o.last_error, o.d0_session_date, o.d0_close,
+                   o.d0_return_pct, o.d0_hypothetical_pnl, o.d1_session_date,
+                   o.d1_close, o.d1_return_pct, o.d1_hypothetical_pnl,
+                   o.d3_session_date, o.d3_close, o.d3_return_pct,
+                   o.d3_hypothetical_pnl, o.d5_session_date, o.d5_close,
+                   o.d5_return_pct, o.d5_hypothetical_pnl,
+                   c.decision_source, c.inferred AS context_inferred
+            FROM ai_candidate_outcomes AS o
+            JOIN ai_research_memos AS m ON m.id = o.memo_id
+            LEFT JOIN decision_contexts AS c ON c.id = m.decision_context_id
             {outcomes_where_clause}
-            ORDER BY decision_at, id
+            ORDER BY o.decision_at, o.id
             """,
             outcomes_params,
         )
@@ -555,6 +584,8 @@ def _build_closed_trades(rows: dict[str, list[dict[str, Any]]], *, since: dateti
                 signal_id=signal_id,
                 execution_mode=execution_mode,
                 execution_mode_inherited=execution_mode_inherited,
+                decision_source=str(entry.get("decision_source") or "unknown"),
+                context_inferred=bool(entry.get("context_inferred")),
                 setup_tags=_setup_tags(signal, memo, risk_profile),
                 provider_votes=_provider_votes_for_signal(memos, signal_id),
             )
@@ -617,6 +648,8 @@ def _build_opportunities(rows: dict[str, list[dict[str, Any]]], *, since: dateti
                 risk_profile=risk_profile,
                 signal_id=signal_id,
                 created_at=_parse_dt(signal.get("created_at")),
+                decision_source=str(signal.get("decision_source") or "unknown"),
+                context_inferred=bool(signal.get("context_inferred")),
                 setup_tags=_setup_tags(signal, _latest_ai_memo(rows["ai_memos"], signal_id=signal_id), risk_profile),
                 provider_votes=_provider_votes_for_signal(rows["ai_memos"], signal_id),
             )
@@ -654,6 +687,8 @@ def _build_candidate_outcomes(
                 comparison_notional=_float(row.get("comparison_notional"), 30.0),
                 price_source=str(row.get("price_source") or "model_packet.price_unavailable"),
                 status=str(row.get("status") or "pending"),
+                decision_source=str(row.get("decision_source") or "unknown"),
+                context_inferred=bool(row.get("context_inferred")),
                 horizon_returns=horizon_returns,
                 horizon_pnl=horizon_pnl,
             )
@@ -674,24 +709,68 @@ async def build_edge_report(
     since = datetime.now(UTC) - timedelta(days=max(1, int(window_days)))
     rows = await _fetch_rows(db_path or get_configured_db_path(), since=since)
     all_trades = _build_closed_trades(rows, since=since)
-    mode_counts = dict(_bucket_counts([trade.execution_mode for trade in all_trades]))
+    all_opportunities = _build_opportunities(rows, since=since)
+    all_outcomes = _build_candidate_outcomes(rows, since=since)
+    trading_trades = [
+        trade for trade in all_trades if trade.decision_source in TRADING_DECISION_SOURCES
+    ]
+    trading_opportunities = [
+        row for row in all_opportunities if row.decision_source in TRADING_DECISION_SOURCES
+    ]
+    trading_outcomes = [
+        row for row in all_outcomes if row.decision_source in TRADING_DECISION_SOURCES
+    ]
+    legacy_only = mode_filter == "legacy"
+    if legacy_only:
+        selected_trades = [
+            trade for trade in trading_trades if trade.decision_source == "legacy_supervisor_entry"
+        ]
+        opportunities = [
+            row for row in trading_opportunities if row.decision_source == "legacy_supervisor_entry"
+        ]
+        outcomes = [
+            row for row in trading_outcomes if row.decision_source == "legacy_supervisor_entry"
+        ]
+    else:
+        selected_trades = trading_trades
+        opportunities = trading_opportunities
+        outcomes = trading_outcomes
+    mode_counts = dict(_bucket_counts([trade.execution_mode for trade in selected_trades]))
     actual_mixed = (
         mode_counts.get("mixed", 0) > 0
         or (mode_counts.get("paper", 0) > 0 and mode_counts.get("live", 0) > 0)
     )
-    scorecard_withheld = actual_mixed and mode_filter in {None, "mixed"}
+    scorecard_withheld = actual_mixed and mode_filter in {None, "mixed", "legacy"}
     if mode_filter in {"paper", "live", "unknown"}:
-        trades = [trade for trade in all_trades if trade.execution_mode == mode_filter]
+        trades = [trade for trade in selected_trades if trade.execution_mode == mode_filter]
     else:
-        trades = all_trades
+        trades = selected_trades
+    provenance_counts = {
+        "captured_trades": sum(
+            1 for trade in trading_trades if trade.decision_source == "supervisor_entry"
+        ),
+        "legacy_trades": sum(
+            1 for trade in trading_trades if trade.decision_source == "legacy_supervisor_entry"
+        ),
+        "captured_decisions": sum(
+            1 for row in trading_outcomes if row.decision_source == "supervisor_entry"
+        ),
+        "legacy_decisions": sum(
+            1 for row in trading_outcomes if row.decision_source == "legacy_supervisor_entry"
+        ),
+        "offline_decisions_excluded": sum(
+            1 for row in all_outcomes if row.decision_source not in TRADING_DECISION_SOURCES
+        ),
+    }
     return EdgeReport(
         window_days=window_days,
         closed_trades=trades,
-        opportunities=_build_opportunities(rows, since=since),
-        candidate_outcomes=_build_candidate_outcomes(rows, since=since),
+        opportunities=opportunities,
+        candidate_outcomes=outcomes,
         execution_mode_filter=mode_filter,
         execution_mode_counts=mode_counts,
         scorecard_withheld=scorecard_withheld,
+        provenance_counts=provenance_counts,
     )
 
 
@@ -703,6 +782,11 @@ async def _attach_ai_cost(report: EdgeReport, *, settings: Any) -> EdgeReport:
             settings=settings,
             start_utc=start_utc,
             end_utc=end_utc,
+            decision_sources=(
+                ("legacy_supervisor_entry",)
+                if report.execution_mode_filter == "legacy"
+                else ("supervisor_entry", "legacy_supervisor_entry")
+            ),
         )
     except Exception as exc:
         return replace(report, ai_cost_unavailable_reason=f"cost estimate failed: {type(exc).__name__}")
@@ -1630,12 +1714,32 @@ def _execution_mode_header(report: EdgeReport) -> list[str]:
             f"unknown={counts['unknown']}, conflicting={counts['mixed']}"
         ),
     ]
+    if report.execution_mode_filter == "legacy":
+        lines.append("Provenance filter: LEGACY INFERRED RECORDS ONLY")
     inherited = sum(1 for trade in report.closed_trades if trade.execution_mode_inherited)
     if inherited:
         lines.append(
             f"Mode note: {inherited} trade(s) inherit mode from a proven entry because the paired exit is unknown."
         )
     return lines
+
+
+def _provenance_header(report: EdgeReport) -> list[str]:
+    counts = report.provenance_counts
+    return [
+        (
+            "Trade provenance: "
+            f"captured={int(counts.get('captured_trades', 0))}, "
+            f"legacy inferred={int(counts.get('legacy_trades', 0))}"
+        ),
+        (
+            "AI decision provenance: "
+            f"captured={int(counts.get('captured_decisions', 0))}, "
+            f"legacy inferred={int(counts.get('legacy_decisions', 0))}, "
+            f"offline excluded={int(counts.get('offline_decisions_excluded', 0))}"
+        ),
+        "Legacy note: inferred rows are included for continuity but never counted as proven provenance.",
+    ]
 
 
 def render_edge_report(report: EdgeReport) -> str:
@@ -1651,6 +1755,7 @@ def render_edge_report(report: EdgeReport) -> str:
         f"Window: last {report.window_days} days",
     ]
     lines.extend(_execution_mode_header(report))
+    lines.extend(_provenance_header(report))
     if report.scorecard_withheld:
         lines.extend(
             [
