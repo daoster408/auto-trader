@@ -744,20 +744,33 @@ class TelegramBot:
         if not await self._require_authorized(update, "/edge"):
             return
         args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
-        if len(args) > 1:
-            await update.message.reply_text(f"Use: /edge [days], where days is 1-{MAX_EDGE_REPORT_DAYS}.")
+        if len(args) > 2:
+            await update.message.reply_text(
+                f"Use: /edge [days] [paper|live|mixed|unknown], where days is 1-{MAX_EDGE_REPORT_DAYS}."
+            )
+            return
+        mode = next((arg.lower() for arg in args if arg.lower() in {"paper", "live", "mixed", "unknown"}), None)
+        day_args = [arg for arg in args if arg.lower() not in {"paper", "live", "mixed", "unknown"}]
+        if len(day_args) > 1 or (len(args) == 2 and mode is None):
+            await update.message.reply_text(
+                f"Use: /edge [days] [paper|live|mixed|unknown], where days is 1-{MAX_EDGE_REPORT_DAYS}."
+            )
             return
         try:
-            days = int(args[0]) if args else 14
+            days = int(day_args[0]) if day_args else 14
         except ValueError:
-            await update.message.reply_text(f"Use: /edge [days], where days is 1-{MAX_EDGE_REPORT_DAYS}.")
+            await update.message.reply_text(
+                f"Use: /edge [days] [paper|live|mixed|unknown], where days is 1-{MAX_EDGE_REPORT_DAYS}."
+            )
             return
         if days < 1 or days > MAX_EDGE_REPORT_DAYS:
-            await update.message.reply_text(f"Use: /edge [days], where days is 1-{MAX_EDGE_REPORT_DAYS}.")
+            await update.message.reply_text(
+                f"Use: /edge [days] [paper|live|mixed|unknown], where days is 1-{MAX_EDGE_REPORT_DAYS}."
+            )
             return
         try:
             report = await asyncio.wait_for(
-                run_edge_report(window_days=days),
+                run_edge_report(window_days=days, execution_mode=mode),
                 timeout=EDGE_REPORT_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -786,7 +799,7 @@ class TelegramBot:
         if len(report) > 3900:
             report = report[:3850].rstrip() + "\n...truncated; use /edge with fewer days."
         await update.message.reply_text(report)
-        log.info("edge_report_requested", days=days)
+        log.info("edge_report_requested", days=days, execution_mode=mode)
 
     async def _ai_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_authorized(update, "/ai"):

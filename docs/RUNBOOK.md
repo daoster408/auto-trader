@@ -491,3 +491,13 @@ scripts/ai_rehearsal_batch.sh --limit 5 --paid
 ```
 
 Paid mode can consume real provider budget. Keep it off for broad Sunday batches unless the goal is specifically to test provider behavior.
+## Edge Execution-Mode Safety
+
+Every persisted order records `paper`, `live`, or `unknown`. Historical
+backfill uses only explicit `(PAPER, ...)` or `(LIVE, ...)` entry-journal
+evidence; unknown rows are never inferred from the current environment.
+
+Use `/edge paper` or `/edge live` to isolate P/L. A proven entry supplies
+the trade mode when its paired historical exit is unknown. If a report
+window contains both proven paper and proven live trades, the unfiltered
+scorecard is withheld and the report must be rerun with a mode filter.

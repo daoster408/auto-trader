@@ -11,6 +11,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -140,6 +141,7 @@ from auto_trader.scheduler.trading_supervisor import (
     _position_stagnation_features,
 )
 from auto_trader.persistence.db import (
+    ExecutionModeConflictError,
     append_journal_entry,
     backfill_exit_reasons_from_journal,
     consume_planned_maintenance_shutdown,
@@ -176,6 +178,99 @@ from auto_trader.persistence.db import (
     upsert_order_record,
     update_account_risk_state,
 )
+
+
+@pytest.mark.asyncio
+async def test_order_execution_mode_persists_and_rejects_known_conflict():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_db_path(Path(tmp) / "execution_mode.db")
+        await init_db()
+        order = {
+            "id": "mode-order",
+            "symbol": "MODE",
+            "side": "buy",
+            "qty": 1,
+            "status": "filled",
+            "paper": True,
+        }
+        assert await upsert_order_record(order)
+        rows = await get_latest_order_records()
+        assert rows[0]["execution_mode"] == "paper"
+
+        assert await upsert_order_record({**order, "paper": None})
+        rows = await get_latest_order_records()
+        assert rows[0]["execution_mode"] == "paper"
+
+        with pytest.raises(ExecutionModeConflictError, match="execution mode conflict"):
+            await upsert_order_record({**order, "paper": False})
+
+
+@pytest.mark.asyncio
+async def test_execution_mode_backfill_uses_only_explicit_entry_journal_evidence():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "execution_mode_backfill.db"
+        configure_db_path(db_path)
+        await init_db()
+        risk_id = await log_risk_decision(
+            approved=True,
+            reason="Passed",
+            symbol="MODE",
+            side="long",
+            proposed_qty=1,
+            sized_qty=1,
+            equity_snapshot=400,
+            risk_metrics={},
+            model_tag="rules/v0",
+            trace_id="mode-backfill",
+        )
+        await upsert_order_record(
+            {"id": "entry-mode", "symbol": "MODE", "side": "buy", "qty": 1, "status": "filled"},
+            risk_decision_id=risk_id,
+        )
+        await upsert_order_record(
+            {"id": "exit-mode", "symbol": "MODE", "side": "sell", "qty": 1, "status": "filled"}
+        )
+        await append_journal_entry(
+            content=(
+                "BUY: MODE (PAPER, aggressive)\n"
+                "Order: qty 1.000000, status filled.\n"
+                f"RiskEngine: Passed; decision {risk_id}; trace mode-backfill."
+            )
+        )
+
+        configure_db_path(db_path)
+        await init_db()
+        with sqlite3.connect(db_path) as connection:
+            modes = dict(connection.execute("SELECT client_order_id, execution_mode FROM orders"))
+        assert modes == {"entry-mode": "paper", "exit-mode": "unknown"}
+
+
+def test_edge_trade_mode_inherits_proven_entry_and_withholds_actual_blend():
+    paper = _closed_trade("PAPER", 1.0)
+    paper = replace(paper, execution_mode="paper", execution_mode_inherited=True)
+    live = replace(_closed_trade("LIVE", 2.0), execution_mode="live")
+    paper_only = EdgeReport(
+        window_days=14,
+        closed_trades=[paper],
+        opportunities=[],
+        execution_mode_counts={"paper": 1},
+    )
+    mixed = EdgeReport(
+        window_days=14,
+        closed_trades=[paper, live],
+        opportunities=[],
+        execution_mode_counts={"paper": 1, "live": 1},
+        scorecard_withheld=True,
+    )
+
+    paper_rendered = render_edge_report(paper_only)
+    mixed_rendered = render_edge_report(mixed)
+    assert "Execution mode: PAPER" in paper_rendered
+    assert "inherit mode from a proven entry" in paper_rendered
+    assert "Realized P/L before AI cost: $1.00" in paper_rendered
+    assert "!!! MIXED PAPER/LIVE EVIDENCE !!!" in mixed_rendered
+    assert "Dollar scorecard: WITHHELD" in mixed_rendered
+    assert "Realized P/L" not in mixed_rendered
 
 
 class DummySettings:
@@ -9382,7 +9477,7 @@ async def test_telegram_edge_handler_returns_default_scoreboard(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {}
 
-    async def fake_edge_report(*, window_days):
+    async def fake_edge_report(*, window_days, execution_mode=None):
         called["window_days"] = window_days
         return "EDGE REPORT\nClosed trades: 9\nRealized P/L: -$0.04"
 
@@ -9408,7 +9503,7 @@ async def test_telegram_edge_handler_accepts_custom_days(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {}
 
-    async def fake_edge_report(*, window_days):
+    async def fake_edge_report(*, window_days, execution_mode=None):
         called["window_days"] = window_days
         return f"EDGE REPORT\nWindow: last {window_days} days"
 
@@ -9430,10 +9525,37 @@ async def test_telegram_edge_handler_accepts_custom_days(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_telegram_edge_handler_accepts_mode_with_or_without_days(monkeypatch):
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    called = []
+
+    async def fake_edge_report(*, window_days, execution_mode=None):
+        called.append((window_days, execution_mode))
+        return "EDGE REPORT"
+
+    monkeypatch.setattr("auto_trader.comms.telegram_bot.run_edge_report", fake_edge_report)
+    bot = TelegramBot(
+        token="token",
+        state_machine=sm,
+        risk_engine=RiskEngine(sm, DummySettings()),
+        adapter=object(),
+        resume_token="resume",
+        allowed_ids=[123],
+    )
+    first = FakeTelegramUpdate(chat_id=123, user_id=456)
+    second = FakeTelegramUpdate(chat_id=123, user_id=456)
+
+    await bot._edge_handler(first, FakeTelegramContext(["paper"]))
+    await bot._edge_handler(second, FakeTelegramContext(["30", "live"]))
+
+    assert called == [(14, "paper"), (30, "live")]
+
+
+@pytest.mark.asyncio
 async def test_telegram_edge_handler_reports_timeout_without_blank_error(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
 
-    async def slow_edge_report(*, window_days):
+    async def slow_edge_report(*, window_days, execution_mode=None):
         await asyncio.sleep(0.1)
         return "EDGE REPORT"
 
@@ -9461,7 +9583,7 @@ async def test_telegram_edge_handler_rejects_out_of_range_days(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {"edge": 0}
 
-    async def fake_edge_report(*, window_days):
+    async def fake_edge_report(*, window_days, execution_mode=None):
         called["edge"] += 1
         return "EDGE REPORT"
 
@@ -9479,7 +9601,7 @@ async def test_telegram_edge_handler_rejects_out_of_range_days(monkeypatch):
     await bot._edge_handler(update, FakeTelegramContext(["91"]))
 
     assert called == {"edge": 0}
-    assert update.message.replies == ["Use: /edge [days], where days is 1-90."]
+    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown], where days is 1-90."]
 
 
 @pytest.mark.asyncio
@@ -9487,7 +9609,7 @@ async def test_telegram_edge_handler_rejects_zero_days(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {"edge": 0}
 
-    async def fake_edge_report(*, window_days):
+    async def fake_edge_report(*, window_days, execution_mode=None):
         called["edge"] += 1
         return "EDGE REPORT"
 
@@ -9505,7 +9627,7 @@ async def test_telegram_edge_handler_rejects_zero_days(monkeypatch):
     await bot._edge_handler(update, FakeTelegramContext(["0"]))
 
     assert called == {"edge": 0}
-    assert update.message.replies == ["Use: /edge [days], where days is 1-90."]
+    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown], where days is 1-90."]
 
 
 @pytest.mark.asyncio
@@ -9513,7 +9635,7 @@ async def test_telegram_edge_handler_rejects_multiple_args(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {"edge": 0}
 
-    async def fake_edge_report(*, window_days):
+    async def fake_edge_report(*, window_days, execution_mode=None):
         called["edge"] += 1
         return "EDGE REPORT"
 
@@ -9531,7 +9653,7 @@ async def test_telegram_edge_handler_rejects_multiple_args(monkeypatch):
     await bot._edge_handler(update, FakeTelegramContext(["14", "extra"]))
 
     assert called == {"edge": 0}
-    assert update.message.replies == ["Use: /edge [days], where days is 1-90."]
+    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown], where days is 1-90."]
 
 
 @pytest.mark.asyncio
@@ -9539,7 +9661,7 @@ async def test_telegram_edge_handler_rejects_invalid_days(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {"edge": 0}
 
-    async def fake_edge_report(*, window_days):
+    async def fake_edge_report(*, window_days, execution_mode=None):
         called["edge"] += 1
         return "EDGE REPORT"
 
@@ -9557,7 +9679,7 @@ async def test_telegram_edge_handler_rejects_invalid_days(monkeypatch):
     await bot._edge_handler(update, FakeTelegramContext(["abc"]))
 
     assert called == {"edge": 0}
-    assert update.message.replies == ["Use: /edge [days], where days is 1-90."]
+    assert update.message.replies == ["Use: /edge [days] [paper|live|mixed|unknown], where days is 1-90."]
 
 
 @pytest.mark.asyncio
@@ -9565,7 +9687,7 @@ async def test_telegram_unauthorized_edge_does_not_read_report(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {"edge": 0}
 
-    async def fake_edge_report(*, window_days):
+    async def fake_edge_report(*, window_days, execution_mode=None):
         called["edge"] += 1
         return "EDGE REPORT"
 

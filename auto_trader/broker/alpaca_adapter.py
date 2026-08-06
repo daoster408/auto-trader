@@ -185,6 +185,7 @@ class AlpacaAdapter:
                         "avg_fill_price": _safe_float(getattr(order, "filled_avg_price", None), default=None),
                         "submitted_at": _iso_value(getattr(order, "submitted_at", None)),
                         "filled_at": _iso_value(getattr(order, "filled_at", None)),
+                        "paper": self.paper,
                         "rationale": "broker_reconciliation",
                     }
                 )
@@ -217,6 +218,7 @@ class AlpacaAdapter:
                         "order_type": _enum_value(getattr(order, "order_type", "")),
                         "status": _enum_value(getattr(order, "status", "")),
                         "submitted_at": _iso_value(getattr(order, "submitted_at", None)),
+                        "paper": self.paper,
                         "rationale": "broker_open_order_check",
                     }
                 )

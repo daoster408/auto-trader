@@ -27,6 +27,7 @@ log = get_logger("auto_trader.persistence.db")
 _DB_PATH: Path = Path("auto_trader.db")
 _DB_LOCK = asyncio.Lock()  # single writer guarantee (simple & cheap for v1)
 _OUTCOME_BACKFILL_COMPLETE = False
+_EXECUTION_MODE_BACKFILL_COMPLETE = False
 CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = (
     "ai_research_committee/v0",
     "ai_research_committee/v1",
@@ -54,6 +55,16 @@ AUTO_EXIT_JOURNAL_RE = re.compile(
     r"Order (?P<order_id>[A-Za-z0-9._:\-]+)",
     re.IGNORECASE,
 )
+BUY_JOURNAL_MODE_RE = re.compile(
+    r"^BUY:\s+(?P<symbol>[A-Z0-9.\-]+)\s+"
+    r"\((?P<mode>PAPER|LIVE),[^\n]*\).*?"
+    r"RiskEngine:.*?decision\s+(?P<risk_decision_id>\d+)\s*;",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+class ExecutionModeConflictError(RuntimeError):
+    """Raised when one durable order ID is attributed to both paper and live."""
 
 
 def _utc_iso(dt: datetime) -> str:
@@ -199,9 +210,10 @@ async def _pending_exit_reason_for_order(
 
 def configure_db_path(path: str | Path) -> None:
     """Called at startup from settings so DB location is configurable."""
-    global _DB_PATH, _OUTCOME_BACKFILL_COMPLETE
+    global _DB_PATH, _OUTCOME_BACKFILL_COMPLETE, _EXECUTION_MODE_BACKFILL_COMPLETE
     _DB_PATH = Path(path).expanduser().resolve()
     _OUTCOME_BACKFILL_COMPLETE = False
+    _EXECUTION_MODE_BACKFILL_COMPLETE = False
 
 
 def get_configured_db_path() -> Path:
@@ -226,6 +238,16 @@ async def init_db() -> None:
             column="signal_id",
             definition="INTEGER REFERENCES signals(id)",
         )
+        await _ensure_column(
+            db,
+            table="orders",
+            column="execution_mode",
+            definition=(
+                "TEXT NOT NULL DEFAULT 'unknown' "
+                "CHECK (execution_mode IN ('paper','live','unknown'))"
+            ),
+        )
+        await _backfill_order_execution_modes(db)
         await _backfill_ai_candidate_outcomes(db)
         await db.commit()
     log.info("db_initialized", path=str(_DB_PATH), size_kb=round(_DB_PATH.stat().st_size / 1024, 1) if _DB_PATH.exists() else 0)
@@ -243,6 +265,74 @@ async def _ensure_column(
     if any(str(row[1]) == column for row in rows):
         return
     await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _execution_mode_from_order(order: dict[str, Any]) -> str:
+    paper = order.get("paper")
+    if paper is True:
+        return "paper"
+    if paper is False:
+        return "live"
+    return "unknown"
+
+
+async def _backfill_order_execution_modes(db: aiosqlite.Connection) -> None:
+    """Backfill entry orders only when an explicit journal label proves the mode."""
+    global _EXECUTION_MODE_BACKFILL_COMPLETE
+    if _EXECUTION_MODE_BACKFILL_COMPLETE:
+        return
+    cur = await db.execute(
+        """
+        SELECT content
+        FROM journal_entries
+        WHERE content LIKE 'BUY:%'
+          AND (content LIKE '%(PAPER,%' OR content LIKE '%(LIVE,%')
+        ORDER BY id
+        """
+    )
+    evidence: dict[int, str] = {}
+    for row in await cur.fetchall():
+        match = BUY_JOURNAL_MODE_RE.search(str(row[0] or ""))
+        if not match:
+            continue
+        risk_decision_id = int(match.group("risk_decision_id"))
+        mode = match.group("mode").lower()
+        existing = evidence.get(risk_decision_id)
+        if existing is not None and existing != mode:
+            log.error(
+                "execution_mode_backfill_conflict",
+                risk_decision_id=risk_decision_id,
+                existing=existing,
+                incoming=mode,
+            )
+            continue
+        evidence[risk_decision_id] = mode
+
+    backfilled = 0
+    for risk_decision_id, mode in evidence.items():
+        update = await db.execute(
+            """
+            UPDATE orders
+            SET execution_mode = ?
+            WHERE risk_decision_id = ?
+              AND lower(side) IN ('buy','long')
+              AND execution_mode = 'unknown'
+            """,
+            (mode, risk_decision_id),
+        )
+        backfilled += max(0, int(update.rowcount or 0))
+    counts_cur = await db.execute(
+        "SELECT execution_mode, COUNT(*) FROM orders GROUP BY execution_mode"
+    )
+    counts = {str(row[0]): int(row[1]) for row in await counts_cur.fetchall()}
+    log.warning(
+        "order_execution_mode_backfill_complete",
+        backfilled=backfilled,
+        paper=counts.get("paper", 0),
+        live=counts.get("live", 0),
+        unknown=counts.get("unknown", 0),
+    )
+    _EXECUTION_MODE_BACKFILL_COMPLETE = True
 
 
 def _db_datetime(value: Any) -> datetime:
@@ -971,12 +1061,35 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
     symbol = str(order.get("symbol", "")).upper()
     side = str(order.get("side", ""))
     resolved_rationale = _clean_rationale(rationale or order.get("rationale"))
+    execution_mode = _execution_mode_from_order(order)
 
     async with _DB_LOCK:
         try:
             await init_db()
             db = await _get_conn()
             try:
+                existing_cur = await db.execute(
+                    "SELECT execution_mode FROM orders WHERE client_order_id = ?",
+                    (client_order_id,),
+                )
+                existing_row = await existing_cur.fetchone()
+                existing_mode = str(existing_row["execution_mode"]) if existing_row else "unknown"
+                if (
+                    existing_mode in {"paper", "live"}
+                    and execution_mode in {"paper", "live"}
+                    and existing_mode != execution_mode
+                ):
+                    log.error(
+                        "execution_mode_conflict",
+                        client_order_id=client_order_id,
+                        broker_order_id=broker_order_id,
+                        existing=existing_mode,
+                        incoming=execution_mode,
+                    )
+                    raise ExecutionModeConflictError(
+                        f"order {client_order_id} execution mode conflict: "
+                        f"{existing_mode} != {execution_mode}"
+                    )
                 if _is_exit_side(side) and _is_administrative_exit_rationale(resolved_rationale):
                     pending_reason = await _pending_exit_reason_for_order(
                         db,
@@ -991,9 +1104,9 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
                     INSERT INTO orders (
                         client_order_id, broker_order_id, symbol, side, qty, order_type,
                         status, filled_qty, avg_fill_price, submitted_at, filled_at,
-                        risk_decision_id, rationale
+                        risk_decision_id, rationale, execution_mode
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(client_order_id) DO UPDATE SET
                         broker_order_id=excluded.broker_order_id,
                         symbol=excluded.symbol,
@@ -1006,6 +1119,10 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
                         submitted_at=COALESCE(excluded.submitted_at, orders.submitted_at),
                         filled_at=COALESCE(excluded.filled_at, orders.filled_at),
                         risk_decision_id=COALESCE(excluded.risk_decision_id, orders.risk_decision_id),
+                        execution_mode=CASE
+                            WHEN excluded.execution_mode = 'unknown' THEN orders.execution_mode
+                            ELSE excluded.execution_mode
+                        END,
                         rationale=CASE
                             WHEN excluded.rationale IS NULL OR excluded.rationale = '' THEN orders.rationale
                             WHEN lower(excluded.rationale) = 'broker_reconciliation'
@@ -1033,6 +1150,7 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
                         order.get("filled_at"),
                         risk_decision_id,
                         resolved_rationale,
+                        execution_mode,
                     ),
                 )
                 await db.commit()
@@ -1040,6 +1158,8 @@ async def upsert_order_record(order: dict[str, Any], risk_decision_id: int | Non
                 await db.close()
             log.info("order_record_upserted", broker_order_id=broker_order_id, symbol=order.get("symbol"))
             return True
+        except ExecutionModeConflictError:
+            raise
         except Exception as e:
             log.error("order_record_upsert_failed", error=str(e), broker_order_id=broker_order_id)
             return False
@@ -1718,7 +1838,8 @@ async def get_latest_order_records(limit: int = 5) -> list[dict[str, Any]]:
                         avg_fill_price,
                         submitted_at,
                         filled_at,
-                        rationale
+                        rationale,
+                        execution_mode
                     FROM orders
                     ORDER BY COALESCE(submitted_at, filled_at, '') DESC, rowid DESC
                     LIMIT ?

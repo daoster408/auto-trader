@@ -127,7 +127,9 @@ CREATE TABLE IF NOT EXISTS orders (
     submitted_at TEXT,
     filled_at TEXT,
     risk_decision_id INTEGER REFERENCES risk_decisions(id),
-    rationale TEXT
+    rationale TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (execution_mode IN ('paper','live','unknown'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_filled_exit_time

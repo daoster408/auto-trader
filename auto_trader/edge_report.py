@@ -35,6 +35,7 @@ MISSING_TAG_PREFIXES = (
 SAFE_PROVIDER_NAMES = {"anthropic", "deepseek", "gemini", "multi", "openai", "prefilter", "shadow", "unknown", "xai"}
 SAFE_VERDICTS = {"approve", "reject", "unknown", "watch"}
 SAFE_PROVIDER_ANNOTATIONS = {"high_conf", "invalid", "low_conf", "med_conf"}
+EXECUTION_MODE_FILTERS = {"paper", "live", "mixed", "unknown"}
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class ClosedTradeEvidence:
     ai_verdict: str
     risk_profile: str
     signal_id: int | None
+    execution_mode: str = "unknown"
+    execution_mode_inherited: bool = False
     setup_tags: tuple[str, ...] = ()
     provider_votes: tuple[str, ...] = ()
 
@@ -92,6 +95,9 @@ class EdgeReport:
     estimated_ai_cost: float | None = None
     ai_cost_unknown_calls: int = 0
     ai_cost_unavailable_reason: str | None = None
+    execution_mode_filter: str | None = None
+    execution_mode_counts: dict[str, int] = field(default_factory=dict)
+    scorecard_withheld: bool = False
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -369,7 +375,8 @@ async def _fetch_rows(
         orders_cur = await db.execute(
             """
             SELECT client_order_id, broker_order_id, symbol, side, qty, order_type, status,
-                   filled_qty, avg_fill_price, submitted_at, filled_at, risk_decision_id, rationale
+                   filled_qty, avg_fill_price, submitted_at, filled_at, risk_decision_id,
+                   rationale, execution_mode
             FROM orders
             WHERE lower(status) = 'filled'
             ORDER BY COALESCE(filled_at, submitted_at, ''), rowid
@@ -467,6 +474,19 @@ async def _fetch_rows(
         }
 
 
+def _trade_execution_mode(
+    entry: dict[str, Any],
+    exit_order: dict[str, Any],
+) -> tuple[str, bool]:
+    entry_mode = str(entry.get("execution_mode") or "unknown").lower()
+    exit_mode = str(exit_order.get("execution_mode") or "unknown").lower()
+    if entry_mode in {"paper", "live"}:
+        if exit_mode in {"paper", "live"} and exit_mode != entry_mode:
+            return "mixed", False
+        return entry_mode, exit_mode == "unknown"
+    return "unknown", False
+
+
 def _build_closed_trades(rows: dict[str, list[dict[str, Any]]], *, since: datetime) -> list[ClosedTradeEvidence]:
     orders = rows["orders"]
     risks_by_id = {int(row["id"]): row for row in rows["risk_decisions"]}
@@ -518,6 +538,7 @@ def _build_closed_trades(rows: dict[str, list[dict[str, Any]]], *, since: dateti
         signal = signals_by_id.get(signal_id or -1)
         risk_profile = _risk_profile_from_signal(signal, risk)
         memo = _latest_ai_memo(memos, signal_id=signal_id)
+        execution_mode, execution_mode_inherited = _trade_execution_mode(entry, exit_order)
         closed.append(
             ClosedTradeEvidence(
                 symbol=symbol,
@@ -532,6 +553,8 @@ def _build_closed_trades(rows: dict[str, list[dict[str, Any]]], *, since: dateti
                 ai_verdict=_ai_verdict_for_signal(memos, signal_id),
                 risk_profile=risk_profile,
                 signal_id=signal_id,
+                execution_mode=execution_mode,
+                execution_mode_inherited=execution_mode_inherited,
                 setup_tags=_setup_tags(signal, memo, risk_profile),
                 provider_votes=_provider_votes_for_signal(memos, signal_id),
             )
@@ -638,15 +661,37 @@ def _build_candidate_outcomes(
     return evidence
 
 
-async def build_edge_report(*, db_path: Path | None = None, window_days: int = 7) -> EdgeReport:
+async def build_edge_report(
+    *,
+    db_path: Path | None = None,
+    window_days: int = 7,
+    execution_mode: str | None = None,
+) -> EdgeReport:
+    mode_filter = str(execution_mode or "").strip().lower() or None
+    if mode_filter is not None and mode_filter not in EXECUTION_MODE_FILTERS:
+        raise ValueError(f"unsupported execution mode filter: {execution_mode}")
     await init_db()
     since = datetime.now(UTC) - timedelta(days=max(1, int(window_days)))
     rows = await _fetch_rows(db_path or get_configured_db_path(), since=since)
+    all_trades = _build_closed_trades(rows, since=since)
+    mode_counts = dict(_bucket_counts([trade.execution_mode for trade in all_trades]))
+    actual_mixed = (
+        mode_counts.get("mixed", 0) > 0
+        or (mode_counts.get("paper", 0) > 0 and mode_counts.get("live", 0) > 0)
+    )
+    scorecard_withheld = actual_mixed and mode_filter in {None, "mixed"}
+    if mode_filter in {"paper", "live", "unknown"}:
+        trades = [trade for trade in all_trades if trade.execution_mode == mode_filter]
+    else:
+        trades = all_trades
     return EdgeReport(
         window_days=window_days,
-        closed_trades=_build_closed_trades(rows, since=since),
+        closed_trades=trades,
         opportunities=_build_opportunities(rows, since=since),
         candidate_outcomes=_build_candidate_outcomes(rows, since=since),
+        execution_mode_filter=mode_filter,
+        execution_mode_counts=mode_counts,
+        scorecard_withheld=scorecard_withheld,
     )
 
 
@@ -1565,6 +1610,34 @@ def write_scoreboard_memory_pack(pack: dict[str, Any], path: Path) -> Path:
     return path
 
 
+def _execution_mode_header(report: EdgeReport) -> list[str]:
+    counts = {
+        mode: int(report.execution_mode_counts.get(mode, 0))
+        for mode in ("paper", "live", "unknown", "mixed")
+    }
+    if report.execution_mode_filter in {"paper", "live", "unknown"}:
+        label = report.execution_mode_filter.upper()
+    elif report.scorecard_withheld:
+        label = "MIXED"
+    else:
+        present = [mode for mode, count in counts.items() if count > 0]
+        label = present[0].upper() if len(present) == 1 else ("NONE" if not present else "MIXED")
+    lines = [
+        f"Execution mode: {label}",
+        (
+            "Trade mode counts: "
+            f"paper={counts['paper']}, live={counts['live']}, "
+            f"unknown={counts['unknown']}, conflicting={counts['mixed']}"
+        ),
+    ]
+    inherited = sum(1 for trade in report.closed_trades if trade.execution_mode_inherited)
+    if inherited:
+        lines.append(
+            f"Mode note: {inherited} trade(s) inherit mode from a proven entry because the paired exit is unknown."
+        )
+    return lines
+
+
 def render_edge_report(report: EdgeReport) -> str:
     trades = report.closed_trades
     opportunities = report.opportunities
@@ -1576,8 +1649,19 @@ def render_edge_report(report: EdgeReport) -> str:
     lines = [
         "EDGE REPORT",
         f"Window: last {report.window_days} days",
-        "",
     ]
+    lines.extend(_execution_mode_header(report))
+    if report.scorecard_withheld:
+        lines.extend(
+            [
+                "",
+                "!!! MIXED PAPER/LIVE EVIDENCE !!!",
+                "Dollar scorecard: WITHHELD to prevent blending simulated and real fills.",
+                "Run /edge paper or /edge live. Use /edge mixed only for this diagnostic view.",
+            ]
+        )
+        return "\n".join(lines)
+    lines.append("")
     lines.extend(
         _summary_lines(
             trades,
@@ -1639,10 +1723,10 @@ def render_edge_report(report: EdgeReport) -> str:
     return "\n".join(lines)
 
 
-async def run_edge_report(*, window_days: int = 7) -> str:
+async def run_edge_report(*, window_days: int = 7, execution_mode: str | None = None) -> str:
     settings = get_settings()
     configure_db_path(getattr(settings, "db_path", "auto_trader.db"))
-    report = await build_edge_report(window_days=window_days)
+    report = await build_edge_report(window_days=window_days, execution_mode=execution_mode)
     report = await _attach_ai_cost(report, settings=settings)
     return render_edge_report(report)
 
@@ -1674,6 +1758,12 @@ async def run_scoreboard_memory_pack(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read-only trade edge evidence report.")
     parser.add_argument("--days", type=int, default=7, help="Lookback window in days.")
+    parser.add_argument(
+        "--execution-mode",
+        choices=sorted(EXECUTION_MODE_FILTERS),
+        default=None,
+        help="Filter closed-trade evidence by paper, live, or unknown; mixed is diagnostic only.",
+    )
     parser.add_argument("--brief", action="store_true", help="Render the learning-loop brief instead of the edge report.")
     parser.add_argument("--memory-pack", action="store_true", help="Render compact scoreboard memory JSON for AI context.")
     parser.add_argument("--write-cache", action="store_true", help="Write the memory pack to its cache path.")
@@ -1693,7 +1783,7 @@ def main() -> None:
     elif args.brief:
         print(asyncio.run(run_learning_brief(window_days=args.days)))
     else:
-        print(asyncio.run(run_edge_report(window_days=args.days)))
+        print(asyncio.run(run_edge_report(window_days=args.days, execution_mode=args.execution_mode)))
 
 
 if __name__ == "__main__":
