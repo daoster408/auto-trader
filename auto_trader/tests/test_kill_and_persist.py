@@ -8944,6 +8944,52 @@ async def test_order_manager_pauses_on_post_submit_persistence_failure(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_order_manager_pauses_on_post_submit_persistence_exception(monkeypatch):
+    """A hard mode conflict after broker acceptance must pause and preserve order identity."""
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, DummySettings())
+
+    class FakeAdapter:
+        async def submit_order(self, **kwargs):
+            return {
+                "id": "broker-accepted-before-conflict",
+                "client_order_id": "broker-accepted-before-conflict",
+                "symbol": kwargs["symbol"],
+                "qty": kwargs["qty"],
+                "side": kwargs["side"],
+                "order_type": kwargs["order_type"],
+                "status": "accepted",
+            }
+
+    async def fake_log_risk_decision(**kwargs):
+        return 43
+
+    async def fake_upsert_order_record(*args, **kwargs):
+        raise ExecutionModeConflictError("paper conflicts with live")
+
+    monkeypatch.setattr(
+        "auto_trader.execution.order_manager.log_risk_decision",
+        fake_log_risk_decision,
+    )
+    monkeypatch.setattr(
+        "auto_trader.execution.order_manager.upsert_order_record",
+        fake_upsert_order_record,
+    )
+
+    manager = OrderManager(risk, FakeAdapter())
+    result = await manager.submit_trade_intent(
+        TradeIntent(symbol="AMPX", side="long", entry_price=23.89),
+        DummySnapshot(),
+    )
+
+    assert result["order"]["id"] == "broker-accepted-before-conflict"
+    assert result["persistence"]["order_record_saved"] is False
+    assert result["risk_decision"]["approved"] is False
+    assert "persistence raised" in result["risk_decision"]["reason"]
+    assert sm.state == SystemState.PAUSED
+
+
+@pytest.mark.asyncio
 async def test_order_manager_persists_signal_id_in_risk_decision(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     risk = RiskEngine(sm, DummySettings())

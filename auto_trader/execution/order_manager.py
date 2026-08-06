@@ -89,7 +89,7 @@ class OrderManager:
             self.log.error("order_blocked_invalid_risk_size", trace_id=decision.trace_id)
             return result
 
-        # Risk approved → submit real order
+        # Risk approved -> submit real order.
         try:
             order_result = await self.adapter.submit_order(
                 symbol=intent.symbol,
@@ -97,28 +97,49 @@ class OrderManager:
                 side=intent.side,
                 order_type="market",
             )
-            result["order"] = order_result
+        except Exception as e:
+            self.log.exception("order_submission_failed_after_risk_approval", error=str(e))
+            result["order"] = {"error": str(e)}
+            result["risk_decision"]["approved"] = False
+            return result
+
+        result["order"] = order_result
+        try:
             persisted = await upsert_order_record(
                 order_result,
                 risk_decision_id=risk_decision_id,
                 rationale=intent.rationale,
                 decision_context_id=decision_context_id,
             )
-            result["persistence"]["order_record_saved"] = persisted
-            if not persisted:
-                self.log.critical(
-                    "order_submitted_but_persistence_failed",
-                    order=order_result,
-                    trace_id=decision.trace_id,
-                )
-                if self.risk.sm.can_trade():
-                    self.risk.sm.pause("order persistence failed after broker submit")
-                result["risk_decision"]["approved"] = False
-                result["risk_decision"]["reason"] = "Broker order submitted but local persistence failed; system paused"
-            self.log.info("order_submitted_via_manager", order=order_result, trace_id=decision.trace_id)
         except Exception as e:
-            self.log.exception("order_submission_failed_after_risk_approval", error=str(e))
-            result["order"] = {"error": str(e)}
-            result["risk_decision"]["approved"] = False  # mark as failed post-approval
+            self.log.critical(
+                "order_submitted_but_persistence_raised",
+                order=order_result,
+                trace_id=decision.trace_id,
+                error=str(e),
+            )
+            if self.risk.sm.can_trade():
+                self.risk.sm.pause("order persistence raised after broker submit")
+            result["persistence"]["order_record_saved"] = False
+            result["risk_decision"]["approved"] = False
+            result["risk_decision"]["reason"] = (
+                "Broker order submitted but local persistence raised; system paused"
+            )
+            return result
+
+        result["persistence"]["order_record_saved"] = persisted
+        if not persisted:
+            self.log.critical(
+                "order_submitted_but_persistence_failed",
+                order=order_result,
+                trace_id=decision.trace_id,
+            )
+            if self.risk.sm.can_trade():
+                self.risk.sm.pause("order persistence failed after broker submit")
+            result["risk_decision"]["approved"] = False
+            result["risk_decision"]["reason"] = (
+                "Broker order submitted but local persistence failed; system paused"
+            )
+        self.log.info("order_submitted_via_manager", order=order_result, trace_id=decision.trace_id)
 
         return result
