@@ -256,3 +256,75 @@ async def test_edge_excludes_offline_records_but_keeps_legacy_bucket(tmp_path: P
     assert [row.symbol for row in legacy.opportunities] == ["LEGACY"]
     assert legacy.opportunities[0].context_inferred is True
     assert report.provenance_counts["legacy_trades"] == 0
+
+
+@pytest.mark.asyncio
+async def test_edge_mode_filter_isolates_opportunities_and_ai_outcomes(tmp_path: Path):
+    db_path = tmp_path / "edge_modes.db"
+    configure_db_path(db_path)
+    await init_db()
+    settings = ProvenanceSettings()
+
+    for symbol, mode in (("PAPER", "paper"), ("LIVE", "live")):
+        session = await start_runtime_provenance(
+            settings,
+            process_role="test_supervisor",
+            execution_mode=mode,
+        )
+        assert session is not None
+        snapshot = redacted_config_snapshot(
+            settings,
+            effective={"decision_source": "supervisor_entry", "execution_mode": mode},
+        )
+        context_id = await create_decision_context(
+            runtime_session_id=session.session_id,
+            decision_source="supervisor_entry",
+            ai_entry_gate_enabled=True,
+            ai_entry_gate_source="env",
+            ai_research_enabled=True,
+            simplified_runtime_enabled=True,
+            execution_mode=mode,
+            provider="xai",
+            model_tag="xai/grok-latest",
+            prompt_version="ai_research_single/v1",
+            risk_profile="aggressive",
+            config_hash=config_fingerprint(snapshot),
+            config_snapshot=snapshot,
+        )
+        assert context_id is not None
+        signal_id = await log_signal(
+            symbol=symbol,
+            thesis=f"{mode} candidate",
+            confidence=0.8,
+            source="rules",
+            decision_context_id=context_id,
+        )
+        await log_ai_research_memo(
+            signal_id=signal_id,
+            symbol=symbol,
+            provider="xai",
+            model_tag="xai/grok-latest",
+            prompt_version="ai_research_single/v1",
+            input_hash=mode,
+            verdict="approve",
+            confidence=0.8,
+            used_only_provided_data=True,
+            validation_passed=True,
+            memo={
+                "input_packet": {
+                    "verified_research_context": {
+                        "market": {"quote": {"ask_price": 10.0}}
+                    }
+                }
+            },
+            decision_context_id=context_id,
+            decision_source="supervisor_entry",
+        )
+
+    paper = await build_edge_report(window_days=30, execution_mode="paper")
+    live = await build_edge_report(window_days=30, execution_mode="live")
+
+    assert [row.symbol for row in paper.opportunities] == ["PAPER"]
+    assert [row.symbol for row in paper.candidate_outcomes] == ["PAPER"]
+    assert [row.symbol for row in live.opportunities] == ["LIVE"]
+    assert [row.symbol for row in live.candidate_outcomes] == ["LIVE"]

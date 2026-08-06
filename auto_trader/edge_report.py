@@ -73,6 +73,7 @@ class OpportunityEvidence:
     risk_profile: str
     signal_id: int
     created_at: datetime | None
+    execution_mode: str = "unknown"
     decision_source: str = "unknown"
     context_inferred: bool = False
     setup_tags: tuple[str, ...] = ()
@@ -90,6 +91,7 @@ class CandidateOutcomeEvidence:
     comparison_notional: float
     price_source: str
     status: str
+    execution_mode: str = "unknown"
     decision_source: str = "unknown"
     context_inferred: bool = False
     horizon_returns: dict[int, float] = field(default_factory=dict)
@@ -437,7 +439,8 @@ async def _fetch_rows(
             f"""
             SELECT s.id, s.created_at, s.symbol, s.thesis, s.confidence, s.source,
                    s.model_tag, s.features_json, s.decision_context_id,
-                   c.decision_source, c.inferred AS context_inferred
+                   c.decision_source, c.execution_mode AS context_execution_mode,
+                   c.inferred AS context_inferred
             FROM signals AS s
             LEFT JOIN decision_contexts AS c ON c.id = s.decision_context_id
             {signal_where_clause}
@@ -461,6 +464,7 @@ async def _fetch_rows(
                    m.model_tag, m.prompt_version, m.input_hash, m.verdict,
                    m.confidence, m.used_only_provided_data, m.validation_passed,
                    m.memo_json, m.decision_context_id, c.decision_source,
+                   c.execution_mode AS context_execution_mode,
                    c.inferred AS context_inferred
             FROM ai_research_memos AS m
             LEFT JOIN decision_contexts AS c ON c.id = m.decision_context_id
@@ -483,7 +487,8 @@ async def _fetch_rows(
                    o.d3_session_date, o.d3_close, o.d3_return_pct,
                    o.d3_hypothetical_pnl, o.d5_session_date, o.d5_close,
                    o.d5_return_pct, o.d5_hypothetical_pnl,
-                   c.decision_source, c.inferred AS context_inferred
+                   c.decision_source, c.execution_mode AS context_execution_mode,
+                   c.inferred AS context_inferred
             FROM ai_candidate_outcomes AS o
             JOIN ai_research_memos AS m ON m.id = o.memo_id
             LEFT JOIN decision_contexts AS c ON c.id = m.decision_context_id
@@ -650,6 +655,7 @@ def _build_opportunities(rows: dict[str, list[dict[str, Any]]], *, since: dateti
                 risk_profile=risk_profile,
                 signal_id=signal_id,
                 created_at=_parse_dt(signal.get("created_at")),
+                execution_mode=str(signal.get("context_execution_mode") or "unknown"),
                 decision_source=str(signal.get("decision_source") or "unknown"),
                 context_inferred=bool(signal.get("context_inferred")),
                 setup_tags=_setup_tags(signal, _latest_ai_memo(rows["ai_memos"], signal_id=signal_id), risk_profile),
@@ -689,6 +695,7 @@ def _build_candidate_outcomes(
                 comparison_notional=_float(row.get("comparison_notional"), 30.0),
                 price_source=str(row.get("price_source") or "model_packet.price_unavailable"),
                 status=str(row.get("status") or "pending"),
+                execution_mode=str(row.get("context_execution_mode") or "unknown"),
                 decision_source=str(row.get("decision_source") or "unknown"),
                 context_inferred=bool(row.get("context_inferred")),
                 horizon_returns=horizon_returns,
@@ -745,20 +752,24 @@ async def build_edge_report(
     scorecard_withheld = actual_mixed and mode_filter in {None, "mixed", "legacy"}
     if mode_filter in {"paper", "live", "unknown"}:
         trades = [trade for trade in selected_trades if trade.execution_mode == mode_filter]
+        opportunities = [
+            row for row in opportunities if row.execution_mode == mode_filter
+        ]
+        outcomes = [row for row in outcomes if row.execution_mode == mode_filter]
     else:
         trades = selected_trades
     provenance_counts = {
         "captured_trades": sum(
-            1 for trade in trading_trades if trade.decision_source == "supervisor_entry"
+            1 for trade in trades if trade.decision_source == "supervisor_entry"
         ),
         "legacy_trades": sum(
-            1 for trade in trading_trades if trade.decision_source == "legacy_supervisor_entry"
+            1 for trade in trades if trade.decision_source == "legacy_supervisor_entry"
         ),
         "captured_decisions": sum(
-            1 for row in trading_outcomes if row.decision_source == "supervisor_entry"
+            1 for row in outcomes if row.decision_source == "supervisor_entry"
         ),
         "legacy_decisions": sum(
-            1 for row in trading_outcomes if row.decision_source == "legacy_supervisor_entry"
+            1 for row in outcomes if row.decision_source == "legacy_supervisor_entry"
         ),
         "offline_decisions_excluded": sum(
             1 for row in all_outcomes if row.decision_source not in TRADING_DECISION_SOURCES
@@ -788,6 +799,11 @@ async def _attach_ai_cost(report: EdgeReport, *, settings: Any) -> EdgeReport:
                 ("legacy_supervisor_entry",)
                 if report.execution_mode_filter == "legacy"
                 else ("supervisor_entry", "legacy_supervisor_entry")
+            ),
+            execution_modes=(
+                (report.execution_mode_filter,)
+                if report.execution_mode_filter in {"paper", "live", "unknown"}
+                else None
             ),
         )
     except Exception as exc:
@@ -1481,6 +1497,12 @@ def render_learning_brief(report: EdgeReport) -> str:
         "LEARNING BRIEF",
         f"Window: last {report.window_days} days",
         f"Evidence: {int(stats['count'])} closed trades, {len(opportunities)} opportunities",
+        (
+            "Provenance: "
+            f"captured trades={int(report.provenance_counts.get('captured_trades', 0))}, "
+            f"legacy inferred trades={int(report.provenance_counts.get('legacy_trades', 0))}; "
+            "legacy evidence is continuity-only, not proven provenance."
+        ),
         f"Realized P/L before AI cost: {_money(stats['realized_pnl'])}",
         (
             f"Net after estimated AI cost: {_money(stats['realized_pnl'] - report.estimated_ai_cost)}"
@@ -1568,6 +1590,12 @@ def render_scoreboard_memory_context(pack: dict[str, Any]) -> str:
             f"opportunities={pack.get('opportunity_count', 0)}; sample={sample_label}"
         ),
         (
+            "Provenance: "
+            f"captured_trades={_dict(pack.get('provenance')).get('captured_trades', 0)}; "
+            f"legacy_inferred_trades={_dict(pack.get('provenance')).get('legacy_trades', 0)}; "
+            "legacy evidence is not proven provenance."
+        ),
+        (
             f"Observed P/L before AI cost={_money(_float(performance.get('realized_pnl')))}; "
             f"estimated AI cost={_money(estimated_ai_cost) if estimated_ai_cost is not None else 'unavailable'}; "
             f"net={_money(net_after_ai_cost) if net_after_ai_cost is not None else 'unavailable'}; "
@@ -1651,6 +1679,15 @@ def build_scoreboard_memory_pack(
         else "Building sample; still treat as observed evidence, not order authority."
     )
     generated = generated_at or datetime.now(UTC)
+    provenance = {
+        key: int(value)
+        for key, value in sorted(report.provenance_counts.items())
+    }
+    legacy_note = (
+        "Legacy inferred evidence is included for continuity but is not captured/proven provenance."
+        if provenance.get("legacy_trades", 0) or provenance.get("legacy_decisions", 0)
+        else "No legacy inferred evidence is present in this pack."
+    )
     pack: dict[str, Any] = {
         "kind": "scoreboard_memory_pack",
         "generated_at": generated.astimezone(UTC).isoformat().replace("+00:00", "Z"),
@@ -1658,6 +1695,7 @@ def build_scoreboard_memory_pack(
         "closed_trade_count": int(stats["count"]),
         "opportunity_count": len(opportunities),
         "sample_label": sample_quality,
+        "provenance": provenance,
         "sample": {
             "closed_trades": int(stats["count"]),
             "opportunities": len(opportunities),
@@ -1667,6 +1705,7 @@ def build_scoreboard_memory_pack(
         "notes": [
             sample_caveat,
             "Observed evidence only; do not treat this pack as order authority.",
+            legacy_note,
             "RiskEngine remains the sizing and order-flow authority.",
         ],
         "performance": {

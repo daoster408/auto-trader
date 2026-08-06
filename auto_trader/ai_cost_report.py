@@ -241,6 +241,7 @@ async def build_ai_cost_report(
     start_utc: datetime | None = None,
     end_utc: datetime | None = None,
     decision_sources: tuple[str, ...] | None = None,
+    execution_modes: tuple[str, ...] | None = None,
 ) -> AICostReport:
     timezone_name = str(getattr(settings, "report_timezone", "America/Los_Angeles") or "America/Los_Angeles")
     if start_utc is None or end_utc is None:
@@ -271,6 +272,11 @@ async def build_ai_cost_report(
         source_placeholders = ",".join("?" for _ in decision_sources)
         source_clause = f" AND c.decision_source IN ({source_placeholders})"
         params.extend(decision_sources)
+    mode_clause = ""
+    if execution_modes:
+        mode_placeholders = ",".join("?" for _ in execution_modes)
+        mode_clause = f" AND c.execution_mode IN ({mode_placeholders})"
+        params.extend(execution_modes)
     db = await aiosqlite.connect(get_configured_db_path())
     db.row_factory = aiosqlite.Row
     try:
@@ -284,6 +290,7 @@ async def build_ai_cost_report(
               AND m.created_at >= ?
               AND m.created_at < ?
               {source_clause}
+              {mode_clause}
             ORDER BY m.id ASC
             """,
             tuple(params),

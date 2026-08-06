@@ -8755,7 +8755,10 @@ def test_edge_report_payoff_shape_explains_negative_dollars_at_even_win_rate():
 
 @pytest.mark.asyncio
 async def test_edge_ai_cost_uses_same_provider_average_for_unknown_usage(monkeypatch):
+    captured = {}
+
     async def fake_cost_report(**kwargs):
+        captured.update(kwargs)
         return SimpleNamespace(
             unavailable_reason=None,
             total_estimated_cost=0.75,
@@ -8778,6 +8781,18 @@ async def test_edge_ai_cost_uses_same_provider_average_for_unknown_usage(monkeyp
     assert report.estimated_ai_cost == pytest.approx(0.75)
     assert report.ai_cost_unknown_proxy == pytest.approx(0.003)
     assert report.ai_cost_unestimable_calls == 0
+    assert captured["execution_modes"] is None
+
+    await _attach_ai_cost(
+        EdgeReport(
+            window_days=14,
+            closed_trades=[],
+            opportunities=[],
+            execution_mode_filter="paper",
+        ),
+        settings=object(),
+    )
+    assert captured["execution_modes"] == ("paper",)
 
 
 def test_edge_report_payoff_shape_shows_when_win_rate_clears_breakeven():
