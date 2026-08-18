@@ -89,6 +89,70 @@ def _parse_runtime_bool(key: str, value: str) -> bool:
     raise ValueError(f"invalid boolean runtime config for {key}: {value}")
 
 
+def _memo_age_seconds(memo: dict[str, Any], *, now: datetime | None = None) -> float | None:
+    raw_created_at = memo.get("created_at")
+    if not raw_created_at:
+        return None
+    try:
+        created_at = datetime.fromisoformat(str(raw_created_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    current = now or datetime.now(UTC)
+    return max(0.0, (current.astimezone(UTC) - created_at.astimezone(UTC)).total_seconds())
+
+
+def _provider_failure_cooldown_active(
+    memo: dict[str, Any],
+    *,
+    cooldown_seconds: int,
+    now: datetime | None = None,
+) -> tuple[bool, float | None]:
+    if bool(memo.get("validation_passed")):
+        return False, None
+    age_seconds = _memo_age_seconds(memo, now=now)
+    return age_seconds is not None and age_seconds < cooldown_seconds, age_seconds
+
+
+def _cached_failure_reuse_memo(
+    cached: dict[str, Any],
+    *,
+    symbol: str,
+    cooldown_seconds: int,
+    age_seconds: float | None,
+) -> dict[str, Any]:
+    source_memo = cached.get("memo") if isinstance(cached.get("memo"), dict) else {}
+    source_committee = (
+        source_memo.get("committee") if isinstance(source_memo.get("committee"), dict) else {}
+    )
+    validation_errors = list(source_committee.get("validation_errors") or [])
+    provider_failure = (
+        dict(source_memo.get("provider_failure"))
+        if isinstance(source_memo.get("provider_failure"), dict)
+        else {}
+    )
+    return {
+        "cache_reuse": {
+            "source_memo_id": cached.get("id"),
+            "source_signal_id": cached.get("signal_id"),
+            "kind": "provider_failure_cooldown",
+            "failure_category": provider_failure.get("category") or "unknown",
+            "source_age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+            "cooldown_seconds": cooldown_seconds,
+        },
+        "committee": {
+            "symbol": symbol.upper(),
+            "verdict": str(cached.get("verdict") or "watch"),
+            "confidence": cached.get("confidence"),
+            "used_only_provided_data": True,
+            "validation_errors": validation_errors,
+            "judge_summary": "Recent provider failure reused during the bounded retry cooldown.",
+        },
+        "provider_failure": provider_failure,
+    }
+
+
 async def _runtime_risk_profile(settings: Any, *, paper: bool) -> str:
     try:
         runtime_value = await get_runtime_config_value("risk_profile")
@@ -2001,13 +2065,51 @@ class TradingSupervisor:
                     called_provider=False,
                 )
             if cached is not None:
+                failure_cooldown_seconds = int(
+                    getattr(self.settings, "ai_provider_failure_cooldown_seconds", 300) or 0
+                )
+                failure_cooldown_active, failure_age_seconds = _provider_failure_cooldown_active(
+                    cached,
+                    cooldown_seconds=failure_cooldown_seconds,
+                )
+                if not bool(cached.get("validation_passed")) and not failure_cooldown_active:
+                    log.info(
+                        "ai_research_provider_failure_cooldown_expired",
+                        symbol=intent.symbol.upper(),
+                        provider=cache_provider,
+                        memo_id=cached.get("id"),
+                        source_age_seconds=failure_age_seconds,
+                        cooldown_seconds=failure_cooldown_seconds,
+                    )
+                    cached = None
+            if cached is not None:
                 cached_verdict = str(cached.get("verdict") or "watch")
+                cached_failure = not bool(cached.get("validation_passed"))
                 log.info(
-                    "ai_research_symbol_day_cache_hit",
+                    (
+                        "ai_research_provider_failure_cooldown_hit"
+                        if cached_failure
+                        else "ai_research_symbol_day_cache_hit"
+                    ),
                     symbol=intent.symbol.upper(),
                     provider=cache_provider,
                     verdict=cached_verdict,
                     memo_id=cached.get("id"),
+                )
+                reuse_memo = (
+                    _cached_failure_reuse_memo(
+                        cached,
+                        symbol=intent.symbol,
+                        cooldown_seconds=failure_cooldown_seconds,
+                        age_seconds=failure_age_seconds,
+                    )
+                    if cached_failure
+                    else {
+                        "cache_reuse": {
+                            "source_memo_id": cached.get("id"),
+                            "source_signal_id": cached.get("signal_id"),
+                        }
+                    }
                 )
                 cache_memo_id = await log_ai_research_memo(
                     signal_id=signal_id,
@@ -2022,18 +2124,17 @@ class TradingSupervisor:
                     validation_passed=bool(cached.get("validation_passed")),
                     decision_context_id=decision_context_id,
                     decision_source="supervisor_entry",
-                    memo={
-                        "cache_reuse": {
-                            "source_memo_id": cached.get("id"),
-                            "source_signal_id": cached.get("signal_id"),
-                        }
-                    },
+                    memo=reuse_memo,
                 )
                 return AIResearchRunResult(
                     symbol=intent.symbol.upper(),
                     verdict=cached_verdict,
                     validation_passed=bool(cached.get("validation_passed")),
-                    reason=f"ai_research_cached_{cached_verdict}",
+                    reason=(
+                        "ai_research_provider_failure_cooldown"
+                        if cached_failure
+                        else f"ai_research_cached_{cached_verdict}"
+                    ),
                     called_provider=False,
                     memo_id=cache_memo_id,
                 )

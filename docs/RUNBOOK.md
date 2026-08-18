@@ -375,6 +375,8 @@ scripts/oracle_ai_cost_report.sh --days 30
 
 For `grok-latest`, the configured xAI rates verified on 2026-08-06 are `$1.25` per million regular input tokens, `$0.20` per million cached input tokens, and `$2.50` per million completion or reasoning tokens. Future provider responses persist the explicit cached and reasoning token buckets when supplied.
 
+Use `AI_RESEARCH_XAI_TIMEOUT_SECONDS=60` for live-entry Grok research. The default supervisor tick budget is 90 seconds, so it remains larger than the provider deadline. A failed or invalid provider result is fail-closed and is reused only for `AI_PROVIDER_FAILURE_COOLDOWN_SECONDS` (default 300) to prevent immediate duplicate paid attempts; after that cooldown, the symbol may be researched again. Valid decisions remain cached for the UTC trading day.
+
 Older xAI memos stored only aggregate prompt, completion, and total tokens. Their cache split is reconstructed with `AI_RESEARCH_XAI_LEGACY_CACHED_INPUT_RATIO=0.06245255`, calibrated against the Jul 8-Aug 6 xAI dashboard snapshot: `$2.20`, 1,555,199 tokens, 1.2M regular prompt tokens, 79.8K cached prompt tokens, 65.9K completion tokens, and 207.8K reasoning tokens. The report labels these rows `legacy_estimated`; this is a historical estimate, not a provider invoice.
 
 The report's `persisted_calls` count is the number of stored bot research decisions. It does not equal xAI's portal request counter because one research decision can make multiple HTTP requests or retries. Invalid cost-only settings fall back to defaults and cannot prevent the trading runtime from starting.

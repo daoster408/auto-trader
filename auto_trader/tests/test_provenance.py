@@ -39,6 +39,9 @@ class ProvenanceSettings:
             "AI_ENTRY_GATE_ENABLED": True,
             "AI_RESEARCH_PROVIDER": "xai",
             "AI_RESEARCH_XAI_MODEL": "grok-latest",
+            "AI_RESEARCH_XAI_TIMEOUT_SECONDS": 60,
+            "AI_PROVIDER_FAILURE_COOLDOWN_SECONDS": 300,
+            "SUPERVISOR_TICK_TIMEOUT_SECONDS": 90,
             "RISK_PROFILE": "aggressive",
         }
 
@@ -51,6 +54,9 @@ def test_config_snapshot_redacts_secrets_and_hashes_redacted_form():
     assert first["ALPACA_API_KEY"] == "<redacted>"
     assert first["XAI_API_KEY"] == "<redacted>"
     assert first["AI_ENTRY_GATE_ENABLED"] is True
+    assert first["AI_RESEARCH_XAI_TIMEOUT_SECONDS"] == 60
+    assert first["AI_PROVIDER_FAILURE_COOLDOWN_SECONDS"] == 300
+    assert first["SUPERVISOR_TICK_TIMEOUT_SECONDS"] == 90
     assert first["RISK_PROFILE"] == "aggressive"
     assert "first" not in serialized
     assert "one" not in serialized

@@ -111,10 +111,16 @@ class Settings(BaseSettings):
         alias="AI_RESEARCH_OPENAI_TIMEOUT_SECONDS",
     )
     ai_research_xai_timeout_seconds: float | None = Field(
-        None,
+        60.0,
         ge=1.0,
         le=60.0,
         alias="AI_RESEARCH_XAI_TIMEOUT_SECONDS",
+    )
+    ai_provider_failure_cooldown_seconds: int = Field(
+        300,
+        ge=0,
+        le=3600,
+        alias="AI_PROVIDER_FAILURE_COOLDOWN_SECONDS",
     )
     ai_research_anthropic_timeout_seconds: float | None = Field(
         60.0,

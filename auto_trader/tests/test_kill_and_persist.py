@@ -340,6 +340,7 @@ class DummySupervisorSettings(DummySettings):
     ai_research_anthropic_model = ""
     ai_research_gemini_model = ""
     ai_research_timeout_seconds = 8
+    ai_provider_failure_cooldown_seconds = 300
     ai_research_max_calls_per_day = 0
     ai_research_est_input_tokens = 15000
     ai_research_est_output_tokens = 2000
@@ -552,8 +553,10 @@ def test_settings_bounds_live_ai_provider_reliability_knobs():
     assert settings.supervisor_tick_timeout_seconds == 90
     assert settings.ai_research_openai_timeout_seconds == 60.0
     assert settings.ai_research_anthropic_timeout_seconds == 60.0
-    assert settings.ai_research_xai_timeout_seconds is None
+    assert settings.ai_research_xai_timeout_seconds == 60.0
     assert settings.ai_research_gemini_timeout_seconds is None
+    assert settings.ai_provider_failure_cooldown_seconds == 300
+    assert settings.supervisor_tick_timeout_seconds > settings.ai_research_xai_timeout_seconds
     assert settings.ai_research_anthropic_max_tokens == 2200
     priced = Settings(
         ALPACA_API_KEY="key",
@@ -590,6 +593,14 @@ def test_settings_bounds_live_ai_provider_reliability_knobs():
             TELEGRAM_BOT_TOKEN="token",
             RESUME_TOKEN="resume",
             AI_RESEARCH_OPENAI_TIMEOUT_SECONDS=61,
+        )
+    with pytest.raises(ValidationError, match="AI_PROVIDER_FAILURE_COOLDOWN_SECONDS"):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            AI_PROVIDER_FAILURE_COOLDOWN_SECONDS=3601,
         )
     with pytest.raises(ValidationError, match="AI_RESEARCH_ANTHROPIC_MAX_TOKENS"):
         Settings(
@@ -14879,6 +14890,200 @@ async def test_ai_cache_reuse_is_attributed_to_current_signal_and_context(monkey
         "source_memo_id": 4551,
         "source_signal_id": 4880,
     }
+
+
+@pytest.mark.asyncio
+async def test_ai_provider_failure_cache_uses_short_cooldown_and_preserves_category(monkeypatch):
+    class FakeAdapter:
+        paper = True
+
+    class ExplodingCommittee:
+        provider = "xai"
+        model_tag = "xai/grok-latest"
+
+        async def research(self, intent, *, signal_id=None):
+            raise AssertionError("provider must not be called inside failure cooldown")
+
+    captured = {}
+
+    async def fake_cached(**kwargs):
+        return {
+            "id": 5600,
+            "created_at": (datetime.now(UTC) - timedelta(seconds=60)).isoformat(),
+            "signal_id": 5900,
+            "verdict": "watch",
+            "confidence": None,
+            "validation_passed": False,
+            "memo": {
+                "committee": {
+                    "validation_errors": [
+                        "ai_research_provider_failed",
+                        "ai_research_provider_timeout",
+                    ]
+                },
+                "provider_failure": {
+                    "category": "timeout",
+                    "message": "xai request failed after 60s (timeout)",
+                    "timeout_seconds": 60,
+                },
+            },
+        }
+
+    async def fake_log_memo(**kwargs):
+        captured.update(kwargs)
+        return 5601
+
+    async def unexpected_count(**kwargs):
+        raise AssertionError("cooldown reuse must not touch paid-call counters")
+
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.real_research_providers",
+        lambda committee: ["xai"],
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol",
+        fake_cached,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.log_ai_research_memo",
+        fake_log_memo,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.count_ai_research_memos",
+        unexpected_count,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts",
+        unexpected_count,
+    )
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=object(),
+    )
+    supervisor.research_committee = ExplodingCommittee()
+
+    result = await supervisor._run_ai_research(
+        TradeIntent(symbol="RING", side="long", entry_price=12.0, confidence=0.8),
+        signal_id=5901,
+        decision_context_id=88,
+    )
+
+    assert result.reason == "ai_research_provider_failure_cooldown"
+    assert result.called_provider is False
+    assert captured["validation_passed"] is False
+    assert captured["memo"]["provider_failure"]["category"] == "timeout"
+    assert captured["memo"]["cache_reuse"]["kind"] == "provider_failure_cooldown"
+    assert captured["memo"]["cache_reuse"]["failure_category"] == "timeout"
+    assert captured["memo"]["cache_reuse"]["source_age_seconds"] < 300
+    rendered = _format_ai_decision_rows(
+        [
+            {
+                "created_at": datetime.now(UTC).isoformat(),
+                "symbol": "RING",
+                "provider": "xai",
+                "verdict": "watch",
+                "confidence": None,
+                "validation_passed": False,
+                "prompt_version": captured["prompt_version"],
+                "memo": captured["memo"],
+            }
+        ]
+    )
+    assert "Grok: Error (timeout) on RING" in rendered
+
+
+@pytest.mark.asyncio
+async def test_ai_provider_failure_cache_retries_after_cooldown(monkeypatch):
+    class RetrySettings(DummySupervisorSettings):
+        ai_research_max_calls_per_day = 72
+        ai_paid_prefilter_enabled = True
+
+    class FakeAdapter:
+        paper = True
+
+    class RecoveringCommittee:
+        provider = "xai"
+        model_tag = "xai/grok-latest"
+        include_edge_memory = False
+        prompt_version = SIMPLIFIED_PROMPT_VERSION
+
+        def __init__(self):
+            self.calls = 0
+
+        async def research(self, intent, *, signal_id=None):
+            self.calls += 1
+            return ResearchMemo(
+                symbol=intent.symbol,
+                provider="xai",
+                model_tag=self.model_tag,
+                prompt_version=self.prompt_version,
+                input_hash="fresh-response",
+                verdict="approve",
+                confidence=0.8,
+                used_only_provided_data=True,
+                validation_passed=True,
+                memo={"committee": {"symbol": intent.symbol, "verdict": "approve"}},
+            )
+
+    async def fake_cached(**kwargs):
+        return {
+            "id": 5602,
+            "created_at": (datetime.now(UTC) - timedelta(seconds=301)).isoformat(),
+            "signal_id": 5902,
+            "verdict": "watch",
+            "confidence": None,
+            "validation_passed": False,
+            "memo": {
+                "committee": {"validation_errors": ["ai_research_provider_timeout"]},
+                "provider_failure": {"category": "timeout"},
+            },
+        }
+
+    async def zero_count(**kwargs):
+        return 0
+
+    async def fake_log_memo(**kwargs):
+        return 5603
+
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol",
+        fake_cached,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.evaluate_paid_ai_prefilter",
+        lambda *args, **kwargs: SimpleNamespace(blocked=False, reasons=[], evidence={}),
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.count_ai_research_memos",
+        zero_count,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts",
+        zero_count,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.log_ai_research_memo",
+        fake_log_memo,
+    )
+    committee = RecoveringCommittee()
+    supervisor = TradingSupervisor(
+        settings=RetrySettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=object(),
+    )
+    supervisor.research_committee = committee
+
+    result = await supervisor._run_ai_research(
+        TradeIntent(symbol="RING", side="long", entry_price=12.0, confidence=0.8),
+        signal_id=5903,
+    )
+
+    assert committee.calls == 1
+    assert result.verdict == "approve"
+    assert result.called_provider is True
 
 
 @pytest.mark.asyncio
