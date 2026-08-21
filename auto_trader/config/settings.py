@@ -148,9 +148,9 @@ class Settings(BaseSettings):
         alias="AI_HIGH_EXPOSURE_UNANIMOUS_THRESHOLD_PCT",
     )
     ai_paid_prefilter_enabled: bool = Field(True, alias="AI_PAID_PREFILTER_ENABLED")
-    ai_paid_prefilter_min_rel_volume: float = Field(1.0, ge=0.0, alias="AI_PAID_PREFILTER_MIN_REL_VOLUME")
-    ai_paid_prefilter_strong_rel_volume: float = Field(2.5, ge=0.0, alias="AI_PAID_PREFILTER_STRONG_REL_VOLUME")
-    ai_paid_prefilter_high_buffer_pct: float = Field(0.002, ge=0.0, alias="AI_PAID_PREFILTER_HIGH_BUFFER_PCT")
+    ai_paid_prefilter_min_rel_volume: float = Field(0.8, ge=0.0, alias="AI_PAID_PREFILTER_MIN_REL_VOLUME")
+    ai_paid_prefilter_strong_rel_volume: float = Field(2.0, ge=0.0, alias="AI_PAID_PREFILTER_STRONG_REL_VOLUME")
+    ai_paid_prefilter_high_buffer_pct: float = Field(0.003, ge=0.0, alias="AI_PAID_PREFILTER_HIGH_BUFFER_PCT")
     ai_paid_prefilter_block_inverse_overlap: bool = Field(True, alias="AI_PAID_PREFILTER_BLOCK_INVERSE_OVERLAP")
     ai_research_est_input_tokens: int = Field(15000, ge=0, alias="AI_RESEARCH_EST_INPUT_TOKENS")
     ai_research_est_output_tokens: int = Field(2000, ge=0, alias="AI_RESEARCH_EST_OUTPUT_TOKENS")

@@ -16,6 +16,7 @@ import inspect
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from auto_trader.broker.alpaca_adapter import AlpacaAdapter
 from auto_trader.core.models import TradeIntent
@@ -32,6 +33,24 @@ from auto_trader.utils.logging import get_logger
 
 log = get_logger("auto_trader.intelligence.rules_fallback")
 
+NEW_YORK = ZoneInfo("America/New_York")
+REGULAR_SESSION_MINUTES = 390
+MAX_NORMALIZED_REL_VOLUME = 8.0
+# Approximate cumulative US-equity volume through the regular session. The
+# opening floor and operational cap prevent tiny early prints from exploding.
+EXPECTED_CUMULATIVE_VOLUME_CURVE: tuple[tuple[int, float], ...] = (
+    (0, 0.05),
+    (15, 0.12),
+    (30, 0.18),
+    (60, 0.28),
+    (120, 0.43),
+    (180, 0.56),
+    (240, 0.68),
+    (300, 0.80),
+    (360, 0.93),
+    (REGULAR_SESSION_MINUTES, 1.0),
+)
+
 
 @dataclass(frozen=True)
 class DiscoveryCandidate:
@@ -44,6 +63,19 @@ class DiscoveryCandidate:
     spread_pct: float | None
     rationale: str
     research_context: dict[str, Any] | None = None
+    raw_rel_volume: float | None = None
+    expected_volume_fraction: float = 1.0
+    volume_normalization_mode: str = "raw_fallback"
+    volume_source_timestamp: str | None = None
+
+
+@dataclass(frozen=True)
+class RelativeVolume:
+    raw: float
+    normalized: float
+    expected_fraction: float
+    mode: str
+    source_timestamp: str | None
 
 
 def _chunked(items: list[str], size: int) -> list[list[str]]:
@@ -83,9 +115,66 @@ def _parse_ts(value: Any) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+    except (TypeError, ValueError):
         return None
+
+
+def _latest_market_data_timestamp(snapshot: dict[str, Any]) -> datetime | None:
+    values = (
+        _bar(snapshot, "latestTrade").get("t"),
+        _bar(snapshot, "latestQuote").get("t"),
+        _bar(snapshot, "minuteBar").get("t"),
+        _bar(snapshot, "dailyBar").get("t"),
+    )
+    timestamps = [parsed for value in values if (parsed := _parse_ts(value)) is not None]
+    return max(timestamps) if timestamps else None
+
+
+def _expected_volume_fraction(session_minute: float) -> float:
+    bounded_minute = min(max(session_minute, 0.0), float(REGULAR_SESSION_MINUTES))
+    for (left_minute, left_fraction), (right_minute, right_fraction) in zip(
+        EXPECTED_CUMULATIVE_VOLUME_CURVE[:-1],
+        EXPECTED_CUMULATIVE_VOLUME_CURVE[1:],
+        strict=True,
+    ):
+        if bounded_minute <= right_minute:
+            width = right_minute - left_minute
+            progress = (bounded_minute - left_minute) / width if width else 0.0
+            return left_fraction + ((right_fraction - left_fraction) * progress)
+    return 1.0
+
+
+def _relative_volume(
+    volume: float,
+    previous_volume: float,
+    *,
+    source_timestamp: datetime | None,
+) -> RelativeVolume:
+    source = source_timestamp.isoformat() if source_timestamp is not None else None
+    if previous_volume <= 0:
+        return RelativeVolume(0.0, 0.0, 1.0, "missing_previous_volume", source)
+    raw = volume / previous_volume
+    if source_timestamp is None:
+        return RelativeVolume(raw, raw, 1.0, "raw_fallback", source)
+
+    local = source_timestamp.astimezone(NEW_YORK)
+    session_open = local.replace(hour=9, minute=30, second=0, microsecond=0)
+    session_close = local.replace(hour=16, minute=0, second=0, microsecond=0)
+    if local < session_open or local > session_close:
+        return RelativeVolume(raw, raw, 1.0, "outside_regular_session", source)
+
+    session_minute = (local - session_open).total_seconds() / 60.0
+    expected_fraction = _expected_volume_fraction(session_minute)
+    normalized = min(raw / expected_fraction, MAX_NORMALIZED_REL_VOLUME)
+    return RelativeVolume(
+        raw,
+        normalized,
+        expected_fraction,
+        "regular_session_curve_v1",
+        source,
+    )
 
 
 def _is_fresh(snapshot: dict[str, Any], max_age_minutes: int = 20) -> bool:
@@ -123,7 +212,12 @@ def _candidate_from_snapshot(
     dollar_volume = price * volume
     change_pct = (price - prev_close) / prev_close
     intraday_pct = ((price - open_price) / open_price) if open_price > 0 else 0.0
-    rel_volume = volume / prev_volume if prev_volume > 0 else 1.0
+    relative_volume = _relative_volume(
+        volume,
+        prev_volume,
+        source_timestamp=_latest_market_data_timestamp(snapshot),
+    )
+    rel_volume = relative_volume.normalized
 
     # Profile filters widen the paper experiment funnel without creating order authority.
     if not discovery_profile.min_price <= price <= discovery_profile.max_price:
@@ -145,7 +239,8 @@ def _candidate_from_snapshot(
 
     rationale = (
         f"Dynamic discovery: price=${price:.2f}, change={change_pct:.2%}, "
-        f"rel_vol={rel_volume:.2f}, dollar_vol=${dollar_volume:,.0f}"
+        f"rel_vol={rel_volume:.2f} (raw={relative_volume.raw:.2f}), "
+        f"dollar_vol=${dollar_volume:,.0f}"
     )
     return DiscoveryCandidate(
         symbol=symbol,
@@ -156,6 +251,10 @@ def _candidate_from_snapshot(
         change_pct=change_pct,
         spread_pct=spread,
         rationale=rationale,
+        raw_rel_volume=relative_volume.raw,
+        expected_volume_fraction=relative_volume.expected_fraction,
+        volume_normalization_mode=relative_volume.mode,
+        volume_source_timestamp=relative_volume.source_timestamp,
         research_context=build_alpaca_research_context(
             snapshot,
             price=price,
@@ -163,6 +262,10 @@ def _candidate_from_snapshot(
             rel_volume=rel_volume,
             spread_pct=spread,
             dollar_volume=dollar_volume,
+            raw_rel_volume=relative_volume.raw,
+            expected_volume_fraction=relative_volume.expected_fraction,
+            volume_normalization_mode=relative_volume.mode,
+            volume_source_timestamp=relative_volume.source_timestamp,
         ),
     )
 
@@ -174,6 +277,10 @@ def _alpaca_candidate_features(candidate: DiscoveryCandidate) -> dict[str, Any]:
         "score": candidate.score,
         "dollar_volume": candidate.dollar_volume,
         "rel_volume": candidate.rel_volume,
+        "raw_rel_volume": candidate.raw_rel_volume,
+        "expected_volume_fraction": candidate.expected_volume_fraction,
+        "volume_normalization_mode": candidate.volume_normalization_mode,
+        "volume_source_timestamp": candidate.volume_source_timestamp,
         "change_pct": candidate.change_pct,
         "spread_pct": candidate.spread_pct,
     }

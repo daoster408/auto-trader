@@ -8265,6 +8265,160 @@ def test_risky_discovery_profile_widens_candidate_filters():
     assert risky_candidate.symbol == "TEST"
 
 
+def test_relative_volume_normalizes_regular_session_without_amplifying_outside_hours():
+    raw_volume = 100_000
+    previous_volume = 1_000_000
+
+    premarket = rules_fallback._relative_volume(
+        raw_volume,
+        previous_volume,
+        source_timestamp=datetime(2026, 8, 21, 13, 0, tzinfo=UTC),
+    )
+    open_result = rules_fallback._relative_volume(
+        raw_volume,
+        previous_volume,
+        source_timestamp=datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+    first_fifteen = rules_fallback._relative_volume(
+        raw_volume,
+        previous_volume,
+        source_timestamp=datetime(2026, 8, 21, 13, 45, tzinfo=UTC),
+    )
+    midday = rules_fallback._relative_volume(
+        raw_volume,
+        previous_volume,
+        source_timestamp=datetime(2026, 8, 21, 16, 30, tzinfo=UTC),
+    )
+    close_result = rules_fallback._relative_volume(
+        raw_volume,
+        previous_volume,
+        source_timestamp=datetime(2026, 8, 21, 20, 0, tzinfo=UTC),
+    )
+    after_hours = rules_fallback._relative_volume(
+        raw_volume,
+        previous_volume,
+        source_timestamp=datetime(2026, 8, 21, 20, 1, tzinfo=UTC),
+    )
+    winter_open = rules_fallback._relative_volume(
+        raw_volume,
+        previous_volume,
+        source_timestamp=datetime(2026, 1, 15, 14, 30, tzinfo=UTC),
+    )
+
+    assert premarket.normalized == pytest.approx(0.1)
+    assert premarket.mode == "outside_regular_session"
+    assert open_result.expected_fraction == pytest.approx(0.05)
+    assert open_result.normalized == pytest.approx(2.0)
+    assert first_fifteen.expected_fraction == pytest.approx(0.12)
+    assert midday.expected_fraction == pytest.approx(0.56)
+    assert close_result.normalized == pytest.approx(0.1)
+    assert after_hours.normalized == pytest.approx(0.1)
+    assert winter_open.expected_fraction == pytest.approx(0.05)
+
+
+def test_relative_volume_caps_opening_amplification_and_labels_fallback():
+    capped = rules_fallback._relative_volume(
+        500_000,
+        1_000_000,
+        source_timestamp=datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+    fallback = rules_fallback._relative_volume(400_000, 1_000_000, source_timestamp=None)
+    missing_previous = rules_fallback._relative_volume(
+        400_000,
+        0,
+        source_timestamp=datetime(2026, 8, 21, 16, 30, tzinfo=UTC),
+    )
+
+    assert capped.raw == pytest.approx(0.5)
+    assert capped.normalized == pytest.approx(rules_fallback.MAX_NORMALIZED_REL_VOLUME)
+    assert fallback.normalized == pytest.approx(0.4)
+    assert fallback.expected_fraction == pytest.approx(1.0)
+    assert fallback.mode == "raw_fallback"
+    assert fallback.source_timestamp is None
+    assert missing_previous.normalized == 0.0
+    assert missing_previous.mode == "missing_previous_volume"
+
+
+def test_candidate_persists_time_normalized_relative_volume_provenance(monkeypatch):
+    monkeypatch.setattr(rules_fallback, "_is_fresh", lambda snapshot: True)
+    timestamp = "2026-08-21T16:00:00Z"  # Noon ET, 150 regular-session minutes elapsed.
+    snapshot = {
+        "latestTrade": {"p": 10.0, "t": timestamp},
+        "latestQuote": {"bp": 9.98, "ap": 10.02, "t": timestamp},
+        "minuteBar": {"c": 10.0, "t": timestamp},
+        "dailyBar": {"o": 9.9, "h": 10.1, "l": 9.8, "c": 10.0, "v": 120_000},
+        "prevDailyBar": {"c": 9.8, "v": 300_000},
+    }
+
+    candidate = rules_fallback._candidate_from_snapshot(
+        "TEST",
+        snapshot,
+        discovery_profile=get_risk_profile("aggressive", paper=True).discovery,
+    )
+
+    assert candidate is not None
+    assert candidate.raw_rel_volume == pytest.approx(0.4)
+    assert candidate.expected_volume_fraction == pytest.approx(0.495)
+    assert candidate.rel_volume == pytest.approx(0.4 / 0.495)
+    assert candidate.volume_normalization_mode == "regular_session_curve_v1"
+    assert candidate.volume_source_timestamp == "2026-08-21T16:00:00+00:00"
+    assert candidate.research_context["technical"]["raw_rel_volume"] == pytest.approx(0.4)
+    assert candidate.research_context["technical"]["rel_volume"] == pytest.approx(0.4 / 0.495)
+    features = rules_fallback._alpaca_candidate_features(candidate)
+    assert features["raw_rel_volume"] == pytest.approx(0.4)
+    assert features["volume_normalization_mode"] == "regular_session_curve_v1"
+
+
+def test_simplified_paid_prefilter_defaults_are_aggressive_and_overrides_win():
+    assert Settings.model_fields["ai_paid_prefilter_min_rel_volume"].default == 0.8
+    assert Settings.model_fields["ai_paid_prefilter_strong_rel_volume"].default == 2.0
+    assert Settings.model_fields["ai_paid_prefilter_high_buffer_pct"].default == 0.003
+
+    intent = TradeIntent(
+        symbol="TEST",
+        side="long",
+        entry_price=10.0,
+        features={
+            "research_context": {
+                "technical": {
+                    "rel_volume": 0.9,
+                    "raw_rel_volume": 0.4,
+                    "expected_volume_fraction": 0.45,
+                    "volume_normalization_mode": "regular_session_curve_v1",
+                    "volume_source_timestamp": "2026-08-21T16:00:00+00:00",
+                    "distance_from_high_pct": -0.02,
+                    "dollar_volume": 2_000_000,
+                }
+            }
+        },
+    )
+    defaults = SimpleNamespace(
+        simplified_runtime_enabled=True,
+        alpaca_paper=True,
+        risk_profile="aggressive",
+        ai_paid_prefilter_enabled=True,
+    )
+    overridden = SimpleNamespace(
+        simplified_runtime_enabled=True,
+        alpaca_paper=True,
+        risk_profile="aggressive",
+        ai_paid_prefilter_enabled=True,
+        ai_paid_prefilter_min_rel_volume=1.0,
+        ai_paid_prefilter_strong_rel_volume=2.5,
+        ai_paid_prefilter_high_buffer_pct=0.002,
+    )
+
+    default_result = evaluate_paid_ai_prefilter(intent, settings=defaults)
+    override_result = evaluate_paid_ai_prefilter(intent, settings=overridden)
+
+    assert default_result.blocked is False
+    assert default_result.evidence["min_rel_volume"] == 0.8
+    assert default_result.evidence["raw_rel_volume"] == 0.4
+    assert default_result.evidence["volume_normalization_mode"] == "regular_session_curve_v1"
+    assert override_result.reasons == ["low_relative_volume"]
+    assert override_result.evidence["min_rel_volume"] == 1.0
+
+
 @pytest.mark.asyncio
 async def test_entry_order_count_uses_persisted_orders():
     with tempfile.TemporaryDirectory() as tmp:

@@ -83,9 +83,9 @@ def evaluate_paid_ai_prefilter(
     profile_prefilter = profile.paid_ai_prefilter
     simplified_runtime = bool(getattr(settings, "simplified_runtime_enabled", False))
     if simplified_runtime:
-        min_rel_volume = float(getattr(settings, "ai_paid_prefilter_min_rel_volume", 1.0))
-        strong_rel_volume = float(getattr(settings, "ai_paid_prefilter_strong_rel_volume", 2.5))
-        high_buffer = abs(float(getattr(settings, "ai_paid_prefilter_high_buffer_pct", 0.002)))
+        min_rel_volume = float(getattr(settings, "ai_paid_prefilter_min_rel_volume", 0.8))
+        strong_rel_volume = float(getattr(settings, "ai_paid_prefilter_strong_rel_volume", 2.0))
+        high_buffer = abs(float(getattr(settings, "ai_paid_prefilter_high_buffer_pct", 0.003)))
         block_inverse_overlap = bool(getattr(settings, "ai_paid_prefilter_block_inverse_overlap", True))
         control_mode = "explicit"
     else:
@@ -138,6 +138,10 @@ def evaluate_paid_ai_prefilter(
         "enabled": True,
         "symbol": symbol,
         "rel_volume": rel_volume,
+        "raw_rel_volume": _float(technical.get("raw_rel_volume")),
+        "expected_volume_fraction": _float(technical.get("expected_volume_fraction")),
+        "volume_normalization_mode": technical.get("volume_normalization_mode"),
+        "volume_source_timestamp": technical.get("volume_source_timestamp"),
         "min_rel_volume": min_rel_volume,
         "strong_rel_volume": strong_rel_volume,
         "distance_from_high_pct": distance_from_high_pct,

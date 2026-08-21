@@ -70,6 +70,10 @@ def build_alpaca_research_context(
     rel_volume: float,
     spread_pct: float | None,
     dollar_volume: float,
+    raw_rel_volume: float | None = None,
+    expected_volume_fraction: float = 1.0,
+    volume_normalization_mode: str = "raw_fallback",
+    volume_source_timestamp: str | None = None,
 ) -> dict[str, Any]:
     """Compact Alpaca snapshot evidence for model-readable research context."""
     daily = _compact_bar(_bar(snapshot, "dailyBar"))
@@ -98,6 +102,10 @@ def build_alpaca_research_context(
             "intraday_pct": intraday_pct,
             "gap_pct": gap_pct,
             "rel_volume": rel_volume,
+            "raw_rel_volume": raw_rel_volume,
+            "expected_volume_fraction": expected_volume_fraction,
+            "volume_normalization_mode": volume_normalization_mode,
+            "volume_source_timestamp": volume_source_timestamp,
             "dollar_volume": dollar_volume,
             "spread_pct": spread_pct,
             "distance_from_high_pct": distance_from_high_pct,

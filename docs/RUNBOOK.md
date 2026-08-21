@@ -292,6 +292,8 @@ Before any paid provider call, the deterministic paid-AI prefilter can block obv
 AI_PAID_PREFILTER_ENABLED=false
 ```
 
+The simplified single-provider runtime uses aggressive deterministic prefilter defaults: minimum relative volume `0.8`, strong relative volume `2.0`, and near-high buffer `0.003`. During regular market hours, relative volume is normalized against a bounded cumulative session-volume curve using the candidate snapshot timestamp; ranking, prefiltering, AI context, and Edge tags all receive that same normalized value. The raw partial-day/full-prior-day ratio, expected session fraction, mode, and source timestamp are retained for audit. Outside regular hours or without a valid timestamp, the scanner uses the raw ratio without amplification. Normalized relative volume is capped at `8.0`, and the existing cumulative dollar-volume discovery floor still applies. These aggressive defaults do not alter RiskEngine sizing, exposure limits, max entries, exits, or order authority.
+
 Legacy risk profiles control how wide the currently implemented experiment funnel is. The simplified target will use explicit numeric settings instead:
 
 - `conservative`: current live-readiness posture; 5% early notional cap, strict discovery and paid-AI prefilter thresholds.
