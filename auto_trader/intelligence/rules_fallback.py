@@ -266,6 +266,7 @@ def _candidate_from_snapshot(
             expected_volume_fraction=relative_volume.expected_fraction,
             volume_normalization_mode=relative_volume.mode,
             volume_source_timestamp=relative_volume.source_timestamp,
+            liquidity_threshold_dollars=discovery_profile.min_dollar_volume,
         ),
     )
 

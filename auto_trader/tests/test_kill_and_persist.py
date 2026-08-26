@@ -4555,6 +4555,13 @@ def test_simplified_research_factory_uses_only_configured_provider_and_distinct_
     assert isinstance(committee, AnthropicResearchCommittee)
     assert committee.include_edge_memory is False
     assert committee.prompt_version == SIMPLIFIED_PROMPT_VERSION
+    assert SIMPLIFIED_PROMPT_VERSION == "ai_research_single/v2"
+    instructions = ai_committee.SIMPLIFIED_COMMITTEE_INSTRUCTIONS
+    assert "aggressive, dollar-outcome-first" in instructions
+    assert "ordinary uncertainty is not enough for watch" in instructions
+    assert "never an automatic veto" in instructions
+    assert "held across sessions" in instructions
+    assert "RiskEngine retains sizing and order authority" in instructions
 
 
 def test_simplified_research_packet_does_not_load_historical_memory(monkeypatch):
@@ -8364,9 +8371,51 @@ def test_candidate_persists_time_normalized_relative_volume_provenance(monkeypat
     assert candidate.volume_source_timestamp == "2026-08-21T16:00:00+00:00"
     assert candidate.research_context["technical"]["raw_rel_volume"] == pytest.approx(0.4)
     assert candidate.research_context["technical"]["rel_volume"] == pytest.approx(0.4 / 0.495)
+    assert candidate.research_context["technical"]["liquidity_threshold_dollars"] == 1_000_000
+    assert candidate.research_context["technical"]["liquidity_pass"] is True
     features = rules_fallback._alpaca_candidate_features(candidate)
     assert features["raw_rel_volume"] == pytest.approx(0.4)
     assert features["volume_normalization_mode"] == "regular_session_curve_v1"
+
+
+def test_candidate_research_liquidity_uses_resolved_discovery_threshold(monkeypatch):
+    monkeypatch.setattr(rules_fallback, "_is_fresh", lambda snapshot: True)
+    timestamp = "2026-08-21T16:00:00Z"
+
+    def snapshot(volume):
+        return {
+            "latestTrade": {"p": 10.0, "t": timestamp},
+            "latestQuote": {"bp": 9.98, "ap": 10.02, "t": timestamp},
+            "dailyBar": {"o": 9.9, "h": 10.1, "l": 9.8, "c": 10.0, "v": volume},
+            "prevDailyBar": {"c": 9.8, "v": 300_000},
+        }
+
+    profile = replace(get_risk_profile("aggressive", paper=True).discovery, min_dollar_volume=0.0)
+    passing = rules_fallback._candidate_from_snapshot("PASS", snapshot(120_000), discovery_profile=profile)
+    failing = rules_fallback._candidate_from_snapshot("FAIL", snapshot(80_000), discovery_profile=profile)
+
+    assert passing is not None
+    assert failing is not None
+    passing_context = rules_fallback.build_alpaca_research_context(
+        snapshot(120_000),
+        price=10.0,
+        change_pct=0.02,
+        rel_volume=1.0,
+        spread_pct=0.004,
+        dollar_volume=1_200_000,
+        liquidity_threshold_dollars=1_000_000,
+    )
+    failing_context = rules_fallback.build_alpaca_research_context(
+        snapshot(80_000),
+        price=10.0,
+        change_pct=0.02,
+        rel_volume=1.0,
+        spread_pct=0.004,
+        dollar_volume=800_000,
+        liquidity_threshold_dollars=1_000_000,
+    )
+    assert passing_context["technical"]["liquidity_pass"] is True
+    assert failing_context["technical"]["liquidity_pass"] is False
 
 
 def test_simplified_paid_prefilter_defaults_are_aggressive_and_overrides_win():
@@ -14418,6 +14467,181 @@ async def test_ai_entry_gate_cached_watch_tries_next_ranked_candidate(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_ai_entry_gate_one_real_attempt_per_tick_then_next_tick_continues(monkeypatch):
+    class GateSettings(DummySupervisorSettings):
+        auto_entry_enabled = True
+        ai_research_enabled = True
+        ai_entry_gate_enabled = True
+        ai_research_provider = "xai"
+        ai_research_xai_model = "grok-latest"
+        ai_research_max_calls_per_day = 72
+        xai_api_key = "xai-key"
+
+    class FakeAdapter:
+        paper = True
+
+        async def get_open_orders(self):
+            return []
+
+    class FakeOrderManager:
+        risk = ApprovingPreviewRisk()
+
+        def __init__(self):
+            self.calls = []
+
+        async def submit_trade_intent(self, intent, snapshot, signal_id=None, decision_context_id=None):
+            self.calls.append(intent.symbol)
+            return {"order": {"id": "second-tick-entry", "symbol": intent.symbol}}
+
+    class FakeCommittee:
+        provider = "xai"
+        model_tag = "xai/grok-latest"
+        prompt_version = SIMPLIFIED_PROMPT_VERSION
+
+    def features(score):
+        return {
+            "discovery": {"score": score, "rel_volume": 3.0, "change_pct": 0.04, "spread_pct": 0.003},
+            "research_context": {
+                "technical": {
+                    "rel_volume": 3.0,
+                    "change_pct": 0.04,
+                    "spread_pct": 0.003,
+                    "distance_from_high_pct": -0.08,
+                    "liquidity_pass": True,
+                },
+                "news": [{"headline": "verified catalyst"}],
+                "fundamental": {"name": "Test Co", "market_cap": 500_000_000},
+            },
+        }
+
+    cached_symbols = set()
+    researched = []
+    journal_entries = []
+    next_signal_id = iter([801, 802])
+
+    async def fake_signals(adapter, max_signals=1, **kwargs):
+        return [
+            TradeIntent(symbol="FIRST", side="long", entry_price=10.0, confidence=0.8, features=features(8.0)),
+            TradeIntent(symbol="SECOND", side="long", entry_price=11.0, confidence=0.8, features=features(7.0)),
+        ]
+
+    async def fake_cached_lookup(*, provider, symbol, **kwargs):
+        if provider == "xai" and symbol in cached_symbols:
+            return {
+                "symbol": symbol,
+                "provider": provider,
+                "model_tag": "xai/grok-latest",
+                "prompt_version": SIMPLIFIED_PROMPT_VERSION,
+                "verdict": "watch",
+                "validation_passed": True,
+            }
+        return None
+
+    async def fake_run_ai(self, intent, **kwargs):
+        researched.append(intent.symbol)
+        if intent.symbol == "FIRST":
+            cached_symbols.add("FIRST")
+            return AIResearchRunResult(
+                symbol="FIRST",
+                verdict="watch",
+                validation_passed=True,
+                reason="ai_research_watch",
+                called_provider=True,
+            )
+        return AIResearchRunResult(
+            symbol="SECOND",
+            verdict="approve",
+            validation_passed=True,
+            reason="ai_research_approve",
+            called_provider=True,
+        )
+
+    async def fake_journal(content):
+        journal_entries.append(content)
+
+    async def fake_runtime_value(key):
+        return None
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_bool", lambda key, default: asyncio.sleep(0, result=True))
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_runtime_config_value", fake_runtime_value)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_simple_rules_signals", fake_signals)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol", fake_cached_lookup)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.log_signal", lambda **kwargs: asyncio.sleep(0, result=next(next_signal_id)))
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.append_journal_entry", fake_journal)
+    monkeypatch.setattr(TradingSupervisor, "_run_ai_research", fake_run_ai)
+
+    manager = FakeOrderManager()
+    supervisor = TradingSupervisor(
+        settings=GateSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=FakeAdapter(),
+        order_manager=manager,
+    )
+    supervisor.research_committee = FakeCommittee()
+
+    first_tick = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=2,
+    )
+    second_tick = await supervisor._maybe_submit_entry(
+        account={"status": "CONNECTED", "account_status": "AccountStatus.ACTIVE", "equity": 100.0},
+        clock={"is_open": True},
+        positions=[],
+        today_new_entries=0,
+        max_new_positions_per_day=2,
+    )
+
+    assert first_tick["blocked"] is True
+    assert first_tick["slate_stop_reason"] == "ai_research_tick_attempt_limit"
+    assert "slate=ai_research_tick_attempt_limit" in journal_entries[0]
+    assert second_tick["order"]["symbol"] == "SECOND"
+    assert researched == ["FIRST", "SECOND"]
+    assert manager.calls == ["SECOND"]
+
+
+@pytest.mark.asyncio
+async def test_simplified_v2_cache_lookup_does_not_reuse_v1_decision(monkeypatch):
+    class FakeCommittee:
+        provider = "xai"
+        model_tag = "xai/grok-latest"
+        prompt_version = SIMPLIFIED_PROMPT_VERSION
+
+    lookups = []
+
+    async def fake_cached_lookup(**kwargs):
+        lookups.append(kwargs)
+        if "ai_research_single/v1" in kwargs.get("prompt_versions", ()):
+            return {"verdict": "watch", "validation_passed": True}
+        return None
+
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol",
+        fake_cached_lookup,
+    )
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=SimpleNamespace(paper=True),
+        order_manager=object(),
+    )
+    supervisor.research_committee = FakeCommittee()
+
+    result = await supervisor._same_day_candidate_ai_block(
+        "TEST",
+        ai_gate_enabled=True,
+        ai_research_enabled=True,
+        real_providers=["xai"],
+    )
+
+    assert result is None
+    assert lookups[0]["prompt_versions"] == (SIMPLIFIED_PROMPT_VERSION, "ai_research_failure/v0")
+    assert "ai_research_single/v1" not in lookups[0]["prompt_versions"]
+
+
+@pytest.mark.asyncio
 async def test_ai_entry_gate_triages_viable_slate_before_paid_ai(monkeypatch):
     class GateSettings(DummySupervisorSettings):
         auto_entry_enabled = True
@@ -15238,6 +15462,75 @@ async def test_ai_provider_failure_cache_retries_after_cooldown(monkeypatch):
     assert committee.calls == 1
     assert result.verdict == "approve"
     assert result.called_provider is True
+
+
+@pytest.mark.asyncio
+async def test_ai_provider_outer_cancellation_is_not_persisted_as_verdict(monkeypatch):
+    class CancellationSettings(DummySupervisorSettings):
+        ai_research_max_calls_per_day = 72
+        ai_paid_prefilter_enabled = True
+
+    started = asyncio.Event()
+
+    class SlowCommittee:
+        provider = "xai"
+        model_tag = "xai/grok-latest"
+        include_edge_memory = False
+        prompt_version = SIMPLIFIED_PROMPT_VERSION
+
+        async def research(self, intent, *, signal_id=None):
+            started.set()
+            await asyncio.sleep(60)
+            raise AssertionError("canceled provider call must not finish")
+
+    async def zero_count(**kwargs):
+        return 0
+
+    async def no_cached(**kwargs):
+        return None
+
+    async def unexpected_memo(**kwargs):
+        raise AssertionError("outer cancellation must not persist a fabricated verdict")
+
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.get_latest_ai_research_memo_for_symbol",
+        no_cached,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.evaluate_paid_ai_prefilter",
+        lambda *args, **kwargs: SimpleNamespace(blocked=False, reasons=[], evidence={}),
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.count_ai_research_memos",
+        zero_count,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.count_ai_research_chargeable_attempts",
+        zero_count,
+    )
+    monkeypatch.setattr(
+        "auto_trader.scheduler.trading_supervisor.log_ai_research_memo",
+        unexpected_memo,
+    )
+    supervisor = TradingSupervisor(
+        settings=CancellationSettings(),
+        state_machine=StateMachine(initial_state=SystemState.ACTIVE),
+        adapter=SimpleNamespace(paper=True),
+        order_manager=object(),
+    )
+    supervisor.research_committee = SlowCommittee()
+
+    task = asyncio.create_task(
+        supervisor._run_ai_research(
+            TradeIntent(symbol="SLOW", side="long", entry_price=10.0, confidence=0.8),
+            signal_id=900,
+        )
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio

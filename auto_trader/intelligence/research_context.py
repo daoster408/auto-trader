@@ -74,6 +74,7 @@ def build_alpaca_research_context(
     expected_volume_fraction: float = 1.0,
     volume_normalization_mode: str = "raw_fallback",
     volume_source_timestamp: str | None = None,
+    liquidity_threshold_dollars: float = 2_000_000.0,
 ) -> dict[str, Any]:
     """Compact Alpaca snapshot evidence for model-readable research context."""
     daily = _compact_bar(_bar(snapshot, "dailyBar"))
@@ -110,7 +111,8 @@ def build_alpaca_research_context(
             "spread_pct": spread_pct,
             "distance_from_high_pct": distance_from_high_pct,
             "distance_from_low_pct": distance_from_low_pct,
-            "liquidity_pass": dollar_volume >= 2_000_000,
+            "liquidity_threshold_dollars": liquidity_threshold_dollars,
+            "liquidity_pass": dollar_volume >= liquidity_threshold_dollars,
             "spread_pass": spread_pct is not None and spread_pct <= 0.006,
             "non_parabolic_pass": change_pct <= 0.12,
         },

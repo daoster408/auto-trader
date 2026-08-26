@@ -1823,6 +1823,7 @@ class TradingSupervisor:
                         intent,
                         signal_id=signal_id,
                         ai_result=ai_result,
+                        paid_attempt_stops_tick=ai_result.called_provider,
                     )
                     if _candidate_specific_ai_block(ai_result):
                         log.info(
@@ -1831,6 +1832,14 @@ class TradingSupervisor:
                             verdict=ai_result.verdict,
                             reason=ai_result.reason,
                         )
+                        if ai_result.called_provider:
+                            log.info(
+                                "ai_research_tick_attempt_limit",
+                                symbol=intent.symbol.upper(),
+                                verdict=ai_result.verdict,
+                                reason=ai_result.reason,
+                            )
+                            return last_blocked_result
                         continue
                     return last_blocked_result
             result = await self.order_manager.submit_trade_intent(
@@ -1868,12 +1877,14 @@ class TradingSupervisor:
         *,
         signal_id: int | None,
         ai_result: AIResearchRunResult,
+        paid_attempt_stops_tick: bool = False,
     ) -> dict[str, Any]:
         reason = f"AI entry gate blocked {intent.symbol.upper()}: {ai_result.reason}"
+        tick_audit = "; slate=ai_research_tick_attempt_limit" if paid_attempt_stops_tick else ""
         await append_journal_entry(
             content=(
                 f"{reason}; verdict={ai_result.verdict}; "
-                f"validation_passed={ai_result.validation_passed}; signal_id={signal_id}"
+                f"validation_passed={ai_result.validation_passed}; signal_id={signal_id}{tick_audit}"
             )
         )
         log.info(
@@ -1892,6 +1903,9 @@ class TradingSupervisor:
                 "validation_passed": ai_result.validation_passed,
                 "reason": ai_result.reason,
             },
+            "slate_stop_reason": (
+                "ai_research_tick_attempt_limit" if paid_attempt_stops_tick else None
+            ),
         }
 
     async def _same_day_candidate_ai_block(
@@ -2326,6 +2340,15 @@ class TradingSupervisor:
                 memo=memo,
                 called_provider=bool(real_providers),
             )
+        except asyncio.CancelledError:
+            log.warning(
+                "ai_research_cancelled",
+                symbol=intent.symbol.upper(),
+                provider=provider,
+                model_tag=model_tag,
+                prompt_version=_single_provider_prompt_version(self.research_committee),
+            )
+            raise
         except Exception as e:
             failure = provider_failure_metadata(e, provider=provider, member=self.research_committee)
             validation_errors = ["ai_research_provider_failed", f"ai_research_provider_{failure['category']}"]
@@ -2595,6 +2618,10 @@ class TradingSupervisor:
                 )
                 self._schedule_candidate_outcome_resolution(result.clock)
             except asyncio.TimeoutError:
+                log.warning(
+                    "supervisor_tick_timed_out",
+                    timeout_seconds=float(self.settings.supervisor_tick_timeout_seconds),
+                )
                 await self._notify_persisted_once("supervisor-timeout", "SUPERVISOR WARNING: tick timed out.")
             except Exception as e:
                 await self._notify_once("supervisor-failed", f"SUPERVISOR WARNING: tick failed: {e}")

@@ -26,7 +26,7 @@ from auto_trader.utils.logging import get_logger
 log = get_logger("auto_trader.intelligence.ai_committee")
 
 PROMPT_VERSION = "ai_research_committee/v3"
-SIMPLIFIED_PROMPT_VERSION = "ai_research_single/v1"
+SIMPLIFIED_PROMPT_VERSION = "ai_research_single/v2"
 AGGREGATE_PROMPT_VERSION = "ai_research_aggregate/v5"
 PATTERN_MEMORY_VERSION = "postmortem_edge_memory/v2"
 CANDIDATE_MEMORY_MATCH_VERSION = "candidate_memory_match/v3"
@@ -51,8 +51,16 @@ COMMITTEE_INSTRUCTIONS = (
     "Do not wrap the object in committee, assessment, analysis, result, or any other key."
 )
 SIMPLIFIED_COMMITTEE_INSTRUCTIONS = (
-    "You are the sole advisory research model for one trading candidate. Use only the provided JSON packet. "
-    "Do not invent market facts and do not recommend order size. No historical scoreboard or postmortem memory "
+    "You are the sole advisory research model for one aggressive, dollar-outcome-first trading candidate. "
+    "Use only the provided JSON packet, cite its concrete favorable and adverse evidence concisely, do not invent "
+    "market facts, and do not recommend order size. Approve when verified evidence supports a plausible favorable "
+    "setup and there is no concrete disqualifier. Reject when verified evidence shows a concrete adverse, "
+    "contradictory, stale, unusable, or untradeable setup. Use watch only when the supplied directional evidence "
+    "is genuinely contradictory or too unusable to choose; ordinary uncertainty is not enough for watch. Missing "
+    "optional macro, fundamental, or news lanes increase uncertainty but are never an automatic veto. Positions "
+    "may be held across sessions under deterministic exits, so late-session timing is not automatically "
+    "disqualifying. Aggressive means a lower uncertainty bar, not approval without favorable evidence. AI is "
+    "advisory only: RiskEngine retains sizing and order authority. No historical scoreboard or postmortem memory "
     "is provided; judge the current verified candidate packet directly. Return only valid JSON with exactly these "
     "top-level keys: symbol, verdict, confidence, used_only_provided_data, bull_case, bear_case, "
     "edge_memory_alignment, edge_memory_conflicts, edge_memory_action, judge_summary. Set edge_memory_action to "
