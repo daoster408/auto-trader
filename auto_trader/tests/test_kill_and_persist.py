@@ -7978,6 +7978,54 @@ def test_risk_engine_preview_does_not_consume_daily_counter():
     assert actual.risk_metrics["daily_new_after"] == 1
 
 
+def test_risk_engine_daily_counter_sync_is_monotonic_within_trading_day():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, DummySettings())
+
+    assert risk.sync_daily_counter(3, "2026-08-27") == 3
+    assert risk.sync_daily_counter(5, "2026-08-27") == 5
+    assert risk.sync_daily_counter(3, "2026-08-27") == 5
+
+    class SyncedSnapshot:
+        equity = 100.0
+        open_positions = []
+        today_new_entries = 3
+        max_new_positions_per_day = 10
+
+    preview = risk.evaluate(
+        TradeIntent(symbol="MSFT", side="long", entry_price=23.89),
+        SyncedSnapshot(),
+        consume_daily_counter=False,
+    )
+
+    assert preview.approved is True
+    assert risk._daily_new_positions == 5
+
+
+def test_risk_engine_daily_counter_sync_resets_from_durable_count_on_new_day():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, DummySettings())
+
+    assert risk.sync_daily_counter(12, "2026-08-27") == 12
+    assert risk.sync_daily_counter(0, "2026-08-28") == 0
+
+    decision = risk.evaluate(TradeIntent(symbol="MSFT", side="long", entry_price=23.89), DummySnapshot())
+
+    assert decision.approved is True
+
+
+def test_risk_engine_new_instance_restores_daily_counter_from_durable_count():
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, DummySettings())
+
+    assert risk.sync_daily_counter(1, "2026-08-28") == 1
+
+    decision = risk.evaluate(TradeIntent(symbol="MSFT", side="long", entry_price=23.89), DummySnapshot())
+
+    assert decision.approved is False
+    assert decision.reason == "Daily new position limit reached"
+
+
 def test_risk_engine_allows_100_pct_gross_exposure_capacity():
     class FullExposureSettings(DummySettings):
         max_gross_exposure_pct = 100.0
@@ -11220,6 +11268,151 @@ async def test_supervisor_exhausted_account_failure_blocks_entry_flow(monkeypatc
     assert entry_called is False
     assert result.entry_result is None
     assert result.errors == ["account unavailable: account transport unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_syncs_new_trading_day_before_entry_flow(monkeypatch):
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 100.0,
+                "buying_power": 100.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fake_count(start_utc_iso):
+        return 0
+
+    async def fake_profile(settings, *, paper):
+        return "aggressive"
+
+    async def fake_cap(settings, *, paper, risk_profile):
+        return 12
+
+    async def fake_account_halts(self, account):
+        return None
+
+    expected_day = datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, DummySettings())
+    risk.sync_daily_counter(12, "2026-08-27")
+    entry_called = False
+
+    async def assert_synced_before_entry(self, **kwargs):
+        nonlocal entry_called
+        entry_called = True
+        assert risk._daily_counter_day == expected_day
+        assert risk._daily_new_positions == 0
+        assert kwargs["today_new_entries"] == 0
+        return None
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fake_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor._runtime_risk_profile", fake_profile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor._runtime_entry_cap", fake_cap)
+    monkeypatch.setattr(TradingSupervisor, "_enforce_account_risk_halts", fake_account_halts)
+    monkeypatch.setattr(TradingSupervisor, "_maybe_submit_entry", assert_synced_before_entry)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=SimpleNamespace(risk=risk),
+    )
+
+    result = await supervisor.tick_once()
+
+    assert entry_called is True
+    assert result.errors == []
+
+
+@pytest.mark.asyncio
+async def test_supervisor_durable_count_failure_blocks_before_entry_flow(monkeypatch):
+    class FakeAdapter:
+        paper = True
+
+        async def get_account_snapshot(self):
+            return {
+                "status": "CONNECTED",
+                "account_status": "AccountStatus.ACTIVE",
+                "equity": 100.0,
+                "cash": 100.0,
+                "buying_power": 100.0,
+                "trading_blocked": False,
+                "account_blocked": False,
+            }
+
+        async def get_clock(self):
+            return {"is_open": True, "source": "alpaca"}
+
+        async def get_recent_orders(self, days=2):
+            return []
+
+        async def get_positions_snapshot(self, *, strict=False):
+            return []
+
+    async def fake_reconcile(orders):
+        return 0
+
+    async def fail_count(start_utc_iso):
+        raise RuntimeError("database unavailable")
+
+    async def fake_profile(settings, *, paper):
+        return "aggressive"
+
+    async def fake_cap(settings, *, paper, risk_profile):
+        return 12
+
+    async def fake_account_halts(self, account):
+        return None
+
+    entry_called = False
+
+    async def fail_if_entry_runs(self, **kwargs):
+        nonlocal entry_called
+        entry_called = True
+        raise AssertionError("entry flow must not run without a durable daily count")
+
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.reconcile_broker_orders", fake_reconcile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor.count_entry_orders_since", fail_count)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor._runtime_risk_profile", fake_profile)
+    monkeypatch.setattr("auto_trader.scheduler.trading_supervisor._runtime_entry_cap", fake_cap)
+    monkeypatch.setattr(TradingSupervisor, "_enforce_account_risk_halts", fake_account_halts)
+    monkeypatch.setattr(TradingSupervisor, "_maybe_submit_entry", fail_if_entry_runs)
+    patch_empty_pending_exit_state(monkeypatch)
+
+    sm = StateMachine(initial_state=SystemState.ACTIVE)
+    risk = RiskEngine(sm, DummySettings())
+    supervisor = TradingSupervisor(
+        settings=DummySupervisorSettings(),
+        state_machine=sm,
+        adapter=FakeAdapter(),
+        order_manager=SimpleNamespace(risk=risk),
+    )
+
+    result = await supervisor.tick_once()
+
+    assert entry_called is False
+    assert "durable entry count unavailable: database unavailable" in result.errors
 
 
 @pytest.mark.asyncio

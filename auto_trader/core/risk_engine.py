@@ -25,8 +25,37 @@ class RiskEngine:
     def __init__(self, state_machine: StateMachine, settings) -> None:
         self.sm = state_machine
         self.settings = settings
-        self._daily_new_positions = 0  # reset at EOD (later)
+        self._daily_new_positions = 0
+        self._daily_counter_day: str | None = None
         log.info("risk_engine_initialized", model_tag="risk/v0")
+
+    def sync_daily_counter(self, durable_count: int, trading_day: str) -> int:
+        """Synchronize process-local entry state to the durable local trading day."""
+        normalized_count = int(durable_count)
+        normalized_day = str(trading_day).strip()
+        if normalized_count < 0:
+            raise ValueError("durable daily entry count cannot be negative")
+        if not normalized_day:
+            raise ValueError("trading day is required for daily counter synchronization")
+
+        previous_day = self._daily_counter_day
+        previous_count = self._daily_new_positions
+        if previous_day != normalized_day:
+            self._daily_counter_day = normalized_day
+            self._daily_new_positions = normalized_count
+        else:
+            self._daily_new_positions = max(previous_count, normalized_count)
+
+        if previous_day != self._daily_counter_day or previous_count != self._daily_new_positions:
+            log.info(
+                "daily_risk_counter_synced",
+                previous_day=previous_day,
+                trading_day=self._daily_counter_day,
+                previous_count=previous_count,
+                durable_count=normalized_count,
+                effective_count=self._daily_new_positions,
+            )
+        return self._daily_new_positions
 
     def evaluate(self, intent: TradeIntent, snapshot, *, consume_daily_counter: bool = True) -> RiskDecision:
         """Core decision point. Returns approved/rejected with full audit trail."""
@@ -228,6 +257,7 @@ class RiskEngine:
 
     def reset_daily_counters(self) -> None:
         self._daily_new_positions = 0
+        self._daily_counter_day = None
         log.info("daily_risk_counters_reset")
 
     def _effective_max_gross_exposure_pct(self) -> float:

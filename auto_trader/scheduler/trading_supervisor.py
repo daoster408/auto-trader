@@ -2449,6 +2449,13 @@ class TradingSupervisor:
         try:
             local_day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
             today_new_entries = await count_entry_orders_since(local_day_start.astimezone(UTC).isoformat())
+            risk_engine = getattr(self.order_manager, "risk", None)
+            sync_daily_counter = getattr(risk_engine, "sync_daily_counter", None)
+            if callable(sync_daily_counter):
+                today_new_entries = sync_daily_counter(
+                    today_new_entries,
+                    local_day_start.date().isoformat(),
+                )
         except Exception as e:
             errors.append(f"durable entry count unavailable: {e}")
 
