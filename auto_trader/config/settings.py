@@ -60,7 +60,7 @@ class Settings(BaseSettings):
         alias="SYMBOL_REENTRY_COOLDOWN_MINUTES",
     )
     position_monitor_interval_seconds: int = Field(60, ge=15, alias="POSITION_MONITOR_INTERVAL_SECONDS")
-    supervisor_tick_timeout_seconds: int = Field(90, ge=1, alias="SUPERVISOR_TICK_TIMEOUT_SECONDS")
+    supervisor_tick_timeout_seconds: int = Field(150, ge=1, alias="SUPERVISOR_TICK_TIMEOUT_SECONDS")
     auto_entry_enabled: bool = Field(False, alias="AUTO_ENTRY_ENABLED")
     auto_exit_enabled: bool = Field(False, alias="AUTO_EXIT_ENABLED")
     position_max_loss_pct: float = Field(-5.0, alias="POSITION_MAX_LOSS_PCT")
@@ -101,6 +101,10 @@ class Settings(BaseSettings):
     ai_research_model: str = Field("", alias="AI_RESEARCH_MODEL")
     ai_research_openai_model: str = Field("", alias="AI_RESEARCH_OPENAI_MODEL")
     ai_research_xai_model: str = Field("", alias="AI_RESEARCH_XAI_MODEL")
+    ai_research_xai_reasoning_effort: Literal["low", "medium", "high", "xhigh"] = Field(
+        "low",
+        alias="AI_RESEARCH_XAI_REASONING_EFFORT",
+    )
     ai_research_anthropic_model: str = Field("", alias="AI_RESEARCH_ANTHROPIC_MODEL")
     ai_research_gemini_model: str = Field("", alias="AI_RESEARCH_GEMINI_MODEL")
     ai_research_timeout_seconds: float = Field(8.0, ge=1.0, le=60.0, alias="AI_RESEARCH_TIMEOUT_SECONDS")
@@ -298,6 +302,30 @@ class Settings(BaseSettings):
             raise ValueError("DISCOVERY_MIN_PRICE must be <= DISCOVERY_MAX_PRICE")
         if self.discovery_min_change_pct > self.discovery_max_change_pct:
             raise ValueError("DISCOVERY_MIN_CHANGE_PCT must be <= DISCOVERY_MAX_CHANGE_PCT")
+        configured_providers = {
+            self.ai_research_provider,
+            *(provider.strip().lower() for provider in self.ai_research_providers.split(",")),
+        }
+        provider_timeouts = {
+            "openai": self.ai_research_openai_timeout_seconds,
+            "xai": self.ai_research_xai_timeout_seconds,
+            "anthropic": self.ai_research_anthropic_timeout_seconds,
+            "gemini": self.ai_research_gemini_timeout_seconds,
+        }
+        active_timeouts = [
+            float(timeout)
+            for provider, timeout in provider_timeouts.items()
+            if provider in configured_providers and timeout is not None
+        ]
+        if (
+            self.ai_research_enabled
+            and active_timeouts
+            and self.supervisor_tick_timeout_seconds <= max(active_timeouts) + 30.0
+        ):
+            raise ValueError(
+                "SUPERVISOR_TICK_TIMEOUT_SECONDS must exceed configured AI provider timeout "
+                "by more than 30 seconds"
+            )
         return self
 
 

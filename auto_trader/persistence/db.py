@@ -955,12 +955,14 @@ async def get_latest_ai_research_memos(
     *,
     symbol: str | None = None,
     exclude_providers: tuple[str, ...] = (),
+    exclude_prompt_versions: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     """Return latest AI/shadow committee memos for audit/status surfaces."""
     return await _latest_ai_research_memos(
         limit=limit,
         symbol=symbol,
         exclude_providers=exclude_providers,
+        exclude_prompt_versions=exclude_prompt_versions,
         initialize=True,
     )
 
@@ -970,12 +972,14 @@ async def read_latest_ai_research_memos(
     *,
     symbol: str | None = None,
     exclude_providers: tuple[str, ...] = (),
+    exclude_prompt_versions: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     """Read latest AI research memos without creating or migrating the database."""
     return await _latest_ai_research_memos(
         limit=limit,
         symbol=symbol,
         exclude_providers=exclude_providers,
+        exclude_prompt_versions=exclude_prompt_versions,
         initialize=False,
     )
 
@@ -985,6 +989,7 @@ async def _latest_ai_research_memos(
     limit: int,
     symbol: str | None,
     exclude_providers: tuple[str, ...],
+    exclude_prompt_versions: tuple[str, ...],
     initialize: bool,
 ) -> list[dict[str, Any]]:
     async with _DB_LOCK:
@@ -1010,6 +1015,15 @@ async def _latest_ai_research_memos(
                     placeholders = ", ".join("?" for _ in clean_excluded)
                     conditions.append(f"lower(provider) NOT IN ({placeholders})")
                     params.extend(clean_excluded)
+                clean_excluded_versions = tuple(
+                    str(version or "").strip()
+                    for version in exclude_prompt_versions
+                    if str(version or "").strip()
+                )
+                if clean_excluded_versions:
+                    placeholders = ", ".join("?" for _ in clean_excluded_versions)
+                    conditions.append(f"prompt_version NOT IN ({placeholders})")
+                    params.extend(clean_excluded_versions)
                 where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
                 params.append(int(limit))
                 cur = await db.execute(

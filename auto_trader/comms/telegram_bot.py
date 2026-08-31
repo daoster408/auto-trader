@@ -52,6 +52,7 @@ EDGE_REPORT_TIMEOUT_SECONDS = 30.0
 MAX_AI_DECISION_ROWS = 12
 AI_DECISION_LOOKBACK_ROWS = 80
 AI_DECISION_EXCLUDED_PROVIDERS = ("multi", "shadow", "prefilter")
+AI_DECISION_EXCLUDED_PROMPT_VERSIONS = ("ai_research_cache_reuse/v0",)
 TELEGRAM_POLLING_RETRY_INITIAL_SECONDS = 2.0
 TELEGRAM_POLLING_RETRY_MAX_SECONDS = 60.0
 
@@ -177,6 +178,7 @@ def _format_ai_decision_rows(rows: list[dict[str, Any]], *, symbol: str | None =
         row
         for row in rows
         if str(row.get("provider") or "").lower() not in set(AI_DECISION_EXCLUDED_PROVIDERS)
+        and str(row.get("prompt_version") or "") not in set(AI_DECISION_EXCLUDED_PROMPT_VERSIONS)
         and (not clean_symbol or str(row.get("symbol") or "").upper() == clean_symbol)
     ][:MAX_AI_DECISION_ROWS]
     title = f"AI DECISIONS: {clean_symbol}" if clean_symbol else f"AI DECISIONS: latest {MAX_AI_DECISION_ROWS}"
@@ -818,6 +820,7 @@ class TelegramBot:
                     limit=AI_DECISION_LOOKBACK_ROWS,
                     symbol=symbol,
                     exclude_providers=AI_DECISION_EXCLUDED_PROVIDERS,
+                    exclude_prompt_versions=AI_DECISION_EXCLUDED_PROMPT_VERSIONS,
                 ),
                 timeout=4.0,
             )

@@ -791,8 +791,23 @@ class HTTPResearchCommittee:
                 "normalization": normalization,
                 "response_id": raw.get("id"),
                 "provider_usage": _provider_usage_metadata(raw),
+                "provider_metadata": self._provider_metadata(raw),
             },
         )
+
+    def _provider_metadata(self, response: dict[str, Any]) -> dict[str, Any]:
+        metadata = {
+            key: value
+            for key, value in {
+                "response_model": response.get("model"),
+                "service_tier": response.get("service_tier"),
+            }.items()
+            if isinstance(value, str) and value.strip()
+        }
+        reasoning_effort = getattr(self, "reasoning_effort", None)
+        if self.provider == "xai" and isinstance(reasoning_effort, str):
+            metadata["reasoning_effort"] = reasoning_effort
+        return metadata
 
     def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
@@ -867,9 +882,31 @@ class XAIResearchCommittee(HTTPResearchCommittee):
 
     provider = "xai"
 
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str,
+        reasoning_effort: str = "low",
+        timeout_seconds: float = 20.0,
+        include_edge_memory: bool = True,
+        prompt_version: str = PROMPT_VERSION,
+        instructions: str = COMMITTEE_INSTRUCTIONS,
+    ) -> None:
+        super().__init__(
+            api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            include_edge_memory=include_edge_memory,
+            prompt_version=prompt_version,
+            instructions=instructions,
+        )
+        self.reasoning_effort = reasoning_effort
+
     def _call_provider(self, packet: dict[str, Any]) -> dict[str, Any]:
         body = {
             "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
             "messages": [
                 {"role": "system", "content": self.instructions},
                 {
@@ -1399,6 +1436,7 @@ def _create_single_research_committee(
         return XAIResearchCommittee(
             _required_key(settings, "xai_api_key", provider),
             model=model,
+            reasoning_effort=str(getattr(settings, "ai_research_xai_reasoning_effort", "low")),
             timeout_seconds=timeout_seconds,
             include_edge_memory=include_edge_memory,
             prompt_version=prompt_version,

@@ -545,18 +545,20 @@ def test_settings_bounds_live_ai_provider_reliability_knobs():
         ALPACA_API_SECRET="secret",
         TELEGRAM_BOT_TOKEN="token",
         RESUME_TOKEN="resume",
-        SUPERVISOR_TICK_TIMEOUT_SECONDS=90,
+        SUPERVISOR_TICK_TIMEOUT_SECONDS=150,
+        AI_RESEARCH_PROVIDER="xai",
         AI_RESEARCH_OPENAI_TIMEOUT_SECONDS=60,
         AI_RESEARCH_ANTHROPIC_TIMEOUT_SECONDS=60,
     )
 
-    assert settings.supervisor_tick_timeout_seconds == 90
+    assert settings.supervisor_tick_timeout_seconds == 150
     assert settings.ai_research_openai_timeout_seconds == 60.0
     assert settings.ai_research_anthropic_timeout_seconds == 60.0
     assert settings.ai_research_xai_timeout_seconds == 60.0
+    assert settings.ai_research_xai_reasoning_effort == "low"
     assert settings.ai_research_gemini_timeout_seconds is None
     assert settings.ai_provider_failure_cooldown_seconds == 300
-    assert settings.supervisor_tick_timeout_seconds > settings.ai_research_xai_timeout_seconds
+    assert settings.supervisor_tick_timeout_seconds > settings.ai_research_xai_timeout_seconds + 30
     assert settings.ai_research_anthropic_max_tokens == 2200
     priced = Settings(
         ALPACA_API_KEY="key",
@@ -601,6 +603,24 @@ def test_settings_bounds_live_ai_provider_reliability_knobs():
             TELEGRAM_BOT_TOKEN="token",
             RESUME_TOKEN="resume",
             AI_PROVIDER_FAILURE_COOLDOWN_SECONDS=3601,
+        )
+    with pytest.raises(ValidationError, match="AI_RESEARCH_XAI_REASONING_EFFORT"):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            AI_RESEARCH_XAI_REASONING_EFFORT="unbounded",
+        )
+    with pytest.raises(ValidationError, match="SUPERVISOR_TICK_TIMEOUT_SECONDS"):
+        Settings(
+            ALPACA_API_KEY="key",
+            ALPACA_API_SECRET="secret",
+            TELEGRAM_BOT_TOKEN="token",
+            RESUME_TOKEN="resume",
+            AI_RESEARCH_PROVIDER="xai",
+            SUPERVISOR_TICK_TIMEOUT_SECONDS=90,
+            AI_RESEARCH_XAI_TIMEOUT_SECONDS=60,
         )
     with pytest.raises(ValidationError, match="AI_RESEARCH_ANTHROPIC_MAX_TOKENS"):
         Settings(
@@ -1634,6 +1654,52 @@ async def test_latest_ai_research_memos_excludes_prefilter_crowding_provider_vie
         assert len(memos) == 1
         assert memos[0]["provider"] == "xai"
         assert memos[0]["memo"]["summary"] == "provider-target"
+
+
+@pytest.mark.asyncio
+async def test_latest_ai_research_memos_excludes_cache_reuse_before_limit():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "ai_research_cache_crowding.db"
+        configure_db_path(db_path)
+        await init_db()
+
+        await log_ai_research_memo(
+            signal_id=1,
+            symbol="CPB",
+            provider="xai",
+            model_tag="xai/grok-latest",
+            prompt_version="ai_research_failure/v0",
+            input_hash="provider-timeout",
+            verdict="watch",
+            confidence=None,
+            used_only_provided_data=True,
+            validation_passed=False,
+            memo={"error_type": "timeout"},
+        )
+        for index in range(85):
+            await log_ai_research_memo(
+                signal_id=100 + index,
+                symbol="CPB",
+                provider="xai",
+                model_tag="xai/grok-latest",
+                prompt_version="ai_research_cache_reuse/v0",
+                input_hash=f"cache-reuse-{index}",
+                verdict="watch",
+                confidence=None,
+                used_only_provided_data=True,
+                validation_passed=False,
+                memo={"error_type": "timeout"},
+            )
+
+        memos = await get_latest_ai_research_memos(
+            limit=12,
+            symbol="cpb",
+            exclude_prompt_versions=("ai_research_cache_reuse/v0",),
+        )
+
+        assert len(memos) == 1
+        assert memos[0]["prompt_version"] == "ai_research_failure/v0"
+        assert memos[0]["memo"]["error_type"] == "timeout"
 
 
 @pytest.mark.asyncio
@@ -5059,6 +5125,32 @@ def test_real_provider_extractors_parse_structured_json():
     assert gemini._extract_output({"candidates": [{"content": {"parts": [{"text": text}]}}]}) == payload
 
 
+def test_xai_request_sets_explicit_low_reasoning_effort_only_for_xai():
+    xai_body = {}
+    xai = XAIResearchCommittee("key", model="grok-latest")
+
+    def fake_xai_post(url, body, headers):
+        xai_body.update(body)
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+    xai._post_json = fake_xai_post
+    xai._call_provider({"candidate": {"symbol": "POET"}})
+
+    assert xai_body["reasoning_effort"] == "low"
+
+    anthropic_body = {}
+    anthropic = AnthropicResearchCommittee("key", model="claude-opus-4-8")
+
+    def fake_anthropic_post(url, body, headers):
+        anthropic_body.update(body)
+        return {"content": []}
+
+    anthropic._post_json = fake_anthropic_post
+    anthropic._call_provider({"candidate": {"symbol": "POET"}})
+
+    assert "reasoning_effort" not in anthropic_body
+
+
 def _opus_nested_committee_output(**committee_overrides):
     committee = {
         "advisory_note": (
@@ -5319,6 +5411,8 @@ async def test_real_provider_research_stores_bounded_usage_metadata():
     def fake_call(packet):
         return {
             "id": "resp_123",
+            "model": "grok-4.6-20260821",
+            "service_tier": "default",
             "choices": [{"message": {"content": json.dumps(payload)}}],
             "usage": {"prompt_tokens": 101, "completion_tokens": 202, "total_tokens": 303},
         }
@@ -5331,6 +5425,11 @@ async def test_real_provider_research_stores_bounded_usage_metadata():
         "input_tokens": 101,
         "output_tokens": 202,
         "total_tokens": 303,
+    }
+    assert memo.memo["provider_metadata"] == {
+        "response_model": "grok-4.6-20260821",
+        "service_tier": "default",
+        "reasoning_effort": "low",
     }
 
 
@@ -10204,10 +10303,13 @@ async def test_telegram_ai_handler_returns_latest_decisions_without_external_cal
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {}
 
-    async def fake_latest_memos(*, limit, symbol=None, exclude_providers=()):
+    async def fake_latest_memos(
+        *, limit, symbol=None, exclude_providers=(), exclude_prompt_versions=()
+    ):
         called["limit"] = limit
         called["symbol"] = symbol
         called["exclude_providers"] = exclude_providers
+        called["exclude_prompt_versions"] = exclude_prompt_versions
         return [
             {
                 "created_at": datetime.now(UTC).isoformat(),
@@ -10234,7 +10336,12 @@ async def test_telegram_ai_handler_returns_latest_decisions_without_external_cal
 
     await bot._ai_handler(update, FakeTelegramContext())
 
-    assert called == {"limit": 80, "symbol": None, "exclude_providers": ("multi", "shadow", "prefilter")}
+    assert called == {
+        "limit": 80,
+        "symbol": None,
+        "exclude_providers": ("multi", "shadow", "prefilter"),
+        "exclude_prompt_versions": ("ai_research_cache_reuse/v0",),
+    }
     assert len(update.message.replies) == 1
     assert "AI DECISIONS: latest 12" in update.message.replies[0]
     assert "Grok: Buy on JGRO" in update.message.replies[0]
@@ -10244,7 +10351,9 @@ async def test_telegram_ai_handler_returns_latest_decisions_without_external_cal
 async def test_telegram_ai_handler_labels_historical_rows_when_paused(monkeypatch):
     sm = StateMachine(initial_state=SystemState.PAUSED)
 
-    async def fake_latest_memos(*, limit, symbol=None, exclude_providers=()):
+    async def fake_latest_memos(
+        *, limit, symbol=None, exclude_providers=(), exclude_prompt_versions=()
+    ):
         return [
             {
                 "created_at": (datetime.now(UTC) - timedelta(days=2)).isoformat(),
@@ -10280,10 +10389,13 @@ async def test_telegram_ai_handler_labels_historical_rows_when_paused(monkeypatc
 async def test_telegram_ai_handler_filters_symbol(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
 
-    async def fake_latest_memos(*, limit, symbol=None, exclude_providers=()):
+    async def fake_latest_memos(
+        *, limit, symbol=None, exclude_providers=(), exclude_prompt_versions=()
+    ):
         assert limit == 80
         assert symbol == "TSLA"
         assert exclude_providers == ("multi", "shadow", "prefilter")
+        assert exclude_prompt_versions == ("ai_research_cache_reuse/v0",)
         return [
             {
                 "created_at": datetime.now(UTC).isoformat(),
@@ -10330,7 +10442,9 @@ async def test_telegram_unauthorized_ai_does_not_read_memos(monkeypatch):
     sm = StateMachine(initial_state=SystemState.ACTIVE)
     called = {"memos": 0}
 
-    async def fake_latest_memos(*, limit, symbol=None, exclude_providers=()):
+    async def fake_latest_memos(
+        *, limit, symbol=None, exclude_providers=(), exclude_prompt_versions=()
+    ):
         called["memos"] += 1
         return []
 
@@ -15562,7 +15676,7 @@ async def test_ai_provider_failure_cache_uses_short_cooldown_and_preserves_categ
             }
         ]
     )
-    assert "Grok: Error (timeout) on RING" in rendered
+    assert rendered == "AI DECISIONS: latest 12\nNo recent provider decisions found."
 
 
 @pytest.mark.asyncio
