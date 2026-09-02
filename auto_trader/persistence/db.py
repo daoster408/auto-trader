@@ -41,6 +41,7 @@ CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = (
     "ai_research_committee/v2",
     "ai_research_committee/v3",
     "ai_research_single/v1",
+    "ai_research_single/v2",
     "ai_research_failure/v0",
 )
 CHARGEABLE_AI_POSTMORTEM_PROMPT_VERSIONS = (
@@ -51,7 +52,10 @@ CHARGEABLE_AI_POSTMORTEM_ESCALATION_PROMPT_VERSIONS = (
     "ai_postmortem_escalation/v0",
     "ai_postmortem_escalation_failure/v0",
 )
-TRACKED_AI_OUTCOME_PROMPT_VERSIONS = ("ai_research_single/v1",)
+TRACKED_AI_OUTCOME_PROMPT_VERSIONS = (
+    "ai_research_single/v1",
+    "ai_research_single/v2",
+)
 TRACKED_AI_OUTCOME_VERDICTS = {"approve", "watch", "reject"}
 TRACKED_AI_OUTCOME_EXCLUDED_PROVIDERS = {"multi", "prefilter", "shadow"}
 AI_OUTCOME_COMPARISON_NOTIONAL = 30.0

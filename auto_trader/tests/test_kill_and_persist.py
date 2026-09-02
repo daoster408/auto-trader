@@ -1812,6 +1812,7 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
             ("anthropic", "ai_research_committee/v2", "paid1-v2"),
             ("anthropic", "ai_research_committee/v3", "paid1-v3"),
             ("anthropic", "ai_research_single/v1", "paid1-single-v1"),
+            ("anthropic", "ai_research_single/v2", "paid1-single-v2"),
             ("anthropic", "ai_research_failure/v0", "paid2"),
             ("shadow", "ai_research_committee/v1", "free1"),
             ("multi", "ai_research_failure/v0", "aggregate1"),
@@ -1834,16 +1835,17 @@ async def test_ai_research_chargeable_count_excludes_budget_and_shadow_rows():
                     "ai_research_committee/v2",
                     "ai_research_committee/v3",
                     "ai_research_single/v1",
+                    "ai_research_single/v2",
                 },
                 memo={"committee": {"judge_summary": "audit"}},
             )
 
-        assert await count_ai_research_memos(provider="anthropic", today_utc=True) == 6
-        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 5
+        assert await count_ai_research_memos(provider="anthropic", today_utc=True) == 7
+        assert await count_ai_research_chargeable_attempts(provider="anthropic", today_utc=True) == 6
         assert await count_ai_research_chargeable_attempts(provider="openai", today_utc=True) == 1
         assert await count_ai_research_chargeable_attempts(provider="shadow", today_utc=True) == 0
         assert await count_ai_research_chargeable_attempts(provider="multi", today_utc=True) == 0
-        assert await count_ai_research_chargeable_attempts(today_utc=True) == 6
+        assert await count_ai_research_chargeable_attempts(today_utc=True) == 7
 
 
 @pytest.mark.asyncio

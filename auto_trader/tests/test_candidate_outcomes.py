@@ -145,7 +145,14 @@ async def test_edge_fetch_bounds_mixed_timestamps_and_keeps_old_trade_metadata(t
 
 
 @pytest.mark.asyncio
-async def test_valid_single_provider_memo_registers_once_per_symbol_session(tmp_path):
+@pytest.mark.parametrize(
+    "prompt_version",
+    ("ai_research_single/v1", "ai_research_single/v2"),
+)
+async def test_valid_single_provider_memo_registers_once_per_symbol_session(
+    tmp_path,
+    prompt_version,
+):
     db_path = tmp_path / "outcomes.db"
     configure_db_path(db_path)
     await init_db()
@@ -156,7 +163,7 @@ async def test_valid_single_provider_memo_registers_once_per_symbol_session(tmp_
             symbol="XYZ",
             provider="xai",
             model_tag="grok-latest",
-            prompt_version="ai_research_single/v1",
+            prompt_version=prompt_version,
             input_hash=digest,
             verdict="approve",
             confidence=0.8,
@@ -219,7 +226,7 @@ async def test_schema_upgrade_backfills_existing_valid_single_provider_memos(tmp
                 signal_id, symbol, provider, model_tag, prompt_version, input_hash,
                 verdict, confidence, used_only_provided_data, validation_passed, memo_json
             )
-            VALUES (1, 'OLD', 'xai', 'grok-latest', 'ai_research_single/v1',
+            VALUES (1, 'OLD', 'xai', 'grok-latest', 'ai_research_single/v2',
                     'old-hash', 'reject', 0.7, 1, 1, ?)
             """,
             (json.dumps(_memo()),),
