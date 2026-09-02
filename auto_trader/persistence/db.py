@@ -32,6 +32,7 @@ _DB_LOCK = asyncio.Lock()  # single writer guarantee (simple & cheap for v1)
 _OUTCOME_BACKFILL_COMPLETE = False
 _EXECUTION_MODE_BACKFILL_COMPLETE = False
 _LEGACY_CONTEXT_BACKFILL_COMPLETE = False
+_ORDER_CONTEXT_REPAIR_COMPLETE = False
 LEGACY_RUNTIME_SESSION_ID = "legacy-supervisor-entry"
 LEGACY_DECISION_CONTEXT_KEY = "legacy-supervisor-entry"
 CHARGEABLE_AI_RESEARCH_PROMPT_VERSIONS = (
@@ -223,11 +224,12 @@ async def _pending_exit_reason_for_order(
 def configure_db_path(path: str | Path) -> None:
     """Called at startup from settings so DB location is configurable."""
     global _DB_PATH, _OUTCOME_BACKFILL_COMPLETE, _EXECUTION_MODE_BACKFILL_COMPLETE
-    global _LEGACY_CONTEXT_BACKFILL_COMPLETE
+    global _LEGACY_CONTEXT_BACKFILL_COMPLETE, _ORDER_CONTEXT_REPAIR_COMPLETE
     _DB_PATH = Path(path).expanduser().resolve()
     _OUTCOME_BACKFILL_COMPLETE = False
     _EXECUTION_MODE_BACKFILL_COMPLETE = False
     _LEGACY_CONTEXT_BACKFILL_COMPLETE = False
+    _ORDER_CONTEXT_REPAIR_COMPLETE = False
 
 
 def get_configured_db_path() -> Path:
@@ -270,6 +272,7 @@ async def init_db() -> None:
             )
         await _backfill_order_execution_modes(db)
         await _backfill_legacy_decision_context(db)
+        await _repair_reconciled_order_contexts(db)
         await _backfill_ai_candidate_outcomes(db)
         await db.commit()
     log.info("db_initialized", path=str(_DB_PATH), size_kb=round(_DB_PATH.stat().st_size / 1024, 1) if _DB_PATH.exists() else 0)
@@ -429,6 +432,88 @@ async def _backfill_legacy_decision_context(db: aiosqlite.Connection) -> None:
         **attached,
     )
     _LEGACY_CONTEXT_BACKFILL_COMPLETE = True
+
+
+async def _repair_reconciled_order_contexts(db: aiosqlite.Connection) -> None:
+    """Restore entry provenance only when its RiskEngine link proves the context."""
+    global _ORDER_CONTEXT_REPAIR_COMPLETE
+    if _ORDER_CONTEXT_REPAIR_COMPLETE:
+        return
+    update = await db.execute(
+        """
+        UPDATE orders
+        SET decision_context_id = (
+            SELECT risk.decision_context_id
+            FROM risk_decisions AS risk
+            JOIN decision_contexts AS target
+              ON target.id = risk.decision_context_id
+            WHERE risk.id = orders.risk_decision_id
+              AND target.decision_source IN (
+                    'supervisor_entry',
+                    'legacy_supervisor_entry'
+              )
+        )
+        WHERE lower(side) IN ('buy', 'long')
+          AND risk_decision_id IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM decision_contexts AS current
+              WHERE current.id = orders.decision_context_id
+                AND current.decision_source = 'broker_reconciliation'
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM risk_decisions AS risk
+              JOIN decision_contexts AS target
+                ON target.id = risk.decision_context_id
+              WHERE risk.id = orders.risk_decision_id
+                AND target.decision_source IN (
+                      'supervisor_entry',
+                      'legacy_supervisor_entry'
+                )
+          )
+        """
+    )
+    repaired = max(0, int(update.rowcount or 0))
+    log.warning("order_context_repair_complete", order_contexts_repaired=repaired)
+    _ORDER_CONTEXT_REPAIR_COMPLETE = True
+
+
+async def _decision_context_source(
+    db: aiosqlite.Connection,
+    context_id: int | None,
+) -> str | None:
+    if context_id is None:
+        return None
+    cur = await db.execute(
+        "SELECT decision_source FROM decision_contexts WHERE id = ?",
+        (context_id,),
+    )
+    row = await cur.fetchone()
+    return str(row[0]) if row is not None else None
+
+
+async def _resolved_order_context_id(
+    db: aiosqlite.Connection,
+    *,
+    existing_context_id: int | None,
+    incoming_context_id: int | None,
+) -> int | None:
+    """Preserve order provenance, allowing only a proven admin-to-supervisor upgrade."""
+    if existing_context_id is None:
+        return incoming_context_id
+    if incoming_context_id is None or incoming_context_id == existing_context_id:
+        return existing_context_id
+    existing_source = await _decision_context_source(db, existing_context_id)
+    incoming_source = await _decision_context_source(db, incoming_context_id)
+    supervisor_sources = {
+        "supervisor_entry",
+        "legacy_supervisor_entry",
+        "supervisor_exit",
+    }
+    if existing_source == "broker_reconciliation" and incoming_source in supervisor_sources:
+        return incoming_context_id
+    return existing_context_id
 
 
 async def _offline_decision_context(
@@ -1404,6 +1489,26 @@ async def upsert_order_record(
             await init_db()
             db = await _get_conn()
             try:
+                existing_cur = await db.execute(
+                    """
+                    SELECT execution_mode, decision_context_id
+                    FROM orders
+                    WHERE client_order_id = ?
+                    """,
+                    (client_order_id,),
+                )
+                existing_row = await existing_cur.fetchone()
+                existing_mode = str(existing_row["execution_mode"]) if existing_row else "unknown"
+                existing_context_id = (
+                    int(existing_row["decision_context_id"])
+                    if existing_row and existing_row["decision_context_id"] is not None
+                    else None
+                )
+                decision_context_id = await _resolved_order_context_id(
+                    db,
+                    existing_context_id=existing_context_id,
+                    incoming_context_id=decision_context_id,
+                )
                 if decision_context_id is None:
                     decision_context_id = await _offline_decision_context(
                         db,
@@ -1412,12 +1517,6 @@ async def upsert_order_record(
                         model_tag="order",
                         prompt_version="order_persistence",
                     )
-                existing_cur = await db.execute(
-                    "SELECT execution_mode FROM orders WHERE client_order_id = ?",
-                    (client_order_id,),
-                )
-                existing_row = await existing_cur.fetchone()
-                existing_mode = str(existing_row["execution_mode"]) if existing_row else "unknown"
                 if (
                     existing_mode in {"paper", "live"}
                     and execution_mode in {"paper", "live"}
@@ -1463,10 +1562,7 @@ async def upsert_order_record(
                         submitted_at=COALESCE(excluded.submitted_at, orders.submitted_at),
                         filled_at=COALESCE(excluded.filled_at, orders.filled_at),
                         risk_decision_id=COALESCE(excluded.risk_decision_id, orders.risk_decision_id),
-                        decision_context_id=COALESCE(
-                            excluded.decision_context_id,
-                            orders.decision_context_id
-                        ),
+                        decision_context_id=excluded.decision_context_id,
                         execution_mode=CASE
                             WHEN excluded.execution_mode = 'unknown' THEN orders.execution_mode
                             ELSE excluded.execution_mode

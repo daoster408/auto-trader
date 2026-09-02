@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from auto_trader.persistence.db import (
     log_ai_research_memo,
     log_risk_decision,
     log_signal,
+    reconcile_broker_orders,
     upsert_order_record,
 )
 from auto_trader.persistence.provenance import (
@@ -232,6 +234,192 @@ async def test_captured_context_links_trading_records_and_preserves_gate_source(
         ).fetchone()
     assert references == [context_id] * 4
     assert context == ("supervisor_entry", 0, 1, "runtime_override", "paper")
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_preserves_captured_order_context(tmp_path: Path):
+    db_path = tmp_path / "reconcile_context.db"
+    configure_db_path(db_path)
+    await init_db()
+    settings = ProvenanceSettings()
+    session = await start_runtime_provenance(
+        settings,
+        process_role="test_supervisor",
+        execution_mode="paper",
+    )
+    assert session is not None
+    snapshot = redacted_config_snapshot(settings)
+    context_id = await create_decision_context(
+        runtime_session_id=session.session_id,
+        decision_source="supervisor_entry",
+        ai_entry_gate_enabled=True,
+        ai_entry_gate_source="env",
+        ai_research_enabled=True,
+        simplified_runtime_enabled=True,
+        execution_mode="paper",
+        provider="xai",
+        model_tag="xai/grok-latest",
+        prompt_version="ai_research_single/v2",
+        risk_profile="aggressive",
+        config_hash=config_fingerprint(snapshot),
+        config_snapshot=snapshot,
+    )
+    assert context_id is not None
+    order = {
+        "id": "broker-reconcile",
+        "client_order_id": "captured-order",
+        "symbol": "KEEP",
+        "side": "buy",
+        "qty": 1,
+        "filled_qty": 1,
+        "avg_fill_price": 20,
+        "status": "filled",
+        "paper": True,
+    }
+    assert await upsert_order_record(order, decision_context_id=context_id)
+
+    assert await reconcile_broker_orders([order]) == 1
+
+    with sqlite3.connect(db_path) as connection:
+        stored_context = connection.execute(
+            "SELECT decision_context_id FROM orders WHERE client_order_id = 'captured-order'"
+        ).fetchone()[0]
+        admin_contexts = connection.execute(
+            "SELECT COUNT(*) FROM decision_contexts WHERE decision_source = 'broker_reconciliation'"
+        ).fetchone()[0]
+    assert stored_context == context_id
+    assert admin_contexts == 0
+
+    placeholder = {**order, "id": "placeholder-broker", "client_order_id": "placeholder"}
+    assert await upsert_order_record(
+        placeholder,
+        decision_source="broker_reconciliation",
+    )
+    assert await upsert_order_record(placeholder, decision_context_id=context_id)
+    with sqlite3.connect(db_path) as connection:
+        upgraded_context = connection.execute(
+            "SELECT decision_context_id FROM orders WHERE client_order_id = 'placeholder'"
+        ).fetchone()[0]
+    assert upgraded_context == context_id
+
+
+@pytest.mark.asyncio
+async def test_startup_repairs_only_proven_entry_context_for_edge(tmp_path: Path):
+    db_path = tmp_path / "repair_context.db"
+    configure_db_path(db_path)
+    await init_db()
+    settings = ProvenanceSettings()
+    session = await start_runtime_provenance(
+        settings,
+        process_role="test_supervisor",
+        execution_mode="paper",
+    )
+    assert session is not None
+    snapshot = redacted_config_snapshot(settings)
+    supervisor_context_id = await create_decision_context(
+        runtime_session_id=session.session_id,
+        decision_source="supervisor_entry",
+        ai_entry_gate_enabled=True,
+        ai_entry_gate_source="env",
+        ai_research_enabled=True,
+        simplified_runtime_enabled=True,
+        execution_mode="paper",
+        provider="xai",
+        model_tag="xai/grok-latest",
+        prompt_version="ai_research_single/v2",
+        risk_profile="aggressive",
+        config_hash=config_fingerprint(snapshot),
+        config_snapshot=snapshot,
+    )
+    assert supervisor_context_id is not None
+    signal_id = await log_signal(
+        symbol="REPAIR",
+        thesis="repair test",
+        confidence=0.8,
+        source="rules",
+        decision_context_id=supervisor_context_id,
+    )
+    risk_id = await log_risk_decision(
+        signal_id=signal_id,
+        approved=True,
+        reason="approved",
+        symbol="REPAIR",
+        side="long",
+        equity_snapshot=400,
+        decision_context_id=supervisor_context_id,
+    )
+    entry_at = datetime.now(UTC) - timedelta(days=2)
+    exit_at = datetime.now(UTC) - timedelta(days=1)
+    assert await upsert_order_record(
+        {
+            "id": "repair-entry",
+            "symbol": "REPAIR",
+            "side": "buy",
+            "qty": 1,
+            "filled_qty": 1,
+            "avg_fill_price": 20,
+            "filled_at": entry_at.isoformat(),
+            "status": "filled",
+            "paper": True,
+        },
+        risk_decision_id=risk_id,
+        decision_context_id=supervisor_context_id,
+    )
+    assert await upsert_order_record(
+        {
+            "id": "repair-exit",
+            "symbol": "REPAIR",
+            "side": "sell",
+            "qty": 1,
+            "filled_qty": 1,
+            "avg_fill_price": 22,
+            "filled_at": exit_at.isoformat(),
+            "status": "filled",
+            "paper": True,
+        },
+        decision_source="broker_reconciliation",
+    )
+    assert await upsert_order_record(
+        {
+            "id": "unproven-entry",
+            "symbol": "ORPHAN",
+            "side": "buy",
+            "qty": 1,
+            "status": "filled",
+            "paper": True,
+        },
+        decision_source="broker_reconciliation",
+    )
+    with sqlite3.connect(db_path) as connection:
+        broker_context_id = connection.execute(
+            "SELECT decision_context_id FROM orders WHERE client_order_id = 'repair-exit'"
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE orders SET decision_context_id = ? WHERE client_order_id = 'repair-entry'",
+            (broker_context_id,),
+        )
+        connection.commit()
+
+    configure_db_path(db_path)
+    await init_db()
+    configure_db_path(db_path)
+    await init_db()
+
+    with sqlite3.connect(db_path) as connection:
+        contexts = dict(
+            connection.execute(
+                "SELECT client_order_id, decision_context_id FROM orders"
+            )
+        )
+    assert contexts["repair-entry"] == supervisor_context_id
+    assert contexts["repair-exit"] == broker_context_id
+    assert contexts["unproven-entry"] == broker_context_id
+
+    report = await build_edge_report(window_days=14)
+    assert len(report.closed_trades) == 1
+    assert report.closed_trades[0].symbol == "REPAIR"
+    assert report.closed_trades[0].decision_source == "supervisor_entry"
+    assert report.closed_trades[0].execution_mode == "paper"
 
 
 @pytest.mark.asyncio
